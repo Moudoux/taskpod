@@ -1,0 +1,35 @@
+# A task can have any name
+task main {
+    description "An optional description of a task";
+    # There are three types of conditions: shell, exists, ask
+    # They can all be appended with a bang (!) to negate their output
+    # All conditions must pass for the task to run
+    condition exists "{{ pwd }}/spec.task";
+    # The commands that this task will run
+    run [
+        echo "Hello main!",
+        echo "This is a second shell command"
+    ];
+}
+
+task print-user {
+    # Variables are defined per task, they can also be defined globally
+    variables [
+        "user" : "Test user"
+    ];
+    # All strings can be templated using {{ }} syntax
+    run echo "Hello {{ user }}";
+}
+
+task hello {
+    # A task can depend on other tasks that must be evaluated
+    # before this task is ran (this does not mean the dependent task must be ran)
+    depends main;
+    run echo "Hello";
+}
+
+# Subtasks are tasks that run after their parent task has ran
+# They can be configured as any normal task
+subtask world of hello {
+    run echo "world";
+}

@@ -1,0 +1,29 @@
+image: rust:latest
+
+stages:
+  - build
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TITLE !~ /^\[nobuild\]/i
+
+linux:
+  stage: build
+  script:
+    - cargo build --release
+  artifacts:
+    expire_in: 1 year
+    paths:
+      - target/release/taskpod
+
+windows:
+  stage: build
+  before_script:
+    - rustup target add x86_64-pc-windows-gnu
+    - apt-get update -y && apt-get install -y mingw-w64
+  script:
+    - cargo build --release --target x86_64-pc-windows-gnu
+  artifacts:
+    expire_in: 1 year
+    paths:
+      - target/x86_64-pc-windows-gnu/release/taskpod.exe
