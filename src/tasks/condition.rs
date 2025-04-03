@@ -1,7 +1,7 @@
-use std::io::Write;
 use crate::tasks::environment::{Environment, Value};
 use crate::tasks::run::Run;
 use anyhow::Result;
+use std::io::Write;
 
 #[derive(Debug)]
 pub enum ConditionType {
@@ -39,7 +39,7 @@ impl Condition {
                     return Ok(!result);
                 }
                 Ok(result)
-            },
+            }
             ConditionType::Shell(run) => {
                 let output = run.execute(env, None, None)?;
                 let success = output.status.success();
@@ -47,14 +47,14 @@ impl Condition {
                     return Ok(!success);
                 }
                 Ok(success)
-            },
+            }
             ConditionType::Ask(value) => {
                 let prompt = value.as_string(env)?;
                 print!("{} (Y/n): ", prompt);
                 std::io::stdout().flush()?;
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
-                Ok(input.len() > 0 && (&input[0..1] == "Y" || &input[0..1] == "y"))
+                Ok(!input.is_empty() && (&input[0..1] == "Y" || &input[0..1] == "y"))
             }
         }
     }

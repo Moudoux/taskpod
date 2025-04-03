@@ -18,7 +18,10 @@ impl Run {
     pub fn print(&self, env: &Environment, level: usize) -> anyhow::Result<()> {
         print!("{:indent$}", "", indent = level);
         for part in &self.parts {
-            let value = part.as_string(env)?;
+            let value = match part {
+                Value::File(name, _) => name.to_string(),
+                _ => part.as_string(env)?
+            };
             print!("{value} ");
         }
         println!();

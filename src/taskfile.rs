@@ -14,21 +14,23 @@ pub struct TaskFile {
 }
 
 impl TaskFile {
-    pub fn from_file(path: &str) -> anyhow::Result<Self> {
+    pub fn from_file(path: &str, dry_run: bool) -> anyhow::Result<Self> {
         let start_time = std::time::Instant::now();
         let mut parser = Parser::from_file(path)?;
-        let environment = Arc::new(Environment::new());
+        let environment = Arc::new(Environment::new(dry_run));
         Self::populate_default_env(environment.clone());
         parser.run(environment.clone())?;
         let mut tasks = parser.tasks;
         let subtasks = parser.subtasks;
         for (_, subtask) in subtasks {
-            let parent_id = subtask.parent_id.as_ref().ok_or(
-                anyhow::anyhow!("Subtask {} has no parent task", subtask.name),
-            )?;
-            let parent_task = tasks
-                .get_mut(parent_id)
-                .ok_or(anyhow::anyhow!("Subtask {} references non-existent parent task {parent_id}", subtask.name))?;
+            let parent_id = subtask.parent_id.as_ref().ok_or(anyhow::anyhow!(
+                "Subtask {} has no parent task",
+                subtask.name
+            ))?;
+            let parent_task = tasks.get_mut(parent_id).ok_or(anyhow::anyhow!(
+                "Subtask {} references non-existent parent task {parent_id}",
+                subtask.name
+            ))?;
             parent_task.subtask.push(Box::new(subtask));
         }
         let duration = start_time.elapsed();
@@ -47,42 +49,50 @@ impl TaskFile {
         env.add("user".into(), Value::Env("USER".into()));
     }
 
-    pub fn print(&self) -> anyhow::Result<()> {
+    pub fn print(&self, ignore_conditions: bool) -> anyhow::Result<()> {
         for task in self.tasks.values() {
-            self.execute_task(task, true)?;
+            self.execute_task(task, true, ignore_conditions)?;
         }
         Ok(())
     }
 
-    pub fn execute(&self) -> anyhow::Result<()> {
+    pub fn execute(&self, ignore_conditions: bool) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
         info!("Executing {}", self.path);
-        if !Condition::should_run_vec(&self.conditions, &self.environment)? {
+        if !ignore_conditions && !Condition::should_run_vec(&self.conditions, &self.environment)? {
             info!("Skipping tasks file execution");
             return Ok(());
         }
         for task in self.tasks.values() {
-            self.execute_task(task, false)?;
+            self.execute_task(task, false, ignore_conditions)?;
         }
         let duration = start.elapsed();
         info!("Done in {:?}", duration);
         Ok(())
     }
 
-    fn execute_task(&self, task: &Task, dry_run: bool) -> anyhow::Result<()> {
+    pub fn execute_task(
+        &self,
+        task: &Task,
+        dry_run: bool,
+        ignore_conditions: bool,
+    ) -> anyhow::Result<()> {
         for depend in &task.depends {
-            let subtask = self
-                .tasks
-                .get(depend)
-                .ok_or_else(|| anyhow::anyhow!("Task {} not found in tasks file", depend))?;
-            match dry_run {
-                true => subtask.print()?,
-                false => subtask.run()?
+            let subtask = self.tasks.get(depend).ok_or_else(|| {
+                anyhow::anyhow!("Task {} not found in tasks file", depend)
+            })?;
+
+            if dry_run {
+                subtask.print(ignore_conditions)?;
+            } else {
+                subtask.run(ignore_conditions)?;
             }
         }
-        match dry_run {
-            true => task.print()?,
-            false => task.run()?
+
+        if dry_run {
+            task.print(ignore_conditions)?;
+        } else {
+            task.run(ignore_conditions)?;
         }
         Ok(())
     }

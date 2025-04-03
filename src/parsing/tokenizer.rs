@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::read_to_string;
+use std::path::Path;
 
 pub struct Tokenizer {
     /// Stream of characters in the raw string
@@ -70,7 +71,11 @@ pub enum TokenType {
 }
 
 impl Tokenizer {
-    pub fn from_file(path: &str) -> Result<Tokenizer> {
+    pub fn from_file(path_str: &str) -> Result<Tokenizer> {
+        let path = Path::new(path_str);
+        if !path.exists() {
+            return Err(anyhow::anyhow!("File {} not found", path_str));
+        }
         let raw = read_to_string(path)?;
         Ok(Self {
             raw,

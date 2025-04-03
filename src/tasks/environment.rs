@@ -14,6 +14,8 @@ pub enum Value {
     Boolean(bool),
     /// Environment variable
     Env(String),
+    /// A raw file, name - contents
+    File(String, String),
 }
 
 lazy_static! {
@@ -24,6 +26,12 @@ lazy_static! {
 impl Value {
     pub fn as_string(&self, env: &Environment) -> Result<String> {
         match self {
+            Value::File(name, body) => {
+                if env.dry_run {
+                    return Ok(format!("file:{name}"))
+                }
+                Ok(body.to_string())
+            },
             Value::String(s) => Self::template_str(s, env),
             Value::Int(i) => Ok(i.to_string()),
             Value::Boolean(b) => Ok(b.to_string()),
@@ -53,11 +61,12 @@ pub struct Environment {
     pub variables: Mutex<HashMap<String, Arc<Value>>>,
     /// Reference to a parent environment
     pub parent: Option<Arc<Environment>>,
+    pub dry_run: bool,
 }
 
 impl Default for Environment {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }
 
@@ -84,16 +93,18 @@ impl Environment {
         variables.insert(name, Arc::new(value));
     }
 
-    pub fn new() -> Self {
+    pub fn new(dry_run: bool) -> Self {
         Environment {
             variables: Mutex::new(HashMap::new()),
             parent: None,
+            dry_run
         }
     }
 
     pub fn derive(parent: Arc<Environment>) -> Environment {
         Environment {
             variables: Mutex::new(HashMap::new()),
+            dry_run: parent.dry_run.clone(),
             parent: Some(parent),
         }
     }

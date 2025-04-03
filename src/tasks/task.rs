@@ -51,47 +51,55 @@ impl Task {
         }
     }
 
-    pub fn print(&self) -> Result<()> {
+    pub fn print(&self, ignore_conditions: bool) -> Result<()> {
         let mut state = self.state.lock().expect("Failed to lock run state");
         if *state != RunState::NotStarted {
             return Ok(());
         }
         *state = RunState::Finished;
-        if !Condition::should_run_vec(&self.conditions, &self.environment)? {
+        if !ignore_conditions && !Condition::should_run_vec(&self.conditions, &self.environment)? {
             info!("Skipping task {}", self.name);
             *state = RunState::Skipped;
             return Ok(());
         }
-        info!("{}", self.name);
+        self.print_name()?;
         for run in &self.run {
             run.print(&self.environment, 2)?;
+        }
+        for subtask in &self.subtask {
+            subtask.print(ignore_conditions)?;
         }
         Ok(())
     }
 
-    pub fn run(&self) -> Result<()> {
+    pub fn print_name(&self) -> Result<()> {
+        match &self.description {
+            Some(desc) => {
+                let parsed_desc = desc.as_string(&self.environment)?;
+                info!("{}", parsed_desc);
+            }
+            None => info!("{}", self.name),
+        }
+        Ok(())
+    }
+
+    pub fn run(&self, ignore_conditions: bool) -> Result<()> {
         let mut state = self.state.lock().expect("Failed to lock run state");
         if *state != RunState::NotStarted {
             return Ok(());
         }
         *state = RunState::Running;
         // Check conditions
-        if !Condition::should_run_vec(&self.conditions, &self.environment)? {
+        if !ignore_conditions && !Condition::should_run_vec(&self.conditions, &self.environment)? {
             debug!("Skipping task {}", self.name);
             *state = RunState::Skipped;
             return Ok(());
         }
-        match &self.description {
-            Some(desc) => {
-                let parsed_desc = desc.as_string(&self.environment)?;
-                info!("{}", parsed_desc);
-            },
-            None => info!("{}", self.name),
-        }
+        self.print_name()?;
         let run_state = self.do_run()?;
         if run_state == RunState::Finished {
             for subtask in &self.subtask {
-                subtask.run()?;
+                subtask.run(ignore_conditions)?;
             }
         }
         *state = run_state;
@@ -105,7 +113,7 @@ impl Task {
             Some(ref dir) => {
                 let parsed_dir = dir.as_string(&self.environment)?;
                 PathBuf::from(parsed_dir)
-            },
+            }
             None => PathBuf::from("."),
         };
         workdir.push(default_dir);

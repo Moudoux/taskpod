@@ -33,10 +33,7 @@ impl Parser {
         }
     }
 
-    pub fn run(
-        &mut self,
-        global_env: Arc<Environment>,
-    ) -> Result<()> {
+    pub fn run(&mut self, global_env: Arc<Environment>) -> Result<()> {
         while self.has_next() {
             let token = self.next()?;
             match &token.token_type {
@@ -70,11 +67,13 @@ impl Parser {
                     self.consume_opt(TokenType::Semicolon);
                 }
                 TokenType::File(file) => {
-                    let name = file.name.to_string();
+                    let name = &file.name;
                     if global_env.has(&name) {
-                        return Err(anyhow::anyhow!("file {name} has already been defined",))
+                        return Err(anyhow::anyhow!("file {name} has already been defined",));
                     }
-                    global_env.add(name, Value::String(file.body.to_string()));
+                    global_env.add(name.to_string(), Value::File(
+                        name.to_string(), file.body.to_string()
+                    ));
                 }
                 _ => return Err(anyhow::anyhow!("Unexpected token: {token}",)),
             }
@@ -144,18 +143,24 @@ impl Parser {
             Some(TokenType::Bang) => {
                 self.skip();
                 true
-            },
+            }
             _ => false,
         };
         let value = match condition.as_str() {
             "exists" => {
                 let path = self.expect_str("file or directory path")?;
                 let value = Value::String(path);
-                Condition { condition_type: ConditionType::Exists(value), invert }
+                Condition {
+                    condition_type: ConditionType::Exists(value),
+                    invert,
+                }
             }
             "shell" => {
                 let command = self.parse_command(true)?;
-                Condition { condition_type: ConditionType::Shell(command), invert }
+                Condition {
+                    condition_type: ConditionType::Shell(command),
+                    invert,
+                }
             }
             "ask" => {
                 let prompt = self.expect_str("ask prompt")?;
