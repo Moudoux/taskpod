@@ -10,3 +10,7 @@ The following (x86_64) platforms have prebuilt binaries from the CI:
 
 * [Linux](https://gitlab.com/deftware/taskpod/builds/artifacts/master/raw/target/release/taskpod?job=linux)
 * [Windows](https://gitlab.com/deftware/taskpod/builds/artifacts/master/raw/target/x86_64-pc-windows-gnu/release/taskpod.exe?job=windows)
+
+## Idea based syntax highlighting
+
+The file [Task.xml](Task.xml) contains syntax highlighting for the task DSL.
