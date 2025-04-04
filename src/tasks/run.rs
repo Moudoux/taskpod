@@ -3,11 +3,28 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub enum OutputMode {
+    Piped,
+    Inherited,
+    None,
+}
+
+impl OutputMode {
+    pub fn stdio(&self) -> Stdio {
+        match self {
+            OutputMode::Piped => Stdio::piped(),
+            OutputMode::Inherited => Stdio::inherit(),
+            OutputMode::None => Stdio::null(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Run {
     pub parts: Vec<Value>,
     pub sub_run: Option<Box<Run>>,
-    pub silent: bool,
+    pub output: OutputMode,
 }
 
 impl Run {
@@ -63,12 +80,19 @@ impl Run {
     }
 
     fn setup_stream(&self, command: &mut Command, stdin: Option<&[u8]>) {
-        if self.silent {
-            command.stdout(Stdio::null());
-            command.stderr(Stdio::null());
-        } else if self.sub_run.is_some() {
-            command.stdout(Stdio::piped());
+        match self.output {
+            OutputMode::Piped => {
+                command.stdout(Stdio::piped());
+            }
+            OutputMode::Inherited => {
+                command.stdout(Stdio::inherit());
+            }
+            OutputMode::None => {
+                command.stdout(Stdio::null());
+                command.stderr(Stdio::null());
+            }
         }
+
         if stdin.is_some() {
             command.stdin(Stdio::piped());
         }

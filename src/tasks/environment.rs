@@ -1,7 +1,9 @@
+use crate::tasks::run::Run;
 use anyhow::Result;
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
@@ -14,6 +16,8 @@ pub enum Value {
     Boolean(bool),
     /// Environment variable
     Env(String),
+    /// A run command
+    Run(Run),
     /// A raw file, name - contents
     File(String, String),
 }
@@ -32,6 +36,12 @@ impl Value {
             Value::Boolean(b) => Ok(b.to_string()),
             Value::Env(name) => std::env::var(name)
                 .map_err(|_| anyhow::anyhow!("Environment variable {name} not found")),
+            Value::Run(run) => {
+                let workdir = PathBuf::from(".");
+                let output = run.execute(env, None, Some(&workdir))?;
+                let stdout = String::from_utf8(output.stdout)?;
+                Ok(stdout.trim().to_string())
+            }
         }
     }
 

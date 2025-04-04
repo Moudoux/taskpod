@@ -2,7 +2,7 @@ use crate::parsing::tokenizer::Tokenizer;
 use crate::parsing::tokenizer::{Token, TokenType};
 use crate::tasks::condition::{Condition, ConditionType};
 use crate::tasks::environment::{Environment, Value};
-use crate::tasks::run::Run;
+use crate::tasks::run::{OutputMode, Run};
 use crate::tasks::task::Task;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -117,7 +117,8 @@ impl Parser {
                     self.consume_opt(TokenType::Semicolon);
                 }
                 TokenType::Run => {
-                    let commands = self.parse_opt_array(|parser| parser.parse_command(false))?;
+                    let commands =
+                        self.parse_opt_array(|parser| parser.parse_command(OutputMode::Inherited))?;
                     task.run.extend(commands);
                     self.consume_opt(TokenType::Semicolon);
                 }
@@ -157,7 +158,7 @@ impl Parser {
                 }
             }
             "shell" => {
-                let command = self.parse_command(true)?;
+                let command = self.parse_command(OutputMode::None)?;
                 Condition {
                     condition_type: ConditionType::Shell(command),
                     invert,
@@ -175,7 +176,7 @@ impl Parser {
         Ok(value)
     }
 
-    fn parse_command(&mut self, silent: bool) -> Result<Run> {
+    fn parse_command(&mut self, output: OutputMode) -> Result<Run> {
         let mut parts = Vec::new();
         while let Some(token) = self.peek() {
             match token {
@@ -187,17 +188,18 @@ impl Parser {
             }
             self.skip();
         }
-        let mut sub_run = None;
+        let mut run = Run {
+            parts,
+            sub_run: None,
+            output: output.clone(),
+        };
         if self.peek() == Some(&TokenType::Pipe) {
             self.skip();
-            let run = self.parse_command(silent)?;
-            sub_run = Some(Box::from(run));
+            let sub_run = self.parse_command(output)?;
+            run.sub_run = Some(Box::from(sub_run));
+            run.output = OutputMode::Piped;
         }
-        Ok(Run {
-            parts,
-            sub_run,
-            silent,
-        })
+        Ok(run)
     }
 
     fn parse_variable(&mut self) -> Result<(String, Value)> {
@@ -214,6 +216,10 @@ impl Parser {
                     let str = self.expect_str("env variable name")?;
                     self.expect(TokenType::RightParenthesis)?;
                     Value::Env(str)
+                }
+                "shell" => {
+                    let command = self.parse_command(OutputMode::Piped)?;
+                    Value::Run(command)
                 }
                 _ => return Err(anyhow::anyhow!("Unexpected variable reference {token}")),
             },

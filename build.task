@@ -1,0 +1,19 @@
+variables [
+    "name" : "taskpod",
+    "version" : shell awk -F'"' '/^version *=/ {print $2; exit}' Cargo.toml
+];
+
+task release {
+    description "Build the release version of {{ name }} {{ version }}";
+    run [
+        cargo build --release,
+        cp "target/release/{{ name }}" "./{{ name }}"
+    ];
+}
+
+task install {
+    description "Install {{ name }}";
+    depends release;
+    condition ask "Do you want to install {{ name }}?";
+    run sudo cp "./{{ name }}" "/usr/bin/{{ name }}";
+}
