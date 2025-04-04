@@ -14,10 +14,10 @@ pub struct TaskFile {
 }
 
 impl TaskFile {
-    pub fn from_file(path: &str, dry_run: bool) -> anyhow::Result<Self> {
+    pub fn from_file(path: &str) -> anyhow::Result<Self> {
         let start_time = std::time::Instant::now();
         let mut parser = Parser::from_file(path)?;
-        let environment = Arc::new(Environment::new(dry_run));
+        let environment = Arc::new(Environment::new());
         Self::populate_default_env(environment.clone());
         parser.run(environment.clone())?;
         let mut tasks = parser.tasks;
@@ -78,9 +78,10 @@ impl TaskFile {
         ignore_conditions: bool,
     ) -> anyhow::Result<()> {
         for depend in &task.depends {
-            let subtask = self.tasks.get(depend).ok_or_else(|| {
-                anyhow::anyhow!("Task {} not found in tasks file", depend)
-            })?;
+            let subtask = self
+                .tasks
+                .get(depend)
+                .ok_or_else(|| anyhow::anyhow!("Task {} not found in tasks file", depend))?;
 
             if dry_run {
                 subtask.print(ignore_conditions)?;

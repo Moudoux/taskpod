@@ -20,7 +20,7 @@ impl Run {
         for part in &self.parts {
             let value = match part {
                 Value::File(name, _) => name.to_string(),
-                _ => part.as_string(env)?
+                _ => part.as_string(env)?,
             };
             print!("{value} ");
         }

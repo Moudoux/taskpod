@@ -68,12 +68,13 @@ impl Parser {
                 }
                 TokenType::File(file) => {
                     let name = &file.name;
-                    if global_env.has(&name) {
+                    if global_env.has(name) {
                         return Err(anyhow::anyhow!("file {name} has already been defined",));
                     }
-                    global_env.add(name.to_string(), Value::File(
-                        name.to_string(), file.body.to_string()
-                    ));
+                    global_env.add(
+                        name.to_string(),
+                        Value::File(name.to_string(), file.body.to_string()),
+                    );
                 }
                 _ => return Err(anyhow::anyhow!("Unexpected token: {token}",)),
             }

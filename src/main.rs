@@ -1,33 +1,36 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use clap::Parser;
 use taskpod::taskfile::TaskFile;
+use taskpod::tasks::environment::Value;
 
 #[derive(Parser)]
 #[command(author, about, long_about = None)]
-struct Args {
+pub struct Args {
     /// Task file to execute
     #[arg(default_value = "main.task")]
-    file: String,
+    pub file: String,
 
     /// Enables verbose output
     #[arg(short, long, default_value_t = false)]
-    verbose: bool,
+    pub verbose: bool,
 
     /// Dry run, do not execute any tasks
     #[arg(short, long, default_value_t = false)]
-    dry_run: bool,
+    pub dry_run: bool,
 
     /// Ignore task conditions
     #[arg(long, default_value_t = false)]
-    ignore_conditions: bool,
+    pub ignore_conditions: bool,
 
     /// Inspect a task
     #[arg(short, long)]
-    inspect: Option<String>,
+    pub inspect: Option<String>,
 
     /// List all tasks
     #[arg(short, long, default_value_t = false)]
-    list: bool,
+    pub list: bool,
 }
 
 fn main() -> Result<()> {
@@ -39,7 +42,21 @@ fn main() -> Result<()> {
     clog.init();
 
     let dry_run = args.dry_run || args.inspect.is_some();
-    let file = TaskFile::from_file(&args.file, dry_run)?;
+    let file = TaskFile::from_file(&args.file)?;
+
+    if dry_run {
+        let mut variables = file.environment.variables.lock().unwrap();
+        let mut files = Vec::new();
+        for (key, value) in variables.iter() {
+            if let Value::File(name, _) = value.as_ref() {
+                let file_body = format!("file:{name}");
+                files.push((key.to_string(), Value::File(name.to_string(), file_body)));
+            }
+        }
+        for (name, file) in files {
+            variables.insert(name, Arc::new(file));
+        }
+    }
 
     if args.list {
         for task in file.tasks.values() {
@@ -58,7 +75,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if !args.dry_run {
+    if !dry_run {
         file.execute(ignore_conditions)?;
     } else {
         file.print(ignore_conditions)?;
