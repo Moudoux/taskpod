@@ -7,6 +7,7 @@ use crate::tasks::task::Task;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
+use log::{debug, info};
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -38,13 +39,7 @@ impl Parser {
             let token = self.next()?;
             match &token.token_type {
                 TokenType::Include => {
-                    let path = self.expect_str("include file path")?;
-                    let mut included_parser = Parser::from_file(&path)?;
-                    included_parser.run(global_env.clone())?;
-                    self.tasks.extend(included_parser.tasks);
-                    self.subtasks.extend(included_parser.subtasks);
-                    self.conditions.extend(included_parser.conditions);
-                    self.expect(TokenType::Semicolon)?;
+                    self.include(global_env.clone())?;
                 }
                 TokenType::Task => {
                     let task = self.parse_task(global_env.clone())?;
@@ -80,6 +75,38 @@ impl Parser {
             }
         }
 
+        Ok(())
+    }
+
+    fn include(&mut self, env: Arc<Environment>) -> Result<()> {
+        let path = self.expect_str("include file path")?;
+        if self.consume_opt(TokenType::LeftBrace) {
+            let mut conditions = None;
+            while !self.consume_opt(TokenType::RightBrace) {
+                let token = self.next()?;
+                match token.token_type {
+                    TokenType::Condition => {
+                        conditions = Some(self.parse_opt_array(Self::parse_condition)?);
+                        self.expect(TokenType::Semicolon)?
+                    }
+                    _ => return Err(anyhow::anyhow!("Unexpected token in include statement {token:?}")),
+                }
+            }
+            self.expect(TokenType::Semicolon)?;
+            if let Some(conditions) = conditions {
+                if !Condition::should_run_vec(&conditions, &env)? {
+                    info!("Skipping include of {path}");
+                    return Ok(());
+                }
+            }
+        }
+        debug!("Importing {path}");
+        let mut included_parser = Parser::from_file(&path)?;
+        included_parser.run(env)?;
+        self.tasks.extend(included_parser.tasks);
+        self.subtasks.extend(included_parser.subtasks);
+        self.conditions.extend(included_parser.conditions);
+        self.consume_opt(TokenType::Semicolon);
         Ok(())
     }
 
@@ -287,12 +314,14 @@ impl Parser {
         Err(anyhow::anyhow!("Expected {:?} but got {token}", token_type))
     }
 
-    fn consume_opt(&mut self, token: TokenType) {
+    fn consume_opt(&mut self, token: TokenType) -> bool {
         if let Some(value) = self.peek() {
             if value == &token {
                 self.skip();
+                return true;
             }
         }
+        false
     }
 
     fn skip(&mut self) {

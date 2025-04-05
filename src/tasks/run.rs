@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum OutputMode {
     Piped,
     Inherited,
@@ -73,6 +73,7 @@ impl Run {
         let output = process.wait_with_output()?;
         let stdout = &output.stdout;
         if let Some(sub_run) = &self.sub_run {
+            debug_assert!(self.output == OutputMode::Piped);
             let sub_output = sub_run.execute(environment, Some(stdout), workdir)?;
             return Ok(sub_output);
         }

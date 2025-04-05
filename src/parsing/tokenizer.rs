@@ -97,11 +97,15 @@ impl Tokenizer {
 
     pub fn run(&mut self) -> Result<()> {
         let mut macros = HashMap::new();
-        while let Some(value) = self.peek() {
+        while let Some(value) = self.peek_once() {
             match value {
                 ' ' | '\n' | '\t' => self.skip(),
                 '#' => {
                     self.read_until(|_, c| c == &'\n');
+                }
+                _ if value == '/' && self.peek_twice() == Some('*') => {
+                    self.read_until(|prev, current| prev == Some('*') && current == &'/');
+                    self.skip();
                 }
                 '(' => self.add_token_type_advance(TokenType::LeftParenthesis),
                 ')' => self.add_token_type_advance(TokenType::RightParenthesis),
@@ -179,8 +183,8 @@ impl Tokenizer {
 
     fn apply_macro(&mut self, macro_type: &RawNamedBody) -> Result<()> {
         let mut args = Vec::new();
-        while self.peek() != Some(';') {
-            if self.peek() == Some(' ') {
+        while self.peek_once() != Some(';') {
+            if self.peek_once() == Some(' ') {
                 self.skip();
             }
             let arg = self.read_until(|_, c| c == &' ' || c == &';').to_string();
@@ -232,7 +236,7 @@ impl Tokenizer {
     fn read_until(&mut self, mut predicate: impl FnMut(Option<char>, &char) -> bool) -> &str {
         let start = self.position;
         let mut previous = None;
-        while let Some(value) = self.peek() {
+        while let Some(value) = self.peek_once() {
             if predicate(previous, &value) {
                 break;
             }
@@ -270,7 +274,7 @@ impl Tokenizer {
     }
 
     fn expect(&mut self, token: char) -> Result<()> {
-        if let Some(value) = self.peek() {
+        if let Some(value) = self.peek_once() {
             self.skip();
             if value == token {
                 return Ok(());
@@ -288,18 +292,23 @@ impl Tokenizer {
         self.position += 1;
     }
 
-    fn peek(&self) -> Option<char> {
-        self.nth(self.position)
+    fn peek(&self, offset: usize) -> Option<char> {
+        self.nth(self.position + offset)
+    }
+
+    fn peek_once(&self) -> Option<char> {
+        self.peek(0)
+    }
+
+    fn peek_twice(&self) -> Option<char> {
+        self.peek(1)
     }
 
     fn nth(&self, n: usize) -> Option<char> {
-        if self.has_next() {
+        if n < self.raw.len() {
             return Some(self.raw.as_bytes()[n] as char);
         }
         None
     }
 
-    fn has_next(&self) -> bool {
-        self.position < self.raw.len()
-    }
 }

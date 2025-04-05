@@ -10,7 +10,7 @@
     <keywords keywords="else;file;if;include;macro;of;subtask;task" ignore_case="false" />
     <keywords2 keywords="condition;depends;description;run;variables;workdir" />
     <keywords3 keywords="ask;env;exists;shell" />
-    <keywords4 keywords="!" />
+    <keywords4 keywords="!;true;false" />
   </highlighting>
   <extensionMap>
     <mapping ext="task" />
