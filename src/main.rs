@@ -6,7 +6,7 @@ use taskpod::taskfile::TaskFile;
 use taskpod::tasks::environment::Value;
 
 #[derive(Parser)]
-#[command(author, about, long_about = None)]
+#[command(author, about, version, long_about = None)]
 pub struct Args {
     /// Task file to execute
     #[arg(default_value = "main.task")]
@@ -27,6 +27,10 @@ pub struct Args {
     /// Inspect a task
     #[arg(short, long)]
     pub inspect: Option<String>,
+
+    /// Run a specific task
+    #[arg(short, long)]
+    pub run: Option<String>,
 
     /// List all tasks
     #[arg(short, long, default_value_t = false)]
@@ -69,6 +73,15 @@ fn main() -> Result<()> {
     if let Some(task_name) = args.inspect {
         if let Some(task) = file.tasks.get(&task_name) {
             file.execute_task(task, true, ignore_conditions)?;
+        } else {
+            return Err(anyhow::anyhow!("Task {} not found", task_name));
+        }
+        return Ok(());
+    }
+
+    if let Some(task_name) = args.run {
+        if let Some(task) = file.tasks.get(&task_name) {
+            file.execute_task(task, false, ignore_conditions)?;
         } else {
             return Err(anyhow::anyhow!("Task {} not found", task_name));
         }
