@@ -19,6 +19,15 @@ task release {
     ];
 }
 
+task windows-release {
+    variables "target" : "x86_64-pc-windows-gnu";
+    description "Build the windows release version of {{ name }} {{ version }}";
+    run [
+        cargo build --release --target "{{ target }}",
+        cp "target/{{ target }}/release/{{ name }}.exe" "./{{ name }}.exe"
+    ];
+}
+
 task install {
     description "Install {{ name }}";
     depends release;

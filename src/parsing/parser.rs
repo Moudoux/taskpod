@@ -355,7 +355,7 @@ impl Parser {
 
     fn peek_previous(&self) -> Option<&TokenType> {
         if self.position < 2 {
-            return None
+            return None;
         }
         self.peek_n(self.position - 2)
     }

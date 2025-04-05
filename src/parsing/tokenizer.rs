@@ -176,9 +176,13 @@ impl Tokenizer {
 
     fn read_string(&mut self, delim: char) {
         self.skip();
-        let string = self
-            .read_until(|previous, c| c == &delim && previous != Some('\\'))
+        let mut string = self
+            .read_until(|previous, c| previous != Some('\\') && c == &delim)
             .to_string();
+        // Remove escaped delimiters
+        if string.contains(delim) {
+            string = string.replace(&format!("\\{}", delim), &delim.to_string());
+        }
         self.skip();
         self.add_token_type(TokenType::String(string));
     }
