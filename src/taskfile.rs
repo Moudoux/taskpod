@@ -11,6 +11,7 @@ pub struct TaskFile {
     pub conditions: Vec<Condition>,
     pub environment: Arc<Environment>,
     pub tasks: HashMap<String, Task>,
+    pub skipped_tasks: Vec<String>,
 }
 
 impl TaskFile {
@@ -40,6 +41,7 @@ impl TaskFile {
             conditions: parser.conditions,
             environment,
             tasks,
+            skipped_tasks: Vec::new(),
         })
     }
 
@@ -77,6 +79,11 @@ impl TaskFile {
         dry_run: bool,
         ignore_conditions: bool,
     ) -> anyhow::Result<()> {
+        if self.skipped_tasks.contains(&task.name) {
+            info!("Skipping task {}", task.name);
+            return Ok(());
+        }
+
         for depend in &task.depends {
             let subtask = self
                 .tasks

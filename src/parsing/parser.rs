@@ -5,9 +5,9 @@ use crate::tasks::environment::{Environment, Value};
 use crate::tasks::run::{OutputMode, Run};
 use crate::tasks::task::Task;
 use anyhow::Result;
+use log::{debug, info};
 use std::collections::HashMap;
 use std::sync::Arc;
-use log::{debug, info};
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -38,6 +38,7 @@ impl Parser {
         while self.has_next() {
             let token = self.next()?;
             match &token.token_type {
+                TokenType::Invoked => continue,
                 TokenType::Include => {
                     self.include(global_env.clone())?;
                 }
@@ -89,7 +90,11 @@ impl Parser {
                         conditions = Some(self.parse_opt_array(Self::parse_condition)?);
                         self.expect(TokenType::Semicolon)?
                     }
-                    _ => return Err(anyhow::anyhow!("Unexpected token in include statement {token:?}")),
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "Unexpected token in include statement {token:?}"
+                        ));
+                    }
                 }
             }
             self.expect(TokenType::Semicolon)?;
@@ -111,9 +116,11 @@ impl Parser {
     }
 
     fn parse_task(&mut self, parent_env: Arc<Environment>) -> Result<Task> {
+        let invoked_only = self.peek_previous() == Some(&TokenType::Invoked);
         let name = self.expect_reference("task name")?;
         let mut task = Task::new(name, Environment::derive(parent_env));
 
+        task.invoked_only = invoked_only;
         if self.peek() == Some(&TokenType::Of) {
             self.skip();
             task.parent_id = Some(self.expect_reference("parent task id")?);
@@ -168,13 +175,7 @@ impl Parser {
 
     fn parse_condition(&mut self) -> Result<Condition> {
         let condition = self.expect_reference("condition type")?;
-        let invert = match self.peek() {
-            Some(TokenType::Bang) => {
-                self.skip();
-                true
-            }
-            _ => false,
-        };
+        let invert = self.consume_opt(TokenType::Bang);
         let value = match condition.as_str() {
             "exists" => {
                 let path = self.expect_str("file or directory path")?;
@@ -198,9 +199,29 @@ impl Parser {
                     invert,
                 }
             }
+            "equals" => {
+                let first = self.parse_value()?;
+                let second = self.parse_value()?;
+                Condition {
+                    condition_type: ConditionType::Equals(first, second),
+                    invert,
+                }
+            }
             _ => return Err(anyhow::anyhow!("Unknown condition type {condition}")),
         };
         Ok(value)
+    }
+
+    fn parse_value(&mut self) -> Result<Value> {
+        let token = self.next()?;
+        let result = match &token.token_type {
+            TokenType::Reference(name) => Value::String(name.clone()),
+            TokenType::String(value) => Value::String(value.clone()),
+            TokenType::Int(value) => Value::Int(*value),
+            TokenType::Boolean(value) => Value::Boolean(*value),
+            _ => return Err(anyhow::anyhow!("Expected value type but got {token:?}")),
+        };
+        Ok(result)
     }
 
     fn parse_command(&mut self, output: OutputMode) -> Result<Run> {
@@ -329,7 +350,18 @@ impl Parser {
     }
 
     fn peek(&self) -> Option<&TokenType> {
-        self.nth(self.position).map(|token| &token.token_type)
+        self.peek_n(self.position)
+    }
+
+    fn peek_previous(&self) -> Option<&TokenType> {
+        if self.position < 2 {
+            return None
+        }
+        self.peek_n(self.position - 2)
+    }
+
+    fn peek_n(&self, position: usize) -> Option<&TokenType> {
+        self.nth(position).map(|token| &token.token_type)
     }
 
     fn next(&mut self) -> Result<&Token> {

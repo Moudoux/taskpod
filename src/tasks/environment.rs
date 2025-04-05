@@ -58,6 +58,12 @@ impl Value {
         }
         Ok(result)
     }
+
+    pub fn equals(&self, value: &Value, env: &Environment) -> Result<bool> {
+        let first = self.as_string(env)?;
+        let second = value.as_string(env)?;
+        Ok(first == second)
+    }
 }
 
 #[derive(Debug)]

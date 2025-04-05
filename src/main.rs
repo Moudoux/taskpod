@@ -35,6 +35,10 @@ pub struct Args {
     /// List all tasks
     #[arg(short, long, default_value_t = false)]
     pub list: bool,
+
+    /// A list of tasks to skip
+    #[arg(short, long, num_args(0..), default_value = None)]
+    pub skip: Option<Vec<String>>,
 }
 
 fn main() -> Result<()> {
@@ -46,7 +50,11 @@ fn main() -> Result<()> {
     clog.init();
 
     let dry_run = args.dry_run || args.inspect.is_some();
-    let file = TaskFile::from_file(&args.file)?;
+    let mut file = TaskFile::from_file(&args.file)?;
+
+    if let Some(skipped_tasks) = args.skip {
+        file.skipped_tasks.extend(skipped_tasks);
+    }
 
     if dry_run {
         let mut variables = file.environment.variables.lock().unwrap();
@@ -86,6 +94,8 @@ fn main() -> Result<()> {
             return Err(anyhow::anyhow!("Task {} not found", task_name));
         }
         return Ok(());
+    } else {
+        file.tasks.retain(|_, task| !task.invoked_only);
     }
 
     if !dry_run {

@@ -33,6 +33,7 @@ pub struct Task {
     pub state: Mutex<RunState>,
     pub parent_id: Option<String>,
     pub subtask: Vec<Box<Task>>,
+    pub invoked_only: bool,
 }
 
 impl Task {
@@ -48,6 +49,7 @@ impl Task {
             subtask: Vec::new(),
             parent_id: None,
             state: Mutex::new(RunState::NotStarted),
+            invoked_only: false,
         }
     }
 

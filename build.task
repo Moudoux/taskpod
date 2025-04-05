@@ -3,6 +3,14 @@ variables [
     "version" : shell awk -F'"' '/^version *=/ {print $2; exit}' Cargo.toml
 ];
 
+invoked task lint {
+    description "Lint {{ name }}";
+    run [
+        cargo fmt,
+        cargo clippy --fix --allow-dirty
+    ];
+}
+
 task release {
     description "Build the release version of {{ name }} {{ version }}";
     run [

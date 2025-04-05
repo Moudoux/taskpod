@@ -56,6 +56,7 @@ pub enum TokenType {
     File(RawNamedBody),
     Of,
     Subtask,
+    Invoked,
     /// Symbol tokens
     LeftParenthesis,
     RightParenthesis,
@@ -140,6 +141,7 @@ impl Tokenizer {
                         "workdir" => self.add_token_type(TokenType::Workdir),
                         "of" => self.add_token_type(TokenType::Of),
                         "subtask" => self.add_token_type(TokenType::Subtask),
+                        "invoked" => self.add_token_type(TokenType::Invoked),
                         "file" => {
                             let file = self.read_raw_named_body()?;
                             self.add_token_type(TokenType::File(file));
@@ -310,5 +312,4 @@ impl Tokenizer {
         }
         None
     }
-
 }

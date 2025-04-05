@@ -8,6 +8,7 @@ pub enum ConditionType {
     Exists(Value),
     Shell(Run),
     Ask(Value),
+    Equals(Value, Value),
 }
 
 #[derive(Debug)]
@@ -32,20 +33,11 @@ impl Condition {
             let path = std::path::Path::new(&str);
             Ok(path.exists())
         };
-        match &self.condition_type {
-            ConditionType::Exists(value) => {
-                let result = exists(value)?;
-                if self.invert {
-                    return Ok(!result);
-                }
-                Ok(result)
-            }
+        let result = match &self.condition_type {
+            ConditionType::Exists(value) => exists(value),
             ConditionType::Shell(run) => {
                 let output = run.execute(env, None, None)?;
                 let success = output.status.success();
-                if self.invert {
-                    return Ok(!success);
-                }
                 Ok(success)
             }
             ConditionType::Ask(value) => {
@@ -56,6 +48,11 @@ impl Condition {
                 std::io::stdin().read_line(&mut input)?;
                 Ok(!input.is_empty() && (&input[0..1] == "Y" || &input[0..1] == "y"))
             }
+            ConditionType::Equals(first, second) => first.equals(second, env),
+        }?;
+        if self.invert {
+            return Ok(!result);
         }
+        Ok(result)
     }
 }
