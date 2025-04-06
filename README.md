@@ -1,6 +1,6 @@
 # Taskpod
 
-Taskpod is a simple task management application 
+Taskpod is a simple platform-independent task management application 
 with a custom DSL for writing tasks. See [spec.task](spec.task) 
 for the specification of the DSL. 
 
@@ -11,6 +11,6 @@ The following (x86_64) platforms have prebuilt binaries from the CI:
 * [Linux](https://gitlab.com/deftware/taskpod/builds/artifacts/master/raw/target/release/taskpod?job=linux)
 * [Windows](https://gitlab.com/deftware/taskpod/builds/artifacts/master/raw/target/x86_64-pc-windows-gnu/release/taskpod.exe?job=windows)
 
-## Idea based syntax highlighting
+## JetBrains Idea based syntax highlighting
 
 The file [Task.xml](Task.xml) contains syntax highlighting for the task DSL.

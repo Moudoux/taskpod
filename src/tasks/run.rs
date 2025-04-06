@@ -72,10 +72,13 @@ impl Run {
         }
         let output = process.wait_with_output()?;
         let stdout = &output.stdout;
-        if let Some(sub_run) = &self.sub_run {
-            debug_assert!(self.output == OutputMode::Piped);
-            let sub_output = sub_run.execute(environment, Some(stdout), workdir)?;
-            return Ok(sub_output);
+        if output.status.success() {
+            // Only run sub_run if the parent command was successful
+            if let Some(sub_run) = &self.sub_run {
+                debug_assert!(self.output == OutputMode::Piped);
+                let sub_output = sub_run.execute(environment, Some(stdout), workdir)?;
+                return Ok(sub_output);
+            }
         }
         Ok(output)
     }

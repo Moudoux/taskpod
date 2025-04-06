@@ -2,7 +2,7 @@ use crate::tasks::condition::Condition;
 use crate::tasks::environment::{Environment, Value};
 use crate::tasks::run::Run;
 use anyhow::Result;
-use log::{debug, info};
+use log::{debug, error, info};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -18,6 +18,7 @@ pub enum RunState {
     Skipped,
     /// The command has finished
     Finished,
+    /// The command has failed
     Failed(ExitStatus, String),
 }
 
@@ -103,9 +104,12 @@ impl Task {
             for subtask in &self.subtask {
                 subtask.run(ignore_conditions)?;
             }
+        } else if let RunState::Failed(status, output) = &run_state {
+            error!("Task {} failed with {} ({})", self.name, status, output);
         }
         *state = run_state;
         std::io::stdout().flush()?;
+        std::io::stderr().flush()?;
         Ok(())
     }
 
