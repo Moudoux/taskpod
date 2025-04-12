@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
 pub enum Value {
+    /// Raw string
+    RawString(String),
     /// String value
     String(String),
     /// Integer value
@@ -31,6 +33,7 @@ impl Value {
     pub fn as_string(&self, env: &Environment) -> Result<String> {
         match self {
             Value::File(_, body) => Ok(body.to_string()),
+            Value::RawString(s) => Ok(s.to_string()),
             Value::String(s) => Self::template_str(s, env),
             Value::Int(i) => Ok(i.to_string()),
             Value::Boolean(b) => Ok(b.to_string()),

@@ -7,6 +7,7 @@ use crate::tasks::task::Task;
 use anyhow::Result;
 use log::{debug, info};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 pub struct Parser {
@@ -72,10 +73,34 @@ impl Parser {
                         Value::File(name.to_string(), file.body.to_string()),
                     );
                 }
+                TokenType::Reference(name) if name == "env" => {
+                    let path_str = self.expect_str("env file path")?;
+                    let path = Path::new(&path_str);
+                    Self::parse_env_file(path, global_env.clone())?;
+                    self.expect(TokenType::Semicolon)?;
+                }
                 _ => return Err(anyhow::anyhow!("Unexpected token: {token}",)),
             }
         }
 
+        Ok(())
+    }
+
+    fn parse_env_file(path: &Path, env: Arc<Environment>) -> Result<()> {
+        if !path.exists() || !path.is_file() {
+            return Err(anyhow::anyhow!(
+                "Environment file {path:?} is not a valid file"
+            ));
+        }
+        let contents = std::fs::read_to_string(path)?;
+        let lines = contents.lines();
+        for line in lines {
+            let seperator_idx = line
+                .find('=')
+                .ok_or(anyhow::anyhow!("Missing seperator in environment file"))?;
+            let (key, value) = line.split_at(seperator_idx);
+            env.add(key.to_string(), Value::RawString(value[1..].to_string()));
+        }
         Ok(())
     }
 

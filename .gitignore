@@ -1,4 +1,5 @@
 /target
 taskpod*
 /arch
-
+.env
+test*
