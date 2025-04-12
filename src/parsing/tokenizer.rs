@@ -37,7 +37,7 @@ impl fmt::Display for Token {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, strum_macros::IntoStaticStr)]
 pub enum TokenType {
     /// Literal tokens
     String(String),

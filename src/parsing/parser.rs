@@ -251,13 +251,25 @@ impl Parser {
 
     fn parse_command(&mut self, output: OutputMode) -> Result<Run> {
         let mut parts = Vec::new();
-        while let Some(token) = self.peek() {
-            match token {
+        let breakpoints = vec![
+            TokenType::Semicolon,
+            TokenType::Pipe,
+            TokenType::Comma,
+            TokenType::RightBracket,
+        ];
+        while let Some(token_type) = self.peek() {
+            match token_type {
                 TokenType::Reference(name) => parts.push(Value::String(name.clone())),
                 TokenType::String(value) => parts.push(Value::String(value.clone())),
                 TokenType::Int(value) => parts.push(Value::Int(*value)),
                 TokenType::Boolean(value) => parts.push(Value::Boolean(*value)),
-                _ => break,
+                _ if breakpoints.contains(token_type) => break,
+                _ => {
+                    // Treat any other token as a command part
+                    let token: &'static str = token_type.into();
+                    let value = Value::String(token.to_lowercase());
+                    parts.push(value);
+                },
             }
             self.skip();
         }
