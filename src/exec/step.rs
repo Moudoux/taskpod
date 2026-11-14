@@ -1893,8 +1893,32 @@ fn split_lines(text: &str) -> (Vec<String>, &'static str) {
     )
 }
 
+/// Whether a line starts with `prefix`, ignoring spacing like `same_line`:
+/// leading spacing, and a run of tabs or spaces matching a single space.
 fn starts_with(line: &str, prefix: &str) -> bool {
-    line.trim_start().starts_with(prefix)
+    squeeze(line).starts_with(&squeeze(prefix))
+}
+
+/// `text` without leading spacing, with each run of spacing (a trailing one
+/// too) as a single space.
+fn squeeze(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut space = false;
+    for c in text.trim_start().chars() {
+        if c.is_whitespace() {
+            space = true;
+        } else {
+            if space {
+                out.push(' ');
+                space = false;
+            }
+            out.push(c);
+        }
+    }
+    if space {
+        out.push(' ');
+    }
+    out
 }
 
 /// A line's ending, `""` for a last line without one.
@@ -2180,6 +2204,43 @@ mod tests {
         assert!(owner_matches("root:wheel", "root:wheel"));
         assert!(!owner_matches("root:root", "root:wheel"));
         assert!(!owner_matches("me:me", "root"));
+    }
+
+    #[test]
+    fn line_prefixes_ignore_spacing() {
+        assert!(starts_with(
+            "auth\t\tsufficient  pam_u2f.so cue\n",
+            "auth sufficient pam_u2f.so"
+        ));
+        assert!(starts_with(
+            "  \"DefaultAction\": \"allow\",\n",
+            "\"DefaultAction\""
+        ));
+        assert!(starts_with("auth\tinclude\tsystem-auth\n", "auth "));
+        assert!(!starts_with("authfile x\n", "auth "));
+        assert!(!starts_with("account required pam_unix.so\n", "auth"));
+    }
+
+    #[test]
+    fn match_replaces_a_line_spaced_with_tabs() {
+        let old = "#%PAM-1.0\nauth\t\tsufficient\tpam_u2f.so cue\nauth\t\tinclude\t\tsystem-auth\n";
+        let new = "auth sufficient pam_u2f.so cue authfile=/etc/u2f_mappings";
+        let (text, change) = ensure_line(
+            old,
+            new,
+            Some("auth sufficient pam_u2f.so"),
+            Some(&LinePlace::Before("auth".into())),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            text,
+            format!("#%PAM-1.0\n{new}\nauth\t\tinclude\t\tsystem-auth\n")
+        );
+        assert_eq!(
+            change,
+            LineChange::Replaced("auth\t\tsufficient\tpam_u2f.so cue".into())
+        );
     }
 
     #[test]

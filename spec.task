@@ -139,7 +139,8 @@ task setup {
     # changed; `keep` leaves it (a data directory).
     directory "/tmp/taskpod-example/data" mode 750 keep
     # `line` makes sure a file that's otherwise left alone (a package's, or
-    # yours) has one line, compared ignoring spacing. Missing, it goes before
+    # yours) has one line, compared ignoring spacing (`before`, `after` and
+    # `match` too: a tab or a run of spaces is one space). Missing, it goes before
     # the first other line starting with `before`, after the last starting
     # with `after`, or at the end; on the wrong side of it, it's moved. With
     # `match "start"`, a line starting with that is this step's line, and is
