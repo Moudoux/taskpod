@@ -254,6 +254,26 @@ impl<'s> Parser<'s> {
                         body.block.guards.push(guard);
                     }
                 }
+                "changed" => {
+                    self.skip_inline_ws();
+                    let opens_block = self.peek() == Some('{');
+                    if opens_block {
+                        self.bump();
+                    }
+                    self.end_of_line()?;
+                    if opens_block {
+                        let inner = self.body(BodyKind::Block, start)?;
+                        let mut block = inner.block;
+                        block.guards.insert(0, Guard::Changed);
+                        body.block.steps.push(Step::Block(block));
+                    } else if kind == BodyKind::Task {
+                        let message = "a task's own `changed` has nothing before it: \
+                            use `changed {` after the steps it follows, or a subtask";
+                        return Err(self.error_at(start, message));
+                    } else {
+                        body.block.guards.push(Guard::Changed);
+                    }
+                }
                 "sudo" => {
                     self.end_of_line()?;
                     body.block.sudo = true;
@@ -504,6 +524,9 @@ impl<'s> Parser<'s> {
         let mut keep = false;
         let source = loop {
             self.skip_inline_ws();
+            if dir && self.at_line_end() {
+                break FileSource::Empty;
+            }
             if let Some('"' | '\'') = self.peek() {
                 let start = self.pos;
                 let text = self.string()?;
@@ -581,7 +604,13 @@ impl<'s> Parser<'s> {
         if dir && let FileSource::Inline(_) = source {
             return Err(self.error_at(
                 origin.after_path,
-                "a directory is copied `from` one, like `directory \"/etc/app\" from \"files/app\"`",
+                "a directory is copied `from` one, like `directory \"/etc/app\" from \"files/app\"`, or has no content",
+            ));
+        }
+        if matches!(source, FileSource::Empty) && encoding.is_some() {
+            return Err(self.error_at(
+                origin.after_path,
+                "a directory without `from` has no encoding",
             ));
         }
         self.end_of_line()?;
@@ -970,6 +999,7 @@ fn is_keyword(word: &str) -> bool {
             | "if"
             | "unless"
             | "ask"
+            | "changed"
             | "sudo"
             | "manual"
             | "interactive"
@@ -1039,6 +1069,8 @@ pub fn guard_passes(guard: &Guard, scope: &Scope, cwd: &Path) -> Result<bool> {
         Guard::If(command) => scope.ctx.check(&scope.expand(command)?, cwd),
         Guard::Unless(command) => Ok(!scope.ctx.check(&scope.expand(command)?, cwd)?),
         Guard::Ask(prompt) => crate::exec::ask(&scope.expand(prompt)?),
+        // Only a task run knows; see `TaskRun::nested`.
+        Guard::Changed => bail!("`changed` is only checked inside a task"),
     }
 }
 

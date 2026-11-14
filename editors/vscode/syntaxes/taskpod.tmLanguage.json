@@ -204,7 +204,7 @@
           ]
         },
         {
-          "match": "^\\s*(ask)\\b",
+          "match": "^\\s*(ask|changed)\\b",
           "captures": {
             "1": {
               "name": "keyword.control.conditional.taskpod"
@@ -312,7 +312,7 @@
       }
     },
     "call": {
-      "begin": "^\\s+(?!(?:desc|needs|lock|if|unless|ask|sudo|manual|interactive|workdir|keep|let|run|undo|file|directory|line)\\b)([\\p{L}\\p{N}_.+-]+)(?=\\s|$)",
+      "begin": "^\\s+(?!(?:desc|needs|lock|if|unless|ask|changed|sudo|manual|interactive|workdir|keep|let|run|undo|file|directory|line)\\b)([\\p{L}\\p{N}_.+-]+)(?=\\s|$)",
       "beginCaptures": {
         "1": {
           "name": "entity.name.function.call.taskpod"

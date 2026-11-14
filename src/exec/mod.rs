@@ -347,6 +347,8 @@ impl<'a> Runner<'a> {
             let passes = match guard {
                 // Checks don't ask, they assume yes.
                 Guard::Ask(_) if self.opts.checking() => true,
+                // `TaskRun::nested` checks it first, it knows what changed.
+                Guard::Changed => true,
                 guard => guard_passes(guard, scope, cwd)?,
             };
             if !passes {

@@ -286,6 +286,8 @@ pub enum FileSource {
     Inline(String),
     /// Copy of a file. Relative paths are relative to the file that uses them.
     Copy(String),
+    /// A `directory` with no `from`: only the directory itself.
+    Empty,
 }
 
 #[derive(Debug, Clone)]
@@ -296,6 +298,9 @@ pub enum Guard {
     Unless(String),
     /// Ask the user.
     Ask(String),
+    /// `changed`: run only if an earlier step in the task changed something.
+    /// Only in templates and inline blocks, where something can come before.
+    Changed,
 }
 
 impl Guard {
@@ -304,6 +309,7 @@ impl Guard {
             Guard::If(cmd) => format!("if {cmd}"),
             Guard::Unless(cmd) => format!("unless {cmd}"),
             Guard::Ask(prompt) => format!("ask {prompt:?}"),
+            Guard::Changed => "changed".to_string(),
         }
     }
 }

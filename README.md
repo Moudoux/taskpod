@@ -79,7 +79,8 @@ takes everything without asking.
 
 - A `from "path"` file gets the system's copy (decoded to UTF-8 when it has
   an `encoding`). A `directory` step pulls each of its files, and copies files
-  that are only on the system into the source directory.
+  that are only on the system into the source directory: only from directories
+  the source has too, and not ones another step of the task writes.
 - Inline content is rewritten in the task file. If it uses `{{ variables }}`,
   changed plain lines are pulled and changed lines with a variable are shown
   for you to edit by hand, so values never end up in your task files. Lines
@@ -124,6 +125,9 @@ parent, and inside a task the steps run last first.
   down` before deleting `compose.yml`). A block with commands and no `undo` is
   reported as not undoable, unless it says `keep`: leave it as it is (a system
   update, data directories). `keep` on a file step leaves the file.
+- **Directories**: a `directory` without `from` that taskpod made is deleted
+  once it's empty (otherwise reported and left), and one that was there gets
+  its mode and owner back; `keep` leaves it.
 - **Lines**: the journal records each line taskpod added or replaced (and
   files it created from a `base`), so undo takes out only those, puts back a
   replaced line, and asks about a line changed since. A line with no record

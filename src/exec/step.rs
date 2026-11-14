@@ -1,7 +1,7 @@
 //! Running the steps of one task.
 
 use super::journal::{self, Entry, Previous};
-use super::target::{self, Current, describe};
+use super::target::{self, Current, DirState, describe};
 use super::{Mode, Outcome, Runner, StepKind, StepRecord, TaskReport, pull, sudo};
 use crate::ast::{Block, Encoding, FileSource, FileStep, Guard, LinePlace, LineStep, Step, Task};
 use crate::parser::guard_passes;
@@ -9,6 +9,7 @@ use crate::ui::{self, TaskLine, ui};
 use crate::vars::{Ctx, Scope, Vars, expand_tilde};
 use anyhow::{Context, Result, anyhow, bail};
 use console::style;
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -54,6 +55,9 @@ pub(crate) struct TaskRun<'r> {
     cwd: PathBuf,
     /// Whether a step changed something.
     changed: bool,
+    /// Whether a step before the current block changed something, for
+    /// `changed` guards: `changed` only counts the block's own steps.
+    changed_before: bool,
     /// The live line, when running for real.
     line: Option<TaskLine>,
     /// Lines shown under the task's status line when it's done: the plan in
@@ -72,6 +76,7 @@ impl<'r> TaskRun<'r> {
             slot: Slot::take(runner),
             cwd: PathBuf::new(),
             changed: false,
+            changed_before: false,
             line: None,
             lines: Vec::new(),
             report: TaskReport::default(),
@@ -300,12 +305,18 @@ impl<'r> TaskRun<'r> {
             self.current(depth, &format!("{label} · kept"));
             return Ok(());
         }
+        let nothing_changed = !self.runner.opts.ignore_guards
+            && block.guards.iter().any(|g| matches!(g, Guard::Changed))
+            && !self.changed
+            && !self.changed_before;
         let skip = if undo {
             self.undo_guard(&block.guards, scope)?.is_some()
         } else {
-            self.runner
-                .failing_guard(&block.guards, scope, &self.cwd)?
-                .is_some()
+            nothing_changed
+                || self
+                    .runner
+                    .failing_guard(&block.guards, scope, &self.cwd)?
+                    .is_some()
         };
         if skip {
             self.current(depth, label);
@@ -313,6 +324,8 @@ impl<'r> TaskRun<'r> {
         }
         // The block only counts as a change if a step inside it changes something.
         let changed_before = std::mem::replace(&mut self.changed, false);
+        let outer_changed = self.changed_before;
+        self.changed_before |= changed_before;
         let mark = self.lines.len();
         let step_mark = self.report.steps.len();
         let unchecked_before = self.report.unchecked;
@@ -324,6 +337,7 @@ impl<'r> TaskRun<'r> {
         };
         let inner_changed = self.changed;
         self.changed = changed_before || inner_changed;
+        self.changed_before = outer_changed;
         let live = self.line.as_ref().is_some_and(TaskLine::shows_live_output);
         let indent = " ".repeat(depth * 2);
         if (inner_changed || result.is_err()) && !live {
@@ -522,6 +536,9 @@ impl<'r> TaskRun<'r> {
     /// source directory, at the same place under the step's path. Files on
     /// the system that the source doesn't have are left alone.
     fn dir(&mut self, file: &FileStep, scope: &Scope, depth: usize) -> Result<()> {
+        if let FileSource::Empty = file.source {
+            return self.make_dir(file, scope, depth);
+        }
         let FileSource::Copy(source) = &file.source else {
             bail!("directory {}: needs `from` a directory", file.path);
         };
@@ -550,6 +567,238 @@ impl<'r> TaskRun<'r> {
         Ok(())
     }
 
+    /// `directory "path"` with no `from`: the directory exists, with its mode
+    /// (default 755) and owner. The journal records whether taskpod created
+    /// it, or its mode and owner before (as a file entry with no content).
+    fn make_dir(&mut self, file: &FileStep, scope: &Scope, depth: usize) -> Result<()> {
+        let ctx = &self.runner.file.ctx;
+        let task = self.task.name.clone();
+        let path = self.target(&scope.expand(&file.path)?);
+        let label = format!("directory {}", path.display());
+        let mode = file.mode.unwrap_or(0o755);
+        let owner = file.owner.as_deref().map(|o| scope.expand(o)).transpose()?;
+        let root = file.sudo || owner.is_some();
+        // Nothing to pull: the step holds no content.
+        if self.runner.opts.pull {
+            self.current(depth, &label);
+            return Ok(());
+        }
+        if self.runner.opts.undo {
+            return self.undo_dir(file, depth, &path, root);
+        }
+        let state = target::dir_state(ctx, &task, &path, false)?;
+        if state == DirState::NotDir {
+            bail!("{} exists and isn't a directory", path.display());
+        }
+        let stat = target::stat(ctx, &path).filter(|_| state != DirState::Missing);
+        let mut differences = Vec::new();
+        match &stat {
+            None => differences.push("new directory".to_string()),
+            Some((current, current_owner)) => {
+                if *current != mode {
+                    differences.push(format!("mode {current:o} → {mode:o}"));
+                }
+                if let Some(wanted) = &owner
+                    && !owner_matches(current_owner, wanted)
+                {
+                    differences.push(format!("owner {current_owner} → {wanted}"));
+                }
+            }
+        }
+        if differences.is_empty() {
+            self.current(depth, &label);
+            return Ok(());
+        }
+        self.change(depth, &format!("{label} · {}", differences.join(", ")));
+        if self.mode() != Mode::Run {
+            return Ok(());
+        }
+        let previous = match stat {
+            None => Previous::Missing,
+            Some((mode, owner)) => Previous::File {
+                content: Vec::new(),
+                mode,
+                owner,
+            },
+        };
+        journal::record(ctx, &task, &path, root, &previous)?;
+        target::make_dir(ctx, &task, &path, mode, owner.as_deref(), file.sudo)
+            .with_context(|| format!("failed to make {}", path.display()))
+    }
+
+    /// Undo a `directory` without `from`: remove it if taskpod created it and
+    /// it's empty, or put its mode and owner back.
+    fn undo_dir(&mut self, file: &FileStep, depth: usize, path: &Path, root: bool) -> Result<()> {
+        let ctx = &self.runner.file.ctx;
+        let task = self.task.name.clone();
+        let label = format!("directory {}", path.display());
+        if file.keep {
+            self.current(depth, &format!("{label} · kept"));
+            return Ok(());
+        }
+        let write = !self.checking();
+        let entry = journal::read(ctx, &task, path, root, write && root)?;
+        let recorded = entry != Entry::None;
+        let previous = match entry {
+            Entry::Some(previous) => Some(previous),
+            Entry::Unreadable => None,
+            Entry::None if file.new => Some(Previous::Missing),
+            Entry::None => {
+                if target::stat(ctx, path).is_none() {
+                    self.current(depth, &format!("{label} · not on the system"));
+                } else {
+                    let text = format!(
+                        "{label}: no record of it before taskpod; mark it `new` if taskpod created it, or `keep`"
+                    );
+                    self.cannot(depth, &text);
+                }
+                return Ok(());
+            }
+        };
+        let forget = |runner: &Runner| -> Result<()> {
+            if write && recorded {
+                journal::remove(&runner.file.ctx, &task, path, root)?;
+            }
+            Ok(())
+        };
+        let state = target::dir_state(ctx, &task, path, write && root)?;
+        match previous {
+            None => {
+                self.change(
+                    depth,
+                    &format!("{label} · put back what was there before taskpod"),
+                );
+                if write {
+                    bail!("can't read the undo journal's entry for {}", path.display());
+                }
+                Ok(())
+            }
+            Some(Previous::Missing) => match state {
+                DirState::Missing => {
+                    self.current(depth, &format!("{label} · already gone"));
+                    forget(self.runner)
+                }
+                DirState::NotDir => {
+                    self.cannot(
+                        depth,
+                        &format!("{label}: it isn't a directory any more, left as it is"),
+                    );
+                    Ok(())
+                }
+                DirState::NotEmpty => {
+                    self.cannot(
+                        depth,
+                        &format!("{label}: taskpod created it, but it isn't empty, left as it is"),
+                    );
+                    Ok(())
+                }
+                DirState::Empty | DirState::Unlistable => {
+                    let note = if state == DirState::Unlistable {
+                        " if it's empty"
+                    } else {
+                        ""
+                    };
+                    self.change(
+                        depth,
+                        &format!("{label} · delete it{note}, taskpod created it"),
+                    );
+                    if !write {
+                        return Ok(());
+                    }
+                    if state == DirState::Unlistable {
+                        self.cannot(
+                            depth,
+                            &format!("{label}: can't see if it's empty, left as it is"),
+                        );
+                        return Ok(());
+                    }
+                    target::remove_dir(ctx, &task, path, root)
+                        .with_context(|| format!("failed to undo {}", path.display()))?;
+                    forget(self.runner)
+                }
+            },
+            Some(Previous::File { mode, owner, .. }) => {
+                let current = target::stat(ctx, path);
+                if current
+                    .as_ref()
+                    .is_some_and(|(m, o)| *m == mode && (!root || *o == owner))
+                {
+                    self.current(depth, &format!("{label} · already as it was"));
+                    return forget(self.runner);
+                }
+                if current.is_none() {
+                    self.current(depth, &format!("{label} · not on the system"));
+                    return Ok(());
+                }
+                self.change(
+                    depth,
+                    &format!(
+                        "{label} · put back mode {mode:o}{}",
+                        if root {
+                            format!(", owner {owner}")
+                        } else {
+                            String::new()
+                        }
+                    ),
+                );
+                if !write {
+                    return Ok(());
+                }
+                target::make_dir(
+                    ctx,
+                    &task,
+                    path,
+                    mode,
+                    root.then_some(owner.as_str()),
+                    file.sudo,
+                )
+                .with_context(|| format!("failed to undo {}", path.display()))?;
+                forget(self.runner)
+            }
+        }
+    }
+
+    /// A path on the machine being configured, relative ones from the workdir.
+    fn target(&self, path: &str) -> PathBuf {
+        let path = PathBuf::from(self.runner.file.ctx.target_path(path));
+        if path.is_absolute() {
+            path
+        } else {
+            self.cwd.join(path)
+        }
+    }
+
+    /// The paths `file` and `line` steps in `block` write, as far as they
+    /// can be worked out without running anything.
+    fn written_paths(&self, block: &Block, scope: &Scope, out: &mut HashSet<PathBuf>) {
+        for step in &block.steps {
+            match step {
+                Step::File(file) if !file.dir => {
+                    if let Ok(path) = scope.expand(&file.path) {
+                        out.insert(self.target(&path));
+                    }
+                }
+                Step::Line(line) => {
+                    if let Ok(path) = scope.expand(&line.path) {
+                        out.insert(self.target(&path));
+                    }
+                }
+                Step::Block(inner) => self.written_paths(inner, scope, out),
+                Step::Call { template, args } => {
+                    let template = &self.runner.file.templates[template];
+                    let Ok(args) = scope.expand(args) else {
+                        continue;
+                    };
+                    let arg_vars = Vars::for_args(&args);
+                    let call_scope = scope.child(&arg_vars);
+                    let template_vars = template.vars.for_call();
+                    self.written_paths(&template.body, &call_scope.child(&template_vars), out);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// `--pull` for a directory: files on the system that the source
     /// directory doesn't have are copied into it.
     fn pull_new_files(
@@ -562,14 +811,25 @@ impl<'r> TaskRun<'r> {
     ) -> Result<()> {
         let ctx = &self.runner.file.ctx;
         let task = self.task.name.clone();
-        let dir = PathBuf::from(ctx.target_path(&scope.expand(&file.path)?));
-        let dir = if dir.is_absolute() {
-            dir
-        } else {
-            self.cwd.join(dir)
-        };
+        let dir = self.target(&scope.expand(&file.path)?);
+        // Files other steps of the task write, like one written inline from
+        // secrets, aren't the directory's to pull.
+        let mut written = HashSet::new();
+        self.written_paths(
+            &self.task.body,
+            &self.runner.root_scope().child(&self.task.vars),
+            &mut written,
+        );
         let as_root = self.mode() == Mode::Run && file.sudo;
-        let system = match target::list(ctx, &task, &dir, as_root) {
+        // The source's own directories: the top, and every one on the way
+        // to one of its files.
+        let mut subdirs = vec![String::new()];
+        for name in names {
+            subdirs.extend(name.match_indices('/').map(|(i, _)| name[..i].to_string()));
+        }
+        subdirs.sort();
+        subdirs.dedup();
+        let system = match target::list(ctx, &task, &dir, &subdirs, as_root) {
             Ok(system) => system,
             Err(e) => {
                 let hint = if file.sudo {
@@ -585,6 +845,9 @@ impl<'r> TaskRun<'r> {
         };
         for name in system.iter().filter(|n| !names.contains(n)) {
             let path = dir.join(name);
+            if written.contains(&path) {
+                continue;
+            }
             let target = source.join(name);
             let label = format!("file {} · only on the system", path.display());
             let refuse = |this: &mut Self, why: &str| {
@@ -995,6 +1258,8 @@ impl<'r> TaskRun<'r> {
         for guard in guards {
             let applies = match guard {
                 Guard::Ask(_) if self.checking() => true,
+                // What ran after a change is undone either way.
+                Guard::Changed => true,
                 Guard::Unless(_) => !guard_passes(guard, scope, &self.cwd)?,
                 Guard::If(_) | Guard::Ask(_) => guard_passes(guard, scope, &self.cwd)?,
             };
@@ -1457,6 +1722,7 @@ fn pull_content(
             .ok_or_else(|| anyhow!("the system's file isn't valid {}", encoding.name()))
     };
     match &file.source {
+        FileSource::Empty => bail!("a directory without `from` has nothing to pull"),
         FileSource::Copy(source) => {
             let source = copy_source(source, scope, dir)?;
             let bytes = if file.raw {
@@ -1774,6 +2040,7 @@ fn list_files(dir: &Path, prefix: &str, names: &mut Vec<String>) -> Result<()> {
 /// The bytes a file step writes.
 fn file_content(file: &FileStep, scope: &Scope, dir: &Path) -> Result<Vec<u8>> {
     match &file.source {
+        FileSource::Empty => bail!("a directory without `from` has no content"),
         FileSource::Inline(text) => file.encoding.encode(&scope.expand(text)?),
         FileSource::Copy(source) => {
             let source = copy_source(source, scope, dir)?;

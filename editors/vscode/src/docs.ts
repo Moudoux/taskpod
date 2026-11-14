@@ -109,6 +109,13 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
     syntax: 'ask "Install games?"',
     snippet: 'ask "${1:Question?}"',
   },
+  changed: {
+    places: ["body"],
+    summary:
+      "Only if an earlier step in this task changed something, like restarting a service after its config file. `changed {` guards a block; in a template, a `changed` line makes the call wait for a change before it in the calling task. In undo, its `undo` runs where it stands either way. A subtask does the same as its own task.",
+    syntax: 'file "/etc/app.conf" sudo from "files/app.conf"\nchanged {\n    run sudo systemctl restart app\n}',
+    snippet: "changed {\n\t$0\n}",
+  },
   lock: {
     places: ["body"],
     summary:
@@ -181,8 +188,8 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   directory: {
     places: ["body"],
     summary:
-      "Copies every file in a `from` directory (subdirectories included) to the same place under the path, each like its own `file` step with the same options: written only when it differs, pulled back with `--pull`, undone with `--undo`. Files on the system that the directory doesn't have are left alone, and `--pull` copies them into it.",
-    syntax: 'directory "/etc/opensnitchd/rules" sudo new from "files/etc/opensnitchd/rules"',
+      "Copies every file in a `from` directory (subdirectories included) to the same place under the path, each like its own `file` step with the same options: written only when it differs, pulled back with `--pull`, undone with `--undo`. Files on the system that the directory doesn't have are left alone, and `--pull` copies them into it: only from directories the source has too, and not ones another step of the task writes. Without `from`, only the directory itself: made if it's missing, with `mode` (default 755) and `owner`; undo deletes one taskpod made once it's empty.",
+    syntax: 'directory "/etc/opensnitchd/rules" sudo new from "files/etc/opensnitchd/rules"\ndirectory "/var/lib/app" sudo keep mode 750 owner app:app',
     snippet: 'directory "${1:path}" from "${2:files/path}"',
   },
   line: {

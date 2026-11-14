@@ -1,5 +1,5 @@
 use super::*;
-use crate::ast::Encoding;
+use crate::ast::{Encoding, FileSource, Step};
 use crate::parser::parse_str;
 
 fn options(jobs: usize) -> Options {
@@ -1160,9 +1160,13 @@ fn copies_directories() {
     std::fs::write(path("files/rules/nested/c.sh"), "#!/bin/sh\n").unwrap();
     std::fs::create_dir_all(path("out")).unwrap();
     std::fs::write(path("out/theirs.json"), "theirs\n").unwrap();
+    // Not in a directory the source has: an app's data, never pulled.
+    std::fs::create_dir_all(path("out/data")).unwrap();
+    std::fs::write(path("out/data/db"), "data\n").unwrap();
     let source = r#"
         task rules {
             directory "out" new from "files/rules"
+            file "out/inline.env" new "inline\n"
         }
     "#;
     assert_eq!(
@@ -1193,6 +1197,9 @@ fn copies_directories() {
     assert_eq!(read(dir.path(), "files/rules/a.json"), "changed\n");
     // Files only on the system are pulled in too, unless they hold a secret.
     assert_eq!(read(dir.path(), "files/rules/theirs.json"), "theirs\n");
+    // But not files another step of the task writes.
+    assert!(!path("files/rules/inline.env").exists());
+    assert!(!path("files/rules/data").exists());
     drop(edits);
 
     // Undo removes what it wrote, and leaves the system's own files.
@@ -1402,11 +1409,21 @@ fn lists_directories_over_ssh() {
     std::fs::create_dir_all(home.join("rules/sub")).unwrap();
     std::fs::write(home.join("rules/b"), "").unwrap();
     std::fs::write(home.join("rules/sub/a"), "").unwrap();
+    std::fs::create_dir_all(home.join("rules/data/deeper")).unwrap();
+    std::fs::write(home.join("rules/data/deeper/db"), "").unwrap();
     let mut file = parse_str("", dir.path()).unwrap();
     file.ctx.remote = Some(remote);
-    let list = |p: &Path| super::target::list(&file.ctx, "t", p, false).unwrap();
-    assert_eq!(list(&home.join("rules")), ["b", "sub/a"]);
-    assert!(list(&home.join("nothing")).is_empty());
+    let list = |p: &Path, subdirs: &[&str]| {
+        let subdirs: Vec<String> = subdirs.iter().map(|s| s.to_string()).collect();
+        super::target::list(&file.ctx, "t", p, &subdirs, false).unwrap()
+    };
+    // Only the directories asked for, each without what's below it.
+    assert_eq!(
+        list(&home.join("rules"), &["", "sub", "missing"]),
+        ["b", "sub/a"]
+    );
+    assert_eq!(list(&home.join("rules"), &[""]), ["b"]);
+    assert!(list(&home.join("nothing"), &[""]).is_empty());
 }
 
 /// Run an undo and return the task's report too.
@@ -1526,4 +1543,209 @@ fn lines_move_to_their_place() {
         read(dir.path(), "pam"),
         "auth u2f\nauth include x\naccount y\nsession z\n"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn changed_runs_only_after_a_change() {
+    let dir = tempfile::tempdir().unwrap();
+    // A template's own `changed` sees the steps before the call, in the
+    // calling task, and a nested block sees the steps before the outer one.
+    let source = r#"
+        template up {
+            changed
+            run echo up {{ 1 }} >> log
+            undo echo down {{ 1 }} >> log
+        }
+        task stack {
+            file "app.conf" "v1\n"
+            up app
+        }
+        task nested {
+            file "other.conf" "v1\n"
+            if true {
+                changed {
+                    run echo nested >> log
+                }
+            }
+        }
+        task inside {
+            changed {
+                run echo never >> log
+            }
+            if true {
+                run echo inside >> log
+                changed {
+                    run echo after inside >> log
+                }
+            }
+        }
+    "#;
+    let outcomes = run(source, dir.path(), &options(1), &[]);
+    assert_eq!(outcomes["stack"], Outcome::Ran);
+    let log = read(dir.path(), "log");
+    assert!(log.contains("up app\n"), "{log}");
+    assert!(log.contains("nested\n"), "{log}");
+    assert!(log.contains("after inside\n"), "{log}");
+    assert!(!log.contains("never"), "{log}");
+
+    // Up to date: nothing changed, so nothing after it runs either.
+    std::fs::remove_file(dir.path().join("log")).unwrap();
+    let outcomes = run(source, dir.path(), &options(1), &["stack", "nested"]);
+    assert_eq!(outcomes["stack"], Outcome::UpToDate);
+    assert_eq!(outcomes["nested"], Outcome::UpToDate);
+    assert_eq!(read(dir.path(), "log"), "");
+
+    // A diff shows the change and what would run after it, without running it.
+    std::fs::write(dir.path().join("app.conf"), "edited\n").unwrap();
+    let mut opts = options(1);
+    opts.mode = Mode::Diff;
+    let outcomes = run(source, dir.path(), &opts, &["stack"]);
+    assert_eq!(outcomes["stack"], Outcome::Ran);
+    assert_eq!(read(dir.path(), "log"), "");
+    let outcomes = run(source, dir.path(), &options(1), &["stack"]);
+    assert_eq!(outcomes["stack"], Outcome::Ran);
+    assert_eq!(read(dir.path(), "log"), "up app\n");
+
+    // Undo runs a `changed` block's undo where it stands, before the file goes.
+    std::fs::remove_file(dir.path().join("log")).unwrap();
+    let outcomes = undo(source, dir.path(), Mode::Run, &["stack"]);
+    assert_eq!(outcomes["stack"], Outcome::Ran);
+    assert_eq!(read(dir.path(), "log"), "down app\n");
+    assert!(!dir.path().join("app.conf").exists());
+}
+
+#[test]
+fn changed_needs_something_before_it() {
+    let err = parse_str("task a {\n changed\n run true\n}\n", Path::new("/tmp"))
+        .err()
+        .unwrap();
+    assert!(format!("{err:#}").contains("nothing before it"), "{err:#}");
+    assert!(parse_str("template t {\n changed\n run true\n}\n", Path::new("/tmp")).is_ok());
+    let err = parse_str("template changed {\n run true\n}\n", Path::new("/tmp"))
+        .err()
+        .unwrap();
+    assert!(format!("{err:#}").contains("keyword"), "{err:#}");
+}
+
+#[cfg(unix)]
+#[test]
+fn directories_without_from_are_made_and_undone() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = |n: &str| dir.path().join(n);
+    let mode = |n: &str| std::fs::metadata(path(n)).unwrap().permissions().mode() & 0o7777;
+    std::fs::create_dir(path("theirs")).unwrap();
+    std::fs::set_permissions(path("theirs"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let source = r#"
+        task dirs {
+            directory "made/deep" mode 750
+            directory "theirs"
+            directory "data" keep
+        }
+    "#;
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["dirs"],
+        Outcome::Ran
+    );
+    assert_eq!(mode("made/deep"), 0o750);
+    assert_eq!(mode("theirs"), 0o755);
+    assert!(path("data").is_dir());
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["dirs"],
+        Outcome::UpToDate
+    );
+
+    // A diff notices the mode.
+    std::fs::set_permissions(path("made/deep"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut opts = options(1);
+    opts.mode = Mode::Diff;
+    assert_eq!(run(source, dir.path(), &opts, &[])["dirs"], Outcome::Ran);
+    assert_eq!(mode("made/deep"), 0o700);
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["dirs"],
+        Outcome::Ran
+    );
+    assert_eq!(mode("made/deep"), 0o750);
+
+    // Undo: a directory taskpod made goes if it's empty, one that was there
+    // gets its mode back, and a kept one stays.
+    std::fs::write(path("data/db"), "").unwrap();
+    let (outcome, report) = undo_report(source, dir.path(), "dirs");
+    assert_eq!(outcome, Outcome::Ran);
+    assert_eq!(report.cannot, 0);
+    assert!(!path("made/deep").exists());
+    assert!(path("made").is_dir(), "only the step's own directory goes");
+    assert_eq!(mode("theirs"), 0o700);
+    assert!(path("data/db").exists());
+
+    // Not empty: left, and reported.
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["dirs"],
+        Outcome::Ran
+    );
+    std::fs::write(path("made/deep/file"), "").unwrap();
+    let (_, report) = undo_report(source, dir.path(), "dirs");
+    assert_eq!(report.cannot, 1);
+    assert!(path("made/deep/file").exists());
+
+    // Something else in the way is an error.
+    std::fs::write(path("plain"), "").unwrap();
+    let outcome = &run(
+        "task t {\n directory \"plain\"\n}\n",
+        dir.path(),
+        &options(1),
+        &[],
+    )["t"];
+    assert!(
+        matches!(outcome, Outcome::Failed(e) if e.contains("isn't a directory")),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn directories_without_from_parse() {
+    let file = parse_str(
+        "task t {\n directory \"/x\" sudo keep mode 750 owner a:b\n}\n",
+        Path::new("/tmp"),
+    )
+    .unwrap();
+    let Step::File(step) = &file.tasks["t"].body.steps[0] else {
+        panic!()
+    };
+    assert!(step.dir && matches!(step.source, FileSource::Empty));
+    assert_eq!(step.mode, Some(0o750));
+    let err = parse_str(
+        "task t {\n directory \"/x\" encoding latin1\n}\n",
+        Path::new("/tmp"),
+    )
+    .err()
+    .unwrap();
+    assert!(format!("{err:#}").contains("no encoding"), "{err:#}");
+    assert!(parse_str("task t {\n file \"/x\"\n}\n", Path::new("/tmp")).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn makes_directories_over_ssh() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (remote, home) = fake_remote(dir.path());
+    let mut file = parse_str("", dir.path()).unwrap();
+    file.ctx.remote = Some(remote);
+    let made = home.join("a b/c");
+    let state = |p: &Path| super::target::dir_state(&file.ctx, "t", p, false).unwrap();
+    assert_eq!(state(&made), super::target::DirState::Missing);
+    super::target::make_dir(&file.ctx, "t", &made, 0o750, None, false).unwrap();
+    assert_eq!(
+        std::fs::metadata(&made).unwrap().permissions().mode() & 0o7777,
+        0o750
+    );
+    assert_eq!(state(&made), super::target::DirState::Empty);
+    std::fs::write(made.join("f"), "").unwrap();
+    assert_eq!(state(&made), super::target::DirState::NotEmpty);
+    assert_eq!(state(&made.join("f")), super::target::DirState::NotDir);
+    std::fs::remove_file(made.join("f")).unwrap();
+    super::target::remove_dir(&file.ctx, "t", &made, false).unwrap();
+    assert!(!made.exists());
 }

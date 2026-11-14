@@ -138,3 +138,20 @@ test("undo blocks are shell, keep and undo aren't template calls", () => {
   expect(index.lines[3].context).toBe("shell");
   expect(index.lines[5].context).not.toBe("shell");
 });
+
+test("changed blocks hold steps, and changed isn't a template call", () => {
+  const index = parse(`template up {
+    changed
+    run up
+}
+task app {
+    file "app.conf" "x"
+    changed {
+        up app
+    }
+    up other
+}
+`);
+  expect(index.refs.filter((r) => r.kind === "template").map((r) => r.name)).toEqual(["up", "up"]);
+  expect(index.tasks.map((t) => t.name)).toEqual(["app"]);
+});

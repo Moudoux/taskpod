@@ -75,14 +75,30 @@ fn read_remote(remote: &Remote, path: &Path, sudo: bool) -> Result<Current> {
 /// The files under a directory (through symlinks), as paths relative to it
 /// joined with `/`, sorted; empty if there's no directory. With `sudo`, a
 /// directory the user can't list is listed as root.
-pub fn list(ctx: &Ctx, task: &str, dir: &Path, sudo: bool) -> Result<Vec<String>> {
-    let script = "[ -d \"$1\" ] || exit 0\ncd -- \"$1\" && find -L . -type f";
+pub fn list(
+    ctx: &Ctx,
+    task: &str,
+    dir: &Path,
+    subdirs: &[String],
+    sudo: bool,
+) -> Result<Vec<String>> {
+    // Only the files right in each subdirectory: not what's in others, like
+    // an app's data next to its config.
+    let script = "[ -d \"$1\" ] || exit 0\ncd -- \"$1\" && shift\nfor d; do\n  if [ -d \"$d\" ]; then find -L \"$d\" -mindepth 1 -maxdepth 1 -type f || exit 1; fi\ndone";
+    let subdirs: Vec<&str> = subdirs
+        .iter()
+        .map(|d| if d.is_empty() { "." } else { d.as_str() })
+        .collect();
     let run = |root: bool| -> Result<std::process::Output> {
         let dir = arg(dir);
         match &ctx.remote {
             Some(remote) => {
                 let sh = if root { "sudo sh" } else { "sh" };
-                let script = format!("{sh} -c {} sh {}", quote(script), quote(&dir));
+                let mut script = format!("{sh} -c {} sh {}", quote(script), quote(&dir));
+                for d in &subdirs {
+                    script.push(' ');
+                    script.push_str(&quote(d));
+                }
                 remote.output(&script, &[])
             }
             None => {
@@ -96,6 +112,7 @@ pub fn list(ctx: &Ctx, task: &str, dir: &Path, sudo: bool) -> Result<Vec<String>
                 command
                     .args(["-c", script, "sh"])
                     .arg(dir)
+                    .args(&subdirs)
                     .stdin(Stdio::null())
                     .stderr(Stdio::null())
                     .output()
@@ -113,7 +130,7 @@ pub fn list(ctx: &Ctx, task: &str, dir: &Path, sudo: bool) -> Result<Vec<String>
     }
     let mut names: Vec<String> = String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter_map(|l| l.strip_prefix("./"))
+        .map(|l| l.strip_prefix("./").unwrap_or(l))
         .map(String::from)
         .collect();
     names.sort();
@@ -354,4 +371,130 @@ pub fn describe(status: ExitStatus) -> String {
         Some(code) => format!("status {code}"),
         None => status.to_string(),
     }
+}
+
+/// What's at a path that should be a directory.
+#[derive(Debug, PartialEq)]
+pub enum DirState {
+    Missing,
+    /// Something that isn't a directory.
+    NotDir,
+    Empty,
+    NotEmpty,
+    /// A directory whose contents can't be listed (as this user).
+    Unlistable,
+}
+
+/// `$1`'s state, through symlinks like `stat`.
+const DIR_STATE: &str = r#"if [ ! -e "$1" ]; then echo missing
+elif [ ! -d "$1" ]; then echo not-dir
+elif [ ! -r "$1" ] || [ ! -x "$1" ]; then echo unlistable
+elif [ -n "$(ls -A -- "$1")" ]; then echo not-empty
+else echo empty; fi"#;
+
+/// Run a script with arguments on the machine being configured, as root
+/// with `sudo`.
+fn script_output(
+    ctx: &Ctx,
+    script: &str,
+    args: &[String],
+    sudo: bool,
+) -> Result<std::process::Output> {
+    match &ctx.remote {
+        Some(remote) => {
+            let sh = if sudo { "sudo sh" } else { "sh" };
+            let mut command = format!("{sh} -c {} sh", quote(script));
+            for a in args {
+                command.push(' ');
+                command.push_str(&quote(a));
+            }
+            remote.output(&command, &[])
+        }
+        None => {
+            let mut command = if sudo {
+                let mut c = std::process::Command::new("sudo");
+                c.arg("sh");
+                c
+            } else {
+                std::process::Command::new("sh")
+            };
+            command
+                .args(["-c", script, "sh"])
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .context("failed to run sh")
+        }
+    }
+}
+
+/// Whether `path` is a directory, and whether it's empty. With `sudo`, one
+/// the user can't list is looked at as root.
+pub fn dir_state(ctx: &Ctx, task: &str, path: &Path, sudo: bool) -> Result<DirState> {
+    let state = |root: bool| -> Result<DirState> {
+        let output = script_output(ctx, DIR_STATE, &[arg(path)], root)?;
+        Ok(match String::from_utf8_lossy(&output.stdout).trim() {
+            "missing" => DirState::Missing,
+            "not-dir" => DirState::NotDir,
+            "empty" => DirState::Empty,
+            "not-empty" => DirState::NotEmpty,
+            _ => DirState::Unlistable,
+        })
+    };
+    match state(false)? {
+        DirState::Unlistable if sudo => {
+            sudo::ensure(task, ctx)?;
+            state(true)
+        }
+        other => Ok(other),
+    }
+}
+
+/// Create a directory (and its parents) if it's missing, and set its mode,
+/// and owner if given, which needs root.
+pub fn make_dir(
+    ctx: &Ctx,
+    task: &str,
+    path: &Path,
+    mode: u32,
+    owner: Option<&str>,
+    sudo: bool,
+) -> Result<()> {
+    let root = sudo || owner.is_some();
+    if root {
+        sudo::ensure(task, ctx)?;
+    }
+    let script = r#"mkdir -p -- "$1" && chmod "$2" "$1" && { [ -z "$3" ] || chown "$3" "$1"; }"#;
+    let args = [
+        arg(path),
+        format!("{mode:o}"),
+        owner.unwrap_or_default().to_string(),
+    ];
+    let output = script_output(ctx, script, &args, root)?;
+    if !output.status.success() {
+        bail!(
+            "creating it exited with {}: {}",
+            describe(output.status),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Remove an empty directory.
+pub fn remove_dir(ctx: &Ctx, task: &str, path: &Path, sudo: bool) -> Result<()> {
+    if sudo {
+        sudo::ensure(task, ctx)?;
+    }
+    let output = script_output(ctx, r#"rmdir -- "$1""#, &[arg(path)], sudo)?;
+    if !output.status.success() {
+        bail!(
+            "rmdir exited with {}: {}",
+            describe(output.status),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }

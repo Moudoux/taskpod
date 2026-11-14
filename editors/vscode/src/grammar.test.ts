@@ -124,3 +124,25 @@ test("highlights directory and line steps", async () => {
   expect(scopeOf(tokens, "before")).toContain("keyword.other.taskpod");
   expect(tokens.some(([, s]) => s.includes("entity.name.function.call"))).toBe(false);
 });
+
+test("highlights changed as a guard", async () => {
+  const tokenize = await tokenizer();
+  const tokens = tokenize(`task app {
+    file "app.conf" "x"
+    changed {
+        run restart
+    }
+}`);
+  expect(scopeOf(tokens, "changed")).toContain("keyword.control.conditional");
+  expect(tokens.some(([, s]) => s.includes("entity.name.function.call"))).toBe(false);
+});
+
+test("highlights a directory without from", async () => {
+  const tokenize = await tokenizer();
+  const tokens = tokenize(`task app {
+    directory "/var/lib/app" sudo keep mode 750 owner app:app
+}`);
+  expect(scopeOf(tokens, "directory")).toContain("keyword.other.file");
+  expect(scopeOf(tokens, "keep")).toContain("keyword.other.taskpod");
+  expect(tokens.some(([, s]) => s.includes("entity.name.function.call"))).toBe(false);
+});

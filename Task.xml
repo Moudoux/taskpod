@@ -13,7 +13,7 @@
     </options>
     <keywords keywords="age-key;env;include;let;of;secrets;shell;subtask;task;template" ignore_case="false" />
     <keywords2 keywords="after;base;before;desc;directory;encoding;file;from;interactive;keep;line;lock;manual;match;mode;needs;new;owner;run;sudo;undo;workdir" />
-    <keywords3 keywords="ask;choose;confirm;if;input;unless" />
+    <keywords3 keywords="ask;changed;choose;confirm;if;input;unless" />
   </highlighting>
   <extensionMap>
     <mapping ext="task" />

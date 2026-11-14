@@ -73,10 +73,19 @@ task hello {
     unless test -e /tmp/taskpod-hello {
         run touch /tmp/taskpod-hello
     }
+    # `changed {` only runs if an earlier step in this task changed something,
+    # like restarting a service after its config file. In undo, its `undo`
+    # runs where it stands either way. In a template, a `changed` line makes
+    # the whole call wait for a change before it in the calling task.
+    file "/tmp/taskpod-hello.conf" "greeting=hello\n"
+    changed {
+        run echo "the config changed"
+    }
 }
 
 # Subtasks run after their parent, and only if the parent changed something:
-# not when it was skipped or everything in it was already up to date.
+# not when it was skipped or everything in it was already up to date. Unlike
+# a `changed` block, a subtask is its own task, so it can be run with -r.
 subtask world of hello {
     run echo "world"
 }
@@ -119,8 +128,15 @@ task setup {
     # `directory` copies every file in a `from` directory (subdirectories
     # included), each like its own file step with the same options. Files
     # there that the directory doesn't have are left alone, and --pull
-    # copies them into it.
+    # copies them into it: only from directories the source has too (not an
+    # app's data/ next to its config), and not ones other steps of the task
+    # write (like a secrets file written inline).
     directory "/tmp/taskpod-example/editors" from "editors/vscode/syntaxes"
+    # Without `from`, only the directory: made if it's missing (with its
+    # parents), with `mode` (default 755) and `owner`. Undo deletes one
+    # taskpod made only once it's empty, and puts back a mode or owner it
+    # changed; `keep` leaves it (a data directory).
+    directory "/tmp/taskpod-example/data" mode 750 keep
     # `line` makes sure a file that's otherwise left alone (a package's, or
     # yours) has one line, compared ignoring spacing. Missing, it goes before
     # the first other line starting with `before`, after the last starting

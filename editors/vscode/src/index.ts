@@ -261,6 +261,7 @@ export function parse(text: string): Index {
       case "if":
       case "unless":
       case "ask":
+      case "changed":
         if (stack.length && /\{\s*$/.test(rest)) stack.push({ kind: "block", owner: frame?.owner, ownerKind: frame?.ownerKind });
         return;
       case "file":
