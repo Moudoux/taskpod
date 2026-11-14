@@ -478,6 +478,30 @@ fn remote_sudo_uses_the_password() {
 
 #[cfg(unix)]
 #[test]
+fn root_only_files_are_read_as_root() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (remote, home) = fake_remote(dir.path());
+    // A fake sudo that can read what the user can't, by lending them read access.
+    crate::test_util::write_script(
+        &dir.path().join("bin/sudo"),
+        "#!/bin/sh\n[ \"$1\" = -n ] && shift\nif [ \"$1\" = cat ]; then chmod u+r \"$3\"; cat -- \"$3\"; s=$?; chmod u-r \"$3\"; exit $s; fi\nexec \"$@\"\n",
+    );
+    let source = "task t {\n file \"~/secret\" sudo mode 200 \"x\\n\"\n}\n";
+    let outcomes = run_remote(source, dir.path(), &remote, &options(1));
+    assert_eq!(outcomes["t"], Outcome::Ran, "{outcomes:?}");
+    let mode = std::fs::metadata(home.join("secret"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o200);
+    // Unreadable as the user, it's still seen to be up to date.
+    let outcomes = run_remote(source, dir.path(), &remote, &options(1));
+    assert_eq!(outcomes["t"], Outcome::UpToDate, "{outcomes:?}");
+}
+
+#[cfg(unix)]
+#[test]
 fn pulls_system_changes_back() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
@@ -1147,6 +1171,17 @@ fn undo_keeps_what_others_need() {
     assert!(err.contains("-u -r c a b"), "{err}");
     let all = select_undo(&file, &["c".into(), "a".into(), "b".into()]).unwrap();
     assert_eq!(all, ["c", "a", "b"]);
+
+    // A task that needs several of them is named once.
+    let file = parse_str(
+        "task c {\n run true\n}\ntask d {\n run true\n}\ntask a {\n needs c d\n run true\n}\ntask b {\n needs c\n run true\n}\n",
+        Path::new("/tmp"),
+    )
+    .unwrap();
+    let err = select_undo(&file, &["c".into(), "d".into()])
+        .unwrap_err()
+        .to_string();
+    assert!(err.ends_with("-u -r c d a b"), "{err}");
 }
 
 #[cfg(unix)]

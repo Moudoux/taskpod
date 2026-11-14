@@ -472,7 +472,10 @@ impl<'r> TaskRun<'r> {
             return self.undo_file(file, depth, &path, &content, owner.as_deref());
         }
 
-        let existing = match target::read(ctx, &self.task.name, &path, false)? {
+        // A step that writes as root reads as root too, when running for
+        // real: a file only root can read is otherwise rewritten every run.
+        let as_root = self.mode() == Mode::Run && (file.sudo || owner.is_some());
+        let existing = match target::read(ctx, &self.task.name, &path, as_root)? {
             Current::Content(bytes) => Some(bytes),
             Current::Missing | Current::Unreadable => None,
         };

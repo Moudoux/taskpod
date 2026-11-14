@@ -837,7 +837,8 @@ impl<'s> Parser<'s> {
             if let Some(continued) = line.strip_suffix('\\') {
                 out.push_str(continued.trim_end());
                 out.push(' ');
-                self.pos += end + 1;
+                // A `\` on the last line of the file has no newline after it.
+                self.pos += (end + 1).min(rest.len());
                 self.skip_inline_ws();
             } else {
                 out.push_str(line);
@@ -1031,21 +1032,17 @@ fn triple_quoted(raw: &str) -> String {
 /// and blank lines from the start and end.
 fn dedent(text: &str, indent: Option<usize>) -> String {
     let lines: Vec<&str> = text.lines().collect();
+    // Only spaces and tabs count, so the cut is always at a character boundary.
+    let leading = |l: &str| l.len() - l.trim_start_matches([' ', '\t']).len();
     let indent = indent.unwrap_or_else(|| {
         lines
             .iter()
             .filter(|l| !l.trim().is_empty())
-            .map(|l| l.len() - l.trim_start().len())
+            .map(|l| leading(l))
             .min()
             .unwrap_or(0)
     });
-    let stripped: Vec<&str> = lines
-        .iter()
-        .map(|l| {
-            let ws = l.len() - l.trim_start().len();
-            &l[ws.min(indent)..]
-        })
-        .collect();
+    let stripped: Vec<&str> = lines.iter().map(|l| &l[leading(l).min(indent)..]).collect();
     let first = stripped.iter().position(|l| !l.trim().is_empty());
     let last = stripped.iter().rposition(|l| !l.trim().is_empty());
     match (first, last) {
@@ -1088,6 +1085,16 @@ fn load_env_file(path: &Path, file: &mut TaskFile) -> Result<()> {
             .split_once('=')
             .ok_or_else(|| anyhow!("{}:{}: expected KEY=value", path.display(), n + 1))?;
         let key = key.trim();
+        // Keys become shell variables (written into remote scripts as is).
+        let valid = key.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            bail!(
+                "{}:{}: invalid variable name {key:?}",
+                path.display(),
+                n + 1
+            );
+        }
         let value = value.trim();
         let value = ['"', '\'']
             .iter()
@@ -1326,6 +1333,25 @@ mod tests {
             "1|two words|x=y"
         );
         assert_eq!(file.ctx.exports.len(), 3);
+
+        std::fs::write(dir.path().join(".env"), "A;touch x=1\n").unwrap();
+        let err = format!("{:#}", parse_file(&path).err().unwrap());
+        assert!(err.contains("invalid variable name"), "{err}");
+    }
+
+    #[test]
+    fn odd_input_doesnt_panic() {
+        // A continued line at the very end of the file.
+        assert!(parse_err("task a {\n  run echo \\").contains("missing closing '}'"));
+        // Indentation that isn't only spaces and tabs.
+        let file = parse("task a {\n  run {\n \u{3000}x\n  y\n  }\n}\n");
+        let steps: Vec<String> = file.tasks["a"]
+            .body
+            .steps
+            .iter()
+            .map(Step::describe)
+            .collect();
+        assert_eq!(steps, ["\u{3000}x\n y"]);
     }
 
     #[cfg(unix)]

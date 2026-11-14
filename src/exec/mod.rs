@@ -209,8 +209,11 @@ pub fn select_undo(file: &TaskFile, targets: &[String]) -> Result<Vec<String>> {
             .map(|(needed, by)| format!("{by} needs {needed}"))
             .collect();
         let mut with: Vec<&str> = targets.iter().map(String::as_str).collect();
-        with.extend(needed_by.iter().map(|(_, by)| *by));
-        with.dedup();
+        for (_, by) in &needed_by {
+            if !with.contains(by) {
+                with.push(by);
+            }
+        }
         bail!(
             "not undoing it, other tasks still need it: {}. To undo those too: -u -r {}",
             list.join(", "),
