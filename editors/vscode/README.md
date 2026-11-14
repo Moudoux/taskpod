@@ -4,15 +4,17 @@ Language support for [taskpod](https://github.com/Moudoux/taskpod) `.task` files
 
 - **Highlighting**, with shell highlighting inside `run`, `if` and `unless`
 - **Completion** for keywords (with snippets), templates, task names after
-  `needs` and `of`, variables inside `{{ }}`, file options and encodings
+  `needs` and `of`, variables and secrets inside `{{ }}`, file options and encodings
 - **Hover** docs for every keyword, task summaries, template bodies and
   variable values
 - **Ctrl+click** on tasks, templates and variables to go to their definition,
-  on `from`, `include` and `env` paths to open the file, and on a `file`
-  destination to open the file on your system
+  on `{{ secrets.name }}` to go to its key in the sops file (keys stay
+  readable in encrypted files, values are never read), on `from`, `include`,
+  `env` and `secrets` paths to open the file, and on a `file` destination to
+  open the file on your system
 - **Find references**, **rename** and the **outline** for tasks, templates and variables
 - **Diagnostics** while typing (unknown tasks, templates and variables, missing
-  files) and from `taskpod --check` when saving
+  files, secrets missing from the `secrets` files) and from `taskpod --check` when saving
 - **Run, Dry run and Diff** above each task, and in the editor title bar for the file
 
 ## Settings

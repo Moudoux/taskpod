@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { BUILTIN_VARS, ENCODINGS, KEYWORDS, keywordMarkdown, type Place } from "./docs";
 import { type Index, type RefKind, parse, resolveVar, symbolAt } from "./index";
+import { type SecretKey, secretKeys } from "./secrets";
 
 const LANGUAGE = "taskpod";
 const SELECTOR: vscode.DocumentSelector = { language: LANGUAGE };
@@ -62,6 +63,64 @@ function expandHome(p: string): string {
 function resolvePath(p: string, from: vscode.Uri): string {
   const expanded = expandHome(p);
   return path.isAbsolute(expanded) ? expanded : path.join(path.dirname(from.fsPath), expanded);
+}
+
+// ---- Secrets -----------------------------------------------------------------
+
+const SECRETS = "secrets.";
+const isSecret = (name: string) => name.startsWith(SECRETS);
+
+interface SecretFile {
+  uri: vscode.Uri;
+  keys: SecretKey[];
+}
+
+const secretCache = new Map<string, { mtime: number; keys: SecretKey[] }>();
+
+/** Keys of a sops file, read from disk: sops keeps keys readable, values are never used. */
+function readSecretKeys(file: string): SecretKey[] | undefined {
+  try {
+    const mtime = fs.statSync(file).mtimeMs;
+    const cached = secretCache.get(file);
+    if (cached?.mtime === mtime) return cached.keys;
+    const keys = secretKeys(fs.readFileSync(file, "utf8"), file);
+    secretCache.set(file, { mtime, keys });
+    return keys;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Files from `secrets` lines in this file and its includes (not `--secrets`, which only the command line knows). */
+function secretFiles(files: FileIndex[]): SecretFile[] {
+  const found: SecretFile[] = [];
+  const seen = new Set<string>();
+  for (const { uri, index } of files) {
+    for (const p of index.paths) {
+      if (p.kind !== "secrets" || p.path.includes("{{")) continue;
+      const target = resolvePath(p.path, uri);
+      if (seen.has(target)) continue;
+      seen.add(target);
+      const keys = readSecretKeys(target);
+      if (keys) found.push({ uri: vscode.Uri.file(target), keys });
+    }
+  }
+  return found;
+}
+
+function secretDefinitions(files: FileIndex[], name: string): vscode.Location[] {
+  const key = name.slice(SECRETS.length);
+  return secretFiles(files).flatMap((f) => f.keys.filter((k) => k.name === key).map((k) => new vscode.Location(f.uri, range(k))));
+}
+
+function secretDoc(files: FileIndex[], name: string): string {
+  const key = name.slice(SECRETS.length);
+  const secrets = secretFiles(files);
+  const base = (uri: vscode.Uri) => `\`${path.basename(uri.fsPath)}\``;
+  const where = secrets.filter((f) => f.keys.some((k) => k.name === key)).map((f) => base(f.uri));
+  if (where.length) return `**${name}**: secret from ${where.join(", ")}`;
+  if (secrets.length) return `**${name}**: not in ${secrets.map((f) => base(f.uri)).join(", ")}, so it must come from \`--secrets\``;
+  return `**${name}**: secret, from a \`secrets\` file or \`taskpod --secrets FILE\``;
 }
 
 function range(span: { line: number; start: number; end: number }): vscode.Range {
@@ -136,7 +195,7 @@ class Provider
       if (symbol.kind === "var") {
         const def = resolveVar(index, symbol.name, position.line) ?? files.slice(1).flatMap((f) => f.index.vars).find((v) => v.name === symbol.name && !v.owner);
         if (def) markdown = `**${symbol.name}** = \`${def.value}\`${def.owner ? `\n\n_in ${def.owner}_` : ""}`;
-        else if (symbol.name.startsWith("secrets.")) markdown = `**${symbol.name}**: secret \`${symbol.name.slice(8)}\`, from a \`secrets\` file or \`--secrets\``;
+        else if (isSecret(symbol.name)) markdown = secretDoc(files, symbol.name);
         else if (BUILTIN_VARS[symbol.name]) markdown = `**${symbol.name}** (built in): ${BUILTIN_VARS[symbol.name]}`;
         else if (/^\d+$/.test(symbol.name)) markdown = `**${symbol.name}**: word ${symbol.name} of the template call's arguments.`;
         else if (process.env[symbol.name] !== undefined) markdown = `**${symbol.name}**: environment variable`;
@@ -159,6 +218,7 @@ class Provider
   provideDefinition(document: vscode.TextDocument, position: vscode.Position): vscode.Definition | undefined {
     const files = project(document);
     const symbol = symbolAt(files[0].index, position.line, position.character);
+    if (symbol && symbol.kind === "var" && isSecret(symbol.name)) return secretDefinitions(files, symbol.name);
     if (symbol) return definitions(files, symbol.name, symbol.kind, document, position.line);
     const pathRef = files[0].index.paths.find((p) => p.line === position.line && position.character >= p.start && position.character <= p.end);
     if (pathRef && !pathRef.path.includes("{{")) {
@@ -173,13 +233,17 @@ class Provider
     const symbol = symbolAt(files[0].index, position.line, position.character);
     if (!symbol) return [];
     const refs = references(files, symbol.name, symbol.kind);
-    return context.includeDeclaration ? [...definitions(files, symbol.name, symbol.kind, document, position.line), ...refs] : refs;
+    if (!context.includeDeclaration) return refs;
+    const secret = symbol.kind === "var" && isSecret(symbol.name);
+    return [...(secret ? secretDefinitions(files, symbol.name) : definitions(files, symbol.name, symbol.kind, document, position.line)), ...refs];
   }
 
   prepareRename(document: vscode.TextDocument, position: vscode.Position): vscode.Range {
     const index = indexOf(document);
     const symbol = symbolAt(index, position.line, position.character);
     if (!symbol) throw new Error("Only tasks, templates and variables can be renamed");
+    // sops ties each value to its key, so renaming a key in the file would break it.
+    if (isSecret(symbol.name)) throw new Error("Rename secrets with sops (sops edit), then update the references");
     return document.getWordRangeAtPosition(position, /[\p{L}\p{N}_.+\-/]+/u)!;
   }
 
@@ -245,6 +309,13 @@ class Provider
         const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Variable);
         item.detail = value;
         items.push(item);
+      }
+      for (const { uri, keys } of secretFiles(files)) {
+        for (const key of keys.filter((k) => k.leaf)) {
+          const item = new vscode.CompletionItem(SECRETS + key.name, vscode.CompletionItemKind.Field);
+          item.detail = `secret · ${path.basename(uri.fsPath)}`;
+          items.push(item);
+        }
       }
       for (const [name, doc] of Object.entries(BUILTIN_VARS)) {
         if (name === "args" && info.ownerKind !== "template") continue;
@@ -330,7 +401,7 @@ function snippet(label: string, body: string, detail: string): vscode.Completion
 
 // ---- Diagnostics -------------------------------------------------------------
 
-const KNOWN_VAR = (name: string) => name.startsWith("secrets.") || BUILTIN_VARS[name] !== undefined || /^\d+$/.test(name) || process.env[name] !== undefined;
+const KNOWN_VAR = (name: string) => isSecret(name) || BUILTIN_VARS[name] !== undefined || /^\d+$/.test(name) || process.env[name] !== undefined;
 
 function lint(document: vscode.TextDocument): vscode.Diagnostic[] {
   const files = project(document);
@@ -338,6 +409,8 @@ function lint(document: vscode.TextDocument): vscode.Diagnostic[] {
   const tasks = new Set(files.flatMap((f) => f.index.tasks.map((t) => t.name)));
   const templates = new Set(files.flatMap((f) => f.index.templates.map((t) => t.name)));
   const globals = new Set(files.flatMap((f) => f.index.vars.filter((v) => !v.owner).map((v) => v.name)));
+  const secrets = secretFiles(files);
+  const secretNames = new Set(secrets.flatMap((f) => f.keys.filter((k) => k.leaf).map((k) => SECRETS + k.name)));
   const diagnostics: vscode.Diagnostic[] = [];
   const add = (span: { line: number; start: number; end: number }, message: string, severity = vscode.DiagnosticSeverity.Error) =>
     diagnostics.push(Object.assign(new vscode.Diagnostic(range(span), message, severity), { source: "taskpod" }));
@@ -345,6 +418,10 @@ function lint(document: vscode.TextDocument): vscode.Diagnostic[] {
   for (const ref of index.refs) {
     if (ref.kind === "task" && !tasks.has(ref.name)) add(ref, `Unknown task '${ref.name}'`);
     if (ref.kind === "template" && !templates.has(ref.name)) add(ref, `Unknown directive or template '${ref.name}'`);
+    if (ref.kind === "var" && isSecret(ref.name) && secrets.length && !secretNames.has(ref.name)) {
+      const where = secrets.map((f) => path.basename(f.uri.fsPath)).join(", ");
+      add(ref, `No secret '${ref.name.slice(SECRETS.length)}' in ${where}`, vscode.DiagnosticSeverity.Warning);
+    }
     if (ref.kind === "var") {
       const owner = index.lines[ref.line]?.owner;
       const local = index.vars.some((v) => v.name === ref.name && v.owner === owner && owner !== undefined);
