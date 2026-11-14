@@ -2,14 +2,21 @@
 # with \ to continue it on the next. Comments start with #.
 #
 #   taskpod spec.task          run every task that isn't manual
-#   taskpod spec.task -d       dry run: show what would run, change nothing
+#   taskpod spec.task -D       compare with the system: only what would change, with file diffs
+#   taskpod spec.task -d       dry run: every task and step, change nothing
 #   taskpod spec.task -r hello run one task, and the tasks it needs
 #   taskpod spec.task -l       list tasks
+#   taskpod spec.task --check  check the file for errors
 
 # Variables. Use them anywhere with {{ name }}. Strings in "double quotes"
 # understand \n, \t, \" and \; 'single quotes' are taken as written.
 let greeting = "Hello"
 let today = $(date +%A)        # shell output, run once when first used
+# Questions, asked once when first used (pausing the live display):
+#   let games = confirm "Install games?"         true or false, so `if {{ games }}` works
+#   let desktop = choose "Desktop?" kde gnome    one of the options
+#   let host = input "Hostname" "archbox"        text, with an optional default
+# Without a terminal: confirm is false, choose takes the first option, input the default.
 # Built in: {{ home }}, {{ user }}, {{ pwd }} and {{ dir }} (this file's
 # directory). Unknown names fall back to environment variables: {{ HOME }}.
 
@@ -43,6 +50,10 @@ task hello {
     if test -d /tmp
     unless test -e /tmp/taskpod-never-exists
     run echo "Hello"
+    # End a guard with { to only guard the steps inside, not the whole task.
+    unless test -e /tmp/taskpod-hello {
+        run touch /tmp/taskpod-hello
+    }
 }
 
 # Subtasks run after their parent, and only if the parent changed something:
@@ -69,13 +80,19 @@ task setup {
     manual                     # only runs with -r, or when another task needs it
     workdir "/tmp"             # where commands run, default: this file's directory
     let where = "{{ home }}"   # variables can be per task
-    # Files are written only when their content or mode differs. Mode is 644,
-    # or 755 for content starting with #!. Add `sudo` to write as root.
+    # Files are written only when their content, mode or owner differs.
+    #   mode 600           permission bits, default 644, or 755 for content starting with #!
+    #   owner user:group   checked and set, writes with sudo
+    #   encoding utf-16le  utf-8 (default), utf-8-bom, utf-16le, utf-16be, latin1 or ascii
+    #   sudo               write as root
+    # Content is a string, a """ block, or `from "path"` (relative to this file,
+    # copied byte for byte unless an encoding is given).
     file "/tmp/taskpod-example/hello.sh" """
         #!/bin/sh
         echo "hello from {{ where }}"
         """
     file "/tmp/taskpod-example/copy.task" mode 600 from "spec.task"
+    file "/tmp/taskpod-example/windows.txt" encoding utf-16le "for notepad\n"
     run /tmp/taskpod-example/hello.sh
 }
 
@@ -85,4 +102,8 @@ task setup {
 #   sudo          ask for sudo before running; commands mentioning sudo do this
 #                 automatically, so parallel tasks never prompt at once
 #   interactive   this task gets the terminal: nothing else runs alongside it,
-#                 and its commands can ask questions
+#                 the live display pauses, and its commands can ask questions
+#
+# While running, each task gets a live spinner with its latest output, above
+# an overall progress bar. Failed tasks show their last output; -v streams
+# everything, and --plain (or no terminal) prints output prefixed by task.

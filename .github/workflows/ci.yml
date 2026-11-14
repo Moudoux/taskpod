@@ -27,11 +27,28 @@ jobs:
       - name: PKGBUILD version matches Cargo.toml
         run: |
           cargo_version=$(awk -F'"' '/^version *=/ {print $2; exit}' Cargo.toml)
-          pkgbuild_version=$(sed -n 's/^pkgver=//p' arch/PKGBUILD)
+          pkgbuild_version=$(sed -n 's/^pkgver=//p' dist/arch/PKGBUILD)
           if [ "$cargo_version" != "$pkgbuild_version" ]; then
-            echo "::error file=arch/PKGBUILD::pkgver $pkgbuild_version doesn't match Cargo.toml $cargo_version"
+            echo "::error file=dist/arch/PKGBUILD::pkgver $pkgbuild_version doesn't match Cargo.toml $cargo_version"
             exit 1
           fi
+
+  vscode:
+    if: ${{ !startsWith(github.event.head_commit.message, '[nobuild]') }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun run package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: taskpod-vscode
+          path: editors/vscode/*.vsix
 
   build:
     needs: check
@@ -59,7 +76,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, vscode]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -72,4 +89,4 @@ jobs:
           mv taskpod-x86_64-unknown-linux-gnu/taskpod taskpod-linux-x86_64
           mv taskpod-x86_64-pc-windows-msvc/taskpod.exe taskpod-windows-x86_64.exe
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
-            taskpod-linux-x86_64 taskpod-windows-x86_64.exe
+            taskpod-linux-x86_64 taskpod-windows-x86_64.exe taskpod-vscode/*.vsix

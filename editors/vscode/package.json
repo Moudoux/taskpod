@@ -1,0 +1,136 @@
+{
+  "name": "taskpod",
+  "displayName": "Taskpod",
+  "description": "Syntax highlighting, completion, hover docs, go to definition and diagnostics for taskpod .task files",
+  "version": "0.3.0",
+  "publisher": "moudoux",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Moudoux/taskpod"
+  },
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": ["Programming Languages", "Linters"],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "languages": [
+      {
+        "id": "taskpod",
+        "aliases": ["Taskpod", "taskpod"],
+        "extensions": [".task"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "taskpod",
+        "scopeName": "source.taskpod",
+        "path": "./syntaxes/taskpod.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.line.shell": "shellscript",
+          "meta.embedded.block.shell": "shellscript"
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "taskpod.runFile",
+        "title": "Run file",
+        "category": "Taskpod",
+        "icon": "$(play)"
+      },
+      {
+        "command": "taskpod.dryRunFile",
+        "title": "Dry run file",
+        "category": "Taskpod",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "taskpod.diffFile",
+        "title": "Compare file with the system",
+        "category": "Taskpod",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "taskpod.runTask",
+        "title": "Run task",
+        "category": "Taskpod"
+      },
+      {
+        "command": "taskpod.dryRunTask",
+        "title": "Dry run task",
+        "category": "Taskpod"
+      },
+      {
+        "command": "taskpod.diffTask",
+        "title": "Compare task with the system",
+        "category": "Taskpod"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "taskpod.diffFile",
+          "when": "editorLangId == taskpod",
+          "group": "navigation@1"
+        },
+        {
+          "command": "taskpod.runFile",
+          "when": "editorLangId == taskpod",
+          "group": "navigation@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "taskpod.runTask",
+          "when": "false"
+        },
+        {
+          "command": "taskpod.dryRunTask",
+          "when": "false"
+        },
+        {
+          "command": "taskpod.diffTask",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Taskpod",
+      "properties": {
+        "taskpod.path": {
+          "type": "string",
+          "default": "taskpod",
+          "description": "Path to the taskpod binary, used for checking files and running tasks."
+        },
+        "taskpod.checkOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run `taskpod --check` when a file is opened or saved and show its errors."
+        },
+        "taskpod.codeLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show Run, Dry run and Diff above each task."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "bun build src/extension.ts --outdir out --target node --format cjs --external vscode --sourcemap=linked",
+    "check": "tsc --noEmit",
+    "test": "bun test",
+    "package": "bun run check && bun run build && vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.100.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.8.0",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.2"
+  }
+}

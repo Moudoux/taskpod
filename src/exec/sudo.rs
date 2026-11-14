@@ -1,32 +1,55 @@
 //! Ask for sudo credentials once, then keep them fresh, so tasks running in
 //! parallel never prompt for a password at the same time.
 
-use crate::term::term;
+use crate::ui::ui;
 use anyhow::{Result, bail};
+use console::style;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
-static AUTHENTICATED: Mutex<bool> = Mutex::new(false);
+#[derive(PartialEq)]
+enum State {
+    Unknown,
+    Authenticated,
+    /// Authentication failed once; don't ask again for every task.
+    Failed,
+}
 
-pub fn ensure() -> Result<()> {
+static STATE: Mutex<State> = Mutex::new(State::Unknown);
+
+/// Make sure sudo has cached credentials. The first time, the live display
+/// pauses and sudo itself asks (password, security key or fingerprint), so
+/// taskpod never sees the password.
+pub fn ensure(task: &str) -> Result<()> {
     if cfg!(not(unix)) {
         return Ok(());
     }
-    let mut authenticated = AUTHENTICATED.lock().unwrap_or_else(|e| e.into_inner());
-    if *authenticated {
-        return Ok(());
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    match *state {
+        State::Authenticated => return Ok(()),
+        State::Failed => bail!("sudo authentication failed earlier in this run"),
+        State::Unknown => {}
     }
     if !sudo(&["-n", "true"]) {
-        let term = term();
-        let _held = term.hold();
-        println!("{}", term.paint("33", ":: sudo needs to authenticate"));
-        let status = Command::new("sudo").arg("-v").status();
-        if !status.is_ok_and(|s| s.success()) {
+        let ok = ui().suspend(|| {
+            eprintln!(
+                "{} {} {}",
+                style("🔒").yellow(),
+                style(format!("{task} needs sudo")).bold(),
+                style("· authenticate once for the whole run").dim()
+            );
+            Command::new("sudo")
+                .arg("-v")
+                .status()
+                .is_ok_and(|s| s.success())
+        });
+        if !ok {
+            *state = State::Failed;
             bail!("sudo authentication failed");
         }
     }
-    *authenticated = true;
+    *state = State::Authenticated;
     std::thread::spawn(|| {
         loop {
             std::thread::sleep(Duration::from_secs(60));

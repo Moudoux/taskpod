@@ -3,7 +3,8 @@
 Taskpod runs tasks from a declarative `.task` file. Tasks declare what they
 need, and everything that can run in parallel does. Checks like
 `unless pacman -Q zsh` make tasks idempotent, so running a file again only
-does what's missing, and `--dry-run` shows what that would be.
+does what's missing, and `--diff` shows what that would be, or tells you the
+system already matches.
 
 ```sh
 template pkg {
@@ -30,26 +31,34 @@ for a small real example.
 
 ```sh
 taskpod [FILE]             # run every task that isn't manual (FILE defaults to main.task)
-taskpod FILE -d            # dry run: run the checks, show what would change
+taskpod FILE -D            # diff: compare with the system, show only what would change
+taskpod FILE -d            # dry run: every task and step, and what would change
 taskpod FILE -r a b        # run tasks a and b, and what they need
 taskpod FILE -i a          # what task a would do
 taskpod FILE -l            # list tasks
+taskpod FILE --check       # check the file for errors
 taskpod FILE -s a          # skip task a
-taskpod FILE -j1           # one task at a time, commands get the terminal directly
-taskpod FILE -v            # show commands and up to date steps
+taskpod FILE -j 4          # at most 4 tasks at once (default: one per CPU)
+taskpod FILE -v            # stream every command and its output
+taskpod FILE --plain       # no live display, output prefixed by task
 ```
 
-Output from tasks running in parallel is prefixed with the task name. Commands
-that use `sudo` make taskpod authenticate once up front and keep the
-credentials fresh, so parallel tasks never ask for a password at the same time.
-Tasks marked `interactive` run alone with the terminal.
+Diffs and dry runs run the `if` and `unless` checks (which shouldn't change
+anything), compare files byte for byte, mode and owner, and show unified diffs.
+
+While running, each task gets a live spinner showing its latest output above
+an overall progress bar; a failed task prints its last output. Questions
+(`ask`, `confirm`, `choose`, `input`) pause the display. Commands that use
+`sudo` make taskpod authenticate once, through sudo itself so security keys
+work, and keep the credentials fresh, so parallel tasks never prompt at the
+same time. Tasks marked `interactive` run alone with the terminal.
 
 ## Install
 
-Arch Linux, from [arch/PKGBUILD](arch/PKGBUILD):
+Arch Linux, from [dist/arch/PKGBUILD](dist/arch/PKGBUILD):
 
 ```sh
-cd arch && makepkg -si
+cd dist/arch && makepkg -si
 ```
 
 Anywhere else with Rust: `cargo install --path .`
@@ -60,8 +69,20 @@ for every `v*` tag. Builds of other commits are under the CI run's artifacts.
 
 ## My system
 
-`arch.task` (gitignored) sets up my Arch install, the taskpod version of my
-arch-config scripts: `taskpod arch.task -d` to check, `taskpod arch.task` to apply.
+`arch/` (gitignored) sets up my Arch install, the taskpod version of my
+arch-config scripts: `taskpod arch/main.task -D` to compare, `taskpod arch/main.task`
+to apply. Longer config files sit next to it in `arch/files/`.
+
+## VS Code
+
+[editors/vscode](editors/vscode) has an extension with highlighting,
+completion, hover docs, go to definition, diagnostics and run buttons. CI
+builds it as a `.vsix`, attached to releases; to build it yourself:
+
+```sh
+cd editors/vscode && bun install && bun run package
+code --install-extension taskpod-*.vsix
+```
 
 ## JetBrains syntax highlighting
 

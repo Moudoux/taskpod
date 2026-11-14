@@ -1,23 +1,31 @@
-//! Running tasks: selection, parallel scheduling and dry runs.
+//! Running tasks: selection, parallel scheduling, dry runs and diffs.
 
 mod step;
 pub mod sudo;
 
 use crate::ast::{Guard, Task, TaskFile};
 use crate::parser::guard_passes;
-use crate::term::term;
+use crate::ui::{self, ui};
 use crate::vars::{Scope, expand_tilde};
 use anyhow::{Result, bail};
+use console::style;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, RwLock, mpsc};
 use std::time::Instant;
 use step::TaskRun;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Mode {
+    Run,
+    /// Show every task and step, and what would change.
+    DryRun,
+    /// Show only what would change, with file diffs.
+    Diff,
+}
+
 pub struct Options {
-    /// Show what would run without changing anything.
-    pub dry_run: bool,
+    pub mode: Mode,
     /// Treat every `if`, `unless` and `ask` as passing.
     pub ignore_guards: bool,
     /// How many tasks may run at the same time.
@@ -26,9 +34,15 @@ pub struct Options {
     pub skip: HashSet<String>,
 }
 
+impl Options {
+    pub fn checking(&self) -> bool {
+        self.mode != Mode::Run
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
-    /// The task did something.
+    /// The task did something (or would, in a dry run).
     Ran,
     /// The task ran, but every step was already up to date.
     UpToDate,
@@ -47,16 +61,7 @@ impl Outcome {
 
 /// Ask a yes/no question.
 pub fn ask(prompt: &str) -> Result<bool> {
-    let term = term();
-    let _held = term.hold();
-    print!("{} {prompt} [y/N] ", term.paint("33", "?"));
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    if !std::io::stdin().is_terminal() {
-        println!("{}", answer.trim());
-    }
-    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
+    ui().confirm(prompt)
 }
 
 /// The tasks to run for `targets` (or every non-manual task), with the tasks
@@ -174,7 +179,7 @@ pub struct Runner<'a> {
 
 impl<'a> Runner<'a> {
     pub fn new(file: &'a TaskFile, opts: &'a Options) -> Self {
-        let jobs = if opts.dry_run { 1 } else { opts.jobs };
+        let jobs = if opts.checking() { 1 } else { opts.jobs };
         Runner {
             file,
             opts,
@@ -220,8 +225,8 @@ impl<'a> Runner<'a> {
         }
         for guard in guards {
             let passes = match guard {
-                // A dry run doesn't ask, it assumes yes.
-                Guard::Ask(_) if self.opts.dry_run => true,
+                // Checks don't ask, they assume yes.
+                Guard::Ask(_) if self.opts.checking() => true,
                 guard => guard_passes(guard, scope, cwd)?,
             };
             if !passes {
@@ -233,7 +238,6 @@ impl<'a> Runner<'a> {
 
     /// Run the tasks in `order`, in parallel where dependencies allow.
     pub fn run(&self, order: &[String]) -> Vec<(String, Outcome)> {
-        crate::term::set_width(order.iter().map(String::as_str));
         let index: HashMap<&str, usize> = order
             .iter()
             .enumerate()
@@ -253,6 +257,13 @@ impl<'a> Runner<'a> {
         let mut ready: VecDeque<usize> = (0..tasks.len()).filter(|&i| waiting[i] == 0).collect();
         let (sender, receiver) = mpsc::channel::<(usize, Outcome)>();
 
+        let what = match self.opts.mode {
+            Mode::Run => "tasks",
+            Mode::DryRun | Mode::Diff => "checked",
+        };
+        let names: Vec<&str> = order.iter().map(String::as_str).collect();
+        ui().begin(&names, what);
+
         std::thread::scope(|s| {
             let mut running = 0;
             loop {
@@ -271,21 +282,20 @@ impl<'a> Runner<'a> {
                     } else {
                         None
                     };
+                    running += 1;
                     match outcome {
                         Some(outcome) => {
-                            report(task, &outcome, None, self.opts.dry_run);
+                            self.report(task, &outcome, "", &[]);
                             sender.send((i, outcome)).expect("receiver is alive");
-                            running += 1;
                         }
-                        // Dry runs are sequential so their output reads in order.
-                        None if self.opts.dry_run => {
-                            let outcome = self.run_task(task);
-                            sender.send((i, outcome)).expect("receiver is alive");
-                            running += 1;
+                        // Checks run one task at a time so their output reads in order.
+                        None if self.opts.checking() => {
+                            sender
+                                .send((i, self.run_task(task)))
+                                .expect("receiver is alive");
                         }
                         None => {
                             let sender = sender.clone();
-                            running += 1;
                             s.spawn(move || {
                                 let outcome = self.run_task(task);
                                 sender.send((i, outcome)).expect("receiver is alive");
@@ -298,6 +308,7 @@ impl<'a> Runner<'a> {
                 }
                 let (i, outcome) = receiver.recv().expect("a task is running");
                 running -= 1;
+                ui().advance();
                 outcomes[i] = Some(outcome);
                 for &d in &dependents[i] {
                     waiting[d] -= 1;
@@ -307,6 +318,7 @@ impl<'a> Runner<'a> {
                 }
             }
         });
+        ui().end();
 
         order
             .iter()
@@ -321,7 +333,7 @@ impl<'a> Runner<'a> {
 
     fn run_task(&self, task: &Task) -> Outcome {
         // Interactive tasks wait until nothing else runs, and block others meanwhile.
-        let (_shared, _exclusive) = if task.interactive {
+        let (_shared, _exclusive) = if task.interactive && !self.opts.checking() {
             (
                 None,
                 Some(self.exclusive.write().unwrap_or_else(|e| e.into_inner())),
@@ -337,42 +349,50 @@ impl<'a> Runner<'a> {
         let outcome = run
             .run()
             .unwrap_or_else(|e| Outcome::Failed(format!("{e:#}")));
-        if self.opts.dry_run && outcome == Outcome::Ran {
-            let root = self.root_scope();
-            let desc = run.desc(&root.child(&task.vars));
-            term().status("▶", "34", &task.name, &desc);
-        }
-        report(task, &outcome, Some(start), self.opts.dry_run);
-        if self.opts.dry_run && (outcome != Outcome::UpToDate || term().verbose) {
-            for line in &run.lines {
-                println!("{line}");
-            }
-        }
+        let elapsed = format!("· {:.1?}", start.elapsed());
+        let root = self.root_scope();
+        let desc = run.desc(&root.child(&task.vars));
+        let detail = match (desc.is_empty(), self.opts.checking()) {
+            (true, true) => String::new(),
+            (true, false) => elapsed,
+            (false, true) => format!("· {desc}"),
+            (false, false) => format!("· {desc} {elapsed}"),
+        };
+        let lines = run.finish();
+        self.report(task, &outcome, &detail, &lines);
         outcome
     }
-}
 
-fn report(task: &Task, outcome: &Outcome, start: Option<Instant>, dry_run: bool) {
-    let term = term();
-    let elapsed = start
-        .map(|s| format!("({:.1?})", s.elapsed()))
-        .unwrap_or_default();
-    match outcome {
-        Outcome::Ran if dry_run => {}
-        Outcome::Ran => term.status("✓", "32", &task.name, &elapsed),
-        Outcome::UpToDate => term.status("✓", "32", &task.name, "up to date"),
-        Outcome::Skipped(reason) => {
-            term.status("○", "2", &task.name, &format!("skipped: {reason}"))
-        }
-        Outcome::Failed(error) => term.status("✗", "31", &task.name, &format!("failed: {error}")),
-        Outcome::Blocked(dep) => {
-            term.status("✗", "31", &task.name, &format!("not run: {dep} failed"))
+    fn report(&self, task: &Task, outcome: &Outcome, detail: &str, lines: &[String]) {
+        let ui = ui();
+        let name = task.name.as_str();
+        let diff = self.opts.mode == Mode::Diff;
+        let line = match outcome {
+            Outcome::Ran if self.opts.checking() => Some(ui::would_change(name, detail)),
+            Outcome::Ran => Some(ui::done(name, detail)),
+            Outcome::UpToDate if !diff || ui.verbose => Some(ui::up_to_date(name)),
+            Outcome::Skipped(reason) if !diff || ui.verbose => Some(ui::skipped(name, reason)),
+            Outcome::Failed(error) => Some(ui::failed(name, error)),
+            Outcome::Blocked(dep) => Some(ui::failed(name, &format!("not run, {dep} failed"))),
+            _ => None,
+        };
+        if let Some(line) = line {
+            ui.line(line);
+            let quiet = *outcome == Outcome::UpToDate && !ui.verbose;
+            for line in lines.iter().filter(|_| !quiet) {
+                ui.line(format!("    {line}"));
+            }
         }
     }
 }
 
 /// Print a summary and return whether everything succeeded.
-pub fn summarize(outcomes: &[(String, Outcome)], start: Instant, dry_run: bool) -> bool {
+pub fn summarize(
+    outcomes: &[(String, Outcome)],
+    start: Instant,
+    opts: &Options,
+    file: &Path,
+) -> bool {
     let count = |f: fn(&Outcome) -> bool| outcomes.iter().filter(|(_, o)| f(o)).count();
     let ran = count(|o| *o == Outcome::Ran);
     let current = count(|o| *o == Outcome::UpToDate);
@@ -382,23 +402,48 @@ pub fn summarize(outcomes: &[(String, Outcome)], start: Instant, dry_run: bool) 
         .filter(|(_, o)| !o.ok())
         .map(|(n, _)| n.as_str())
         .collect();
-    let term = term();
-    let verb = if dry_run { "would run" } else { "ran" };
-    let mut summary = format!("{ran} {verb}, {current} up to date, {skipped} skipped");
-    if !failed.is_empty() {
-        summary.push_str(&format!(
-            ", {} failed ({})",
-            failed.len(),
-            failed.join(", ")
+    let elapsed = style(format!("in {:.1?}", start.elapsed())).dim();
+    let ui = ui();
+    ui.line("");
+    if opts.checking() && ran == 0 && failed.is_empty() {
+        ui.line(format!(
+            "{} {} {elapsed}",
+            style("✓").green().bold(),
+            style(format!(
+                "Nothing would change, the system matches {}",
+                file.display()
+            ))
+            .bold()
         ));
+        return true;
     }
-    let elapsed = format!("{:.1?}", start.elapsed());
-    let code = if failed.is_empty() { "1" } else { "1;31" };
-    println!(
-        "\n{} {}",
-        term.paint(code, &summary),
-        term.paint("2", &format!("in {elapsed}"))
-    );
+    let verb = if opts.checking() {
+        "would change"
+    } else {
+        "ran"
+    };
+    let mut parts = vec![format!("{ran} {verb}")];
+    if opts.mode == Mode::Diff {
+        let changed: Vec<&str> = outcomes
+            .iter()
+            .filter(|(_, o)| *o == Outcome::Ran)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        parts = vec![format!("{ran} {verb}: {}", changed.join(", "))];
+    } else {
+        parts.push(format!("{current} up to date"));
+        parts.push(format!("{skipped} skipped"));
+    }
+    if !failed.is_empty() {
+        parts.push(format!("{} failed ({})", failed.len(), failed.join(", ")));
+    }
+    let summary = parts.join(", ");
+    let summary = if failed.is_empty() {
+        style(summary).bold()
+    } else {
+        style(summary).red().bold()
+    };
+    ui.line(format!("{summary} {elapsed}"));
     failed.is_empty()
 }
 

@@ -5,7 +5,7 @@
 //! `unless`) are passed to the shell as written.
 
 use crate::ast::*;
-use crate::vars::{Ctx, Scope, Var, Vars, expand_tilde};
+use crate::vars::{Ctx, Prompt, Scope, Var, Vars, expand_tilde};
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -61,6 +61,8 @@ struct Body {
 enum BodyKind {
     Task,
     Template,
+    /// An inline `if <check> {` block.
+    Block,
 }
 
 impl<'s> Parser<'s> {
@@ -195,8 +197,17 @@ impl<'s> Parser<'s> {
             let start = self.pos;
             let keyword = self.word("a directive")?;
             let task_only = |p: &Self| {
-                if kind == BodyKind::Template {
+                if kind != BodyKind::Task {
                     Err(p.error_at(start, format!("'{keyword}' can only be used in tasks")))
+                } else {
+                    Ok(())
+                }
+            };
+            let not_in_block = |p: &Self| {
+                if kind == BodyKind::Block {
+                    let message =
+                        format!("'{keyword}' can't be used in an inline block, put it in the task");
+                    Err(p.error_at(start, message))
                 } else {
                     Ok(())
                 }
@@ -207,9 +218,22 @@ impl<'s> Parser<'s> {
                     body.desc = Some(self.string()?);
                     self.end_of_line()?;
                 }
-                "needs" => body.needs.extend(self.words("a task name")?),
+                "needs" => {
+                    not_in_block(self)?;
+                    body.needs.extend(self.words("a task name")?);
+                }
                 "lock" => body.block.locks.extend(self.words("a lock name")?),
-                "if" | "unless" | "ask" => body.block.guards.push(self.guard(&keyword)?),
+                "if" | "unless" | "ask" => {
+                    let (guard, opens_block) = self.guard_line(&keyword)?;
+                    if opens_block {
+                        let inner = self.body(BodyKind::Block, start)?;
+                        let mut block = inner.block;
+                        block.guards.insert(0, guard);
+                        body.block.steps.push(Step::Block(block));
+                    } else {
+                        body.block.guards.push(guard);
+                    }
+                }
                 "sudo" => {
                     self.end_of_line()?;
                     body.block.sudo = true;
@@ -230,6 +254,7 @@ impl<'s> Parser<'s> {
                     self.end_of_line()?;
                 }
                 "let" => {
+                    not_in_block(self)?;
                     let (name, var) = self.let_value()?;
                     body.vars.set(name, var);
                 }
@@ -259,22 +284,43 @@ impl<'s> Parser<'s> {
     }
 
     fn guard(&mut self, keyword: &str) -> Result<Guard> {
-        let guard = match keyword {
-            "ask" => Guard::Ask(self.string()?),
-            _ => {
-                let command = self.rest_of_line();
-                if command.is_empty() {
-                    return Err(self.error(format!("'{keyword}' needs a command")));
-                }
-                if keyword == "if" {
-                    Guard::If(command)
-                } else {
-                    Guard::Unless(command)
-                }
+        let start = self.pos;
+        match self.guard_line(keyword)? {
+            (guard, false) => Ok(guard),
+            (_, true) => {
+                Err(self.error_at(start, "blocks are only allowed inside tasks and templates"))
             }
-        };
+        }
+    }
+
+    /// A guard line, and whether it ends with `{` to open an inline block.
+    fn guard_line(&mut self, keyword: &str) -> Result<(Guard, bool)> {
+        if keyword == "ask" {
+            let guard = Guard::Ask(self.string()?);
+            self.skip_inline_ws();
+            let opens_block = self.peek() == Some('{');
+            if opens_block {
+                self.bump();
+            }
+            self.end_of_line()?;
+            return Ok((guard, opens_block));
+        }
+        let mut command = self.rest_of_line();
+        let opens_block = command == "{" || command.ends_with(" {") || command.ends_with("\t{");
+        if opens_block {
+            command.pop();
+            command = command.trim_end().to_string();
+        }
+        if command.is_empty() {
+            return Err(self.error(format!("'{keyword}' needs a command")));
+        }
         self.end_of_line()?;
-        Ok(guard)
+        let guard = if keyword == "if" {
+            Guard::If(command)
+        } else {
+            Guard::Unless(command)
+        };
+        Ok((guard, opens_block))
     }
 
     /// `include "x" if <command>`
@@ -309,6 +355,10 @@ impl<'s> Parser<'s> {
         }
         self.bump();
         self.skip_inline_ws();
+        if let Some(prompt) = self.prompt()? {
+            self.end_of_line()?;
+            return Ok((name, Var::Prompt(prompt, OnceLock::new())));
+        }
         let var = match self.peek() {
             Some('"' | '\'') => Var::Template(self.string()?),
             Some('$') if self.rest().starts_with("$(") => {
@@ -319,6 +369,38 @@ impl<'s> Parser<'s> {
         };
         self.end_of_line()?;
         Ok((name, var))
+    }
+
+    /// `confirm "Question"`, `choose "Question" a b "c d"` or `input "Question" ["default"]`.
+    fn prompt(&mut self) -> Result<Option<Prompt>> {
+        let save = self.pos;
+        let kind = self.word("").ok();
+        self.skip_inline_ws();
+        let quoted = matches!(self.peek(), Some('"' | '\''));
+        let kind = match kind.as_deref() {
+            Some(k @ ("confirm" | "choose" | "input")) if quoted => k.to_string(),
+            _ => {
+                self.pos = save;
+                return Ok(None);
+            }
+        };
+        let question = self.string()?;
+        let mut values = Vec::new();
+        while !self.at_line_end() {
+            if matches!(self.peek(), Some('"' | '\'')) {
+                values.push(self.string()?);
+            } else {
+                values.push(self.word("an option")?);
+            }
+        }
+        Ok(Some(match kind.as_str() {
+            "confirm" if values.is_empty() => Prompt::Confirm(question),
+            "confirm" => return Err(self.error("confirm takes only a question")),
+            "choose" if values.len() >= 2 => Prompt::Choose(question, values),
+            "choose" => return Err(self.error("choose needs at least two options")),
+            _ if values.len() <= 1 => Prompt::Input(question, values.pop()),
+            _ => return Err(self.error("input takes a question and an optional default")),
+        }))
     }
 
     /// The command inside `$( ... )`, which may span continued lines.
@@ -372,10 +454,12 @@ impl<'s> Parser<'s> {
         Ok(command)
     }
 
-    /// `file "path" [mode 755] [sudo] ("content" | from "path")`
+    /// `file "path" [mode 755] [owner user:group] [encoding utf-16le] [sudo] ("content" | from "path")`
     fn file_step(&mut self) -> Result<FileStep> {
         let path = self.string()?;
         let mut mode = None;
+        let mut owner = None;
+        let mut encoding = None;
         let mut sudo = false;
         let source = loop {
             self.skip_inline_ws();
@@ -384,28 +468,75 @@ impl<'s> Parser<'s> {
             }
             let start = self.pos;
             match self
-                .word("file content, 'from', 'mode' or 'sudo'")?
+                .word("file content, 'from', 'mode', 'owner', 'encoding' or 'sudo'")?
                 .as_str()
             {
                 "mode" => {
                     let value = self.word("a file mode")?;
-                    let parsed = u32::from_str_radix(&value, 8).map_err(|_| {
-                        self.error_at(start, format!("invalid octal mode '{value}'"))
-                    })?;
+                    let parsed = u32::from_str_radix(&value, 8)
+                        .ok()
+                        .filter(|m| *m <= 0o7777)
+                        .ok_or_else(|| {
+                            self.error_at(start, format!("invalid octal mode '{value}'"))
+                        })?;
                     mode = Some(parsed);
                 }
+                "owner" => {
+                    self.skip_inline_ws();
+                    owner = Some(if let Some('"' | '\'') = self.peek() {
+                        self.string()?
+                    } else {
+                        let user = self.word("a user")?;
+                        if self.peek() == Some(':') {
+                            self.bump();
+                            format!("{user}:{}", self.word("a group")?)
+                        } else {
+                            user
+                        }
+                    });
+                }
+                "encoding" => {
+                    let name = self.word("an encoding")?;
+                    encoding = Some(Encoding::parse(&name).ok_or_else(|| {
+                        self.error_at(
+                            start,
+                            format!(
+                                "unknown encoding '{name}', use one of: {}",
+                                Encoding::NAMES.join(", ")
+                            ),
+                        )
+                    })?);
+                }
                 "sudo" => sudo = true,
-                "from" => break FileSource::Copy(self.string()?),
+                "from" => {
+                    let source = self.string()?;
+                    let relative = !(source.contains("{{")
+                        || source.starts_with('~')
+                        || Path::new(&source).is_absolute());
+                    break FileSource::Copy(if relative {
+                        self.dir().join(&source).display().to_string()
+                    } else {
+                        source
+                    });
+                }
                 other => {
                     return Err(self.error_at(start, format!("unexpected '{other}' in file step")));
                 }
             }
         };
         self.end_of_line()?;
+        let raw = encoding.is_none() && matches!(source, FileSource::Copy(_));
         Ok(FileStep {
             path,
             source,
             mode,
+            owner,
+            encoding: if raw {
+                Encoding::Utf8
+            } else {
+                encoding.unwrap_or_default()
+            },
+            raw,
             sudo,
         })
     }
@@ -910,7 +1041,70 @@ mod tests {
         assert_eq!(b.mode, Some(0o600));
         assert!(matches!(&b.source, FileSource::Inline(s) if s == "x\ty\n"));
         let Step::File(c) = &steps[2] else { panic!() };
-        assert!(matches!(&c.source, FileSource::Copy(s) if s == "c.conf"));
+        assert!(matches!(&c.source, FileSource::Copy(s) if s == "/tmp/c.conf"));
+    }
+
+    #[test]
+    fn parses_prompts_blocks_and_file_options() {
+        let file = parse(
+            r#"
+            let de = choose "Desktop?" kde gnome "none at all"
+            let host = input "Hostname" "arch"
+            let name = input "Name"
+            let games = confirm "Games?"
+            task t {
+                unless test -e x {
+                    run touch x
+                    pkg a
+                }
+                ask "Sure?" {
+                    run echo yes
+                }
+                file "/etc/x" owner root:wheel mode 640 encoding UTF-16LE sudo "x"
+                file "/etc/y" owner "{{ user }}" from "y.bin"
+            }
+            template pkg {
+                run echo {{ args }}
+            }
+            "#,
+        );
+        assert!(
+            matches!(file.vars.get("de"), Some(Var::Prompt(Prompt::Choose(_, o), _)) if o.len() == 3 && o[2] == "none at all")
+        );
+        assert!(
+            matches!(file.vars.get("host"), Some(Var::Prompt(Prompt::Input(_, Some(d)), _)) if d == "arch")
+        );
+        assert!(matches!(
+            file.vars.get("name"),
+            Some(Var::Prompt(Prompt::Input(_, None), _))
+        ));
+        assert!(matches!(
+            file.vars.get("games"),
+            Some(Var::Prompt(Prompt::Confirm(_), _))
+        ));
+        let steps = &file.tasks["t"].body.steps;
+        let Step::Block(block) = &steps[0] else {
+            panic!()
+        };
+        assert!(matches!(&block.guards[0], Guard::Unless(c) if c == "test -e x"));
+        assert_eq!(block.steps.len(), 2);
+        assert!(matches!(&steps[1], Step::Block(b) if matches!(&b.guards[0], Guard::Ask(_))));
+        let Step::File(x) = &steps[2] else { panic!() };
+        assert_eq!(
+            (x.owner.as_deref(), x.mode, x.encoding, x.raw),
+            (Some("root:wheel"), Some(0o640), Encoding::Utf16Le, false)
+        );
+        let Step::File(y) = &steps[3] else { panic!() };
+        assert!(y.raw);
+        assert_eq!(y.owner.as_deref(), Some("{{ user }}"));
+
+        assert!(parse_err("let x = choose \"Q\" one\n").contains("at least two"));
+        assert!(
+            parse_err("task t {\n  file \"/x\" encoding ebcdic \"x\"\n}\n")
+                .contains("unknown encoding 'ebcdic'")
+        );
+        assert!(parse_err("if true {\n}\n").contains("only allowed inside tasks"));
+        assert!(parse_err("task t {\n  if true {\n    needs a\n  }\n}\n").contains("inline block"));
     }
 
     #[test]

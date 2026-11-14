@@ -1,0 +1,95 @@
+import { expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as oniguruma from "vscode-oniguruma";
+import * as textmate from "vscode-textmate";
+
+const root = path.join(import.meta.dir, "..");
+const wasm = fs.readFileSync(path.join(root, "node_modules/vscode-oniguruma/release/onig.wasm"));
+
+async function tokenizer() {
+  await oniguruma.loadWASM(wasm.buffer.slice(wasm.byteOffset, wasm.byteOffset + wasm.byteLength) as ArrayBuffer);
+  const registry = new textmate.Registry({
+    onigLib: Promise.resolve({
+      createOnigScanner: (s: string[]) => new oniguruma.OnigScanner(s),
+      createOnigString: (s: string) => new oniguruma.OnigString(s),
+    }),
+    loadGrammar: async (scope) => {
+      if (scope === "source.taskpod") {
+        const file = path.join(root, "syntaxes/taskpod.tmLanguage.json");
+        return textmate.parseRawGrammar(fs.readFileSync(file, "utf8"), file);
+      }
+      // Stand-in for VS Code's shell grammar.
+      return textmate.parseRawGrammar(JSON.stringify({ scopeName: "source.shell", patterns: [] }), "shell.json");
+    },
+  });
+  const grammar = (await registry.loadGrammar("source.taskpod"))!;
+  return (text: string) => {
+    let stack = textmate.INITIAL;
+    const tokens: [string, string][] = [];
+    for (const line of text.split("\n")) {
+      const result = grammar.tokenizeLine(line, stack);
+      for (const t of result.tokens) tokens.push([line.slice(t.startIndex, t.endIndex), t.scopes.join(" ")]);
+      stack = result.ruleStack;
+    }
+    return tokens;
+  };
+}
+
+const scopeOf = (tokens: [string, string][], text: string) => tokens.find(([t]) => t === text)?.[1] ?? `<no token ${text}>`;
+
+test("highlights the language", async () => {
+  const tokenize = await tokenizer();
+  const tokens = tokenize(`let name = "pod {{ x }}"   # comment
+task build {
+    needs lint test
+    unless test -e out {
+        run make {{ name }}
+    }
+    run {
+        if [ -n "\${A}" ]; then echo "}"; fi
+    }
+    pkg zsh
+    file "/etc/x" mode 640 owner root:wheel encoding utf-16le sudo from "files/x"
+    file "/etc/y" """
+        raw {{ name }}
+        """
+}
+subtask notify of build {
+}`);
+  expect(scopeOf(tokens, "let")).toContain("storage.type.let");
+  expect(scopeOf(tokens, "name")).toContain("variable.other.definition");
+  expect(scopeOf(tokens, "x")).toContain("variable.other.readwrite");
+  expect(scopeOf(tokens, " comment")).toContain("comment.line");
+  expect(scopeOf(tokens, "task")).toContain("storage.type.task");
+  expect(scopeOf(tokens, "build")).toContain("entity.name.function");
+  expect(scopeOf(tokens, "lint")).toContain("entity.name.function");
+  expect(scopeOf(tokens, " test -e out")).toContain("meta.embedded.line.shell");
+  expect(scopeOf(tokens, "{")).toContain("punctuation.section.block");
+  expect(scopeOf(tokens, '        if [ -n "${A}" ]; then echo "}"; fi')).toContain("meta.embedded.block.shell");
+  expect(scopeOf(tokens, "pkg")).toContain("entity.name.function.call");
+  expect(scopeOf(tokens, "640")).toContain("constant.numeric.octal");
+  expect(scopeOf(tokens, "root:wheel")).toContain("variable.other.constant.owner");
+  expect(scopeOf(tokens, "utf-16le")).toContain("constant.language.encoding");
+  expect(scopeOf(tokens, "        raw ")).toContain("string.quoted.triple");
+  expect(scopeOf(tokens, "of")).toContain("keyword.other.of");
+  expect(scopeOf(tokens, "notify")).toContain("entity.name.function");
+});
+
+test("tokenizes the example files without leaking state", async () => {
+  const tokenize = await tokenizer();
+  for (const file of ["../../spec.task", "../../build.task"]) {
+    const tokens = tokenize(fs.readFileSync(path.join(root, file), "utf8"));
+    // The last task's closing brace must be back at the top level.
+    const last = tokens.filter(([t]) => t === "}").pop()!;
+    expect(last[1]).not.toContain("embedded");
+    expect(last[1]).not.toContain("string");
+  }
+});
+
+test("continued template calls stay arguments", async () => {
+  const tokenize = await tokenizer();
+  const tokens = tokenize("task a {\n    pkg one \\\n        two\n    needs x \\\n        y\n}");
+  expect(scopeOf(tokens, "        two")).not.toContain("entity.name.function.call");
+  expect(scopeOf(tokens, "y")).toContain("entity.name.function");
+});

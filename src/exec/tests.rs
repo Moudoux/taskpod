@@ -3,7 +3,7 @@ use crate::parser::parse_str;
 
 fn options(jobs: usize) -> Options {
     Options {
-        dry_run: false,
+        mode: Mode::Run,
         ignore_guards: false,
         jobs,
         skip: HashSet::new(),
@@ -175,7 +175,7 @@ fn skip_and_dry_run() {
 
     let dry = tempfile::tempdir().unwrap();
     let mut opts = options(2);
-    opts.dry_run = true;
+    opts.mode = Mode::DryRun;
     let outcomes = run(source, dry.path(), &opts, &[]);
     assert_eq!(outcomes["a"], Outcome::Ran);
     assert!(std::fs::read_dir(dry.path()).unwrap().next().is_none());
@@ -208,4 +208,72 @@ fn files_are_written_once() {
 
     let outcomes = run(source, dir.path(), &options(1), &[]);
     assert_eq!(outcomes["files"], Outcome::UpToDate);
+}
+
+#[cfg(unix)]
+#[test]
+fn inline_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = r#"
+        task t {
+            run touch a
+            unless test -e a {
+                run touch never
+            }
+            if test -e a {
+                run touch b
+            }
+        }
+    "#;
+    let outcomes = run(source, dir.path(), &options(1), &[]);
+    assert_eq!(outcomes["t"], Outcome::Ran);
+    assert!(dir.path().join("b").exists());
+    assert!(!dir.path().join("never").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn diff_mode_and_encodings() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("src.txt"), "copied é\n").unwrap();
+    let source = r#"
+        task files {
+            file "out/utf16" encoding utf-16le "hi\n"
+            file "out/latin" encoding latin1 "é\n"
+            file "out/copy" mode 600 from "src.txt"
+        }
+    "#;
+    let mut diff = options(1);
+    diff.mode = Mode::Diff;
+    assert_eq!(run(source, dir.path(), &diff, &[])["files"], Outcome::Ran);
+    assert!(!dir.path().join("out").exists());
+
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["files"],
+        Outcome::Ran
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("out/utf16")).unwrap(),
+        [0xFF, 0xFE, b'h', 0, b'i', 0, b'\n', 0]
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("out/latin")).unwrap(),
+        [0xE9, b'\n']
+    );
+    assert_eq!(read(dir.path(), "out/copy"), "copied é\n");
+
+    // Now the system matches, so a diff finds nothing.
+    assert_eq!(
+        run(source, dir.path(), &diff, &[])["files"],
+        Outcome::UpToDate
+    );
+
+    // A mode change is a difference too.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        dir.path().join("out/copy"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert_eq!(run(source, dir.path(), &diff, &[])["files"], Outcome::Ran);
 }

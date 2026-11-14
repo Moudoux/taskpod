@@ -17,6 +17,18 @@ pub enum Var {
     Template(String),
     /// Output of a shell command, run the first time the variable is used.
     Shell(String, OnceLock<std::result::Result<String, String>>),
+    /// The answer to a question, asked the first time the variable is used.
+    Prompt(Prompt, OnceLock<std::result::Result<String, String>>),
+}
+
+#[derive(Debug, Clone)]
+pub enum Prompt {
+    /// Yes or no, the answer is `true` or `false`.
+    Confirm(String),
+    /// One of a list of options.
+    Choose(String, Vec<String>),
+    /// Free text, with an optional default.
+    Input(String, Option<String>),
 }
 
 #[derive(Debug, Default)]
@@ -238,7 +250,31 @@ impl<'a> Scope<'a> {
                 })
                 .clone()
                 .map_err(|e| anyhow!("variable '{name}': {e}")),
+            Var::Prompt(prompt, cache) => cache
+                .get_or_init(|| {
+                    let prompt = self
+                        .expand_prompt(prompt, depth)
+                        .map_err(|e| e.to_string())?;
+                    crate::ui::ui().prompt(&prompt).map_err(|e| e.to_string())
+                })
+                .clone()
+                .map_err(|e| anyhow!("variable '{name}': {e}")),
         }
+    }
+
+    fn expand_prompt(&self, prompt: &Prompt, depth: usize) -> Result<Prompt> {
+        let expand = |text: &str| self.expand_depth(text, depth + 1);
+        Ok(match prompt {
+            Prompt::Confirm(question) => Prompt::Confirm(expand(question)?),
+            Prompt::Choose(question, options) => Prompt::Choose(
+                expand(question)?,
+                options.iter().map(|o| expand(o)).collect::<Result<_>>()?,
+            ),
+            Prompt::Input(question, default) => Prompt::Input(
+                expand(question)?,
+                default.as_deref().map(expand).transpose()?,
+            ),
+        })
     }
 }
 

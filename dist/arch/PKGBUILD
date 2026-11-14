@@ -1,7 +1,7 @@
 # Local package for taskpod. Build from this directory with `makepkg -si`.
 #
-# This lives in arch/ rather than the project root because makepkg uses a
-# src/ directory next to the PKGBUILD as its build area: in the root, that
+# This lives in dist/arch/ rather than the project root because makepkg uses
+# a src/ directory next to the PKGBUILD as its build area: in the root, that
 # would be the project's own src/.
 
 pkgname=taskpod
@@ -14,7 +14,7 @@ license=(unknown)
 depends=(gcc-libs glibc)
 makedepends=(cargo)
 
-_root="$startdir/.."
+_root="$startdir/../.."
 
 prepare() {
   cd "$_root"

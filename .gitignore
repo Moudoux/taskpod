@@ -5,9 +5,9 @@
 /test*
 
 # My system config, see README
-/arch.task
+/arch/
 
-# makepkg output (see arch/PKGBUILD)
-arch/pkg/
-arch/src/
-arch/*.pkg.tar.*
+# makepkg output (see dist/arch/PKGBUILD)
+dist/arch/pkg/
+dist/arch/src/
+dist/arch/*.pkg.tar.*

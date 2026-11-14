@@ -59,20 +59,122 @@ pub enum Step {
         template: String,
         args: String,
     },
+    /// A block with its own guards, e.g. `unless <check> {`.
+    Block(Block),
 }
 
 #[derive(Debug)]
 pub struct FileStep {
     pub path: String,
     pub source: FileSource,
+    /// Permission bits, default 644 (755 for content starting with `#!`).
     pub mode: Option<u32>,
+    /// `user` or `user:group`; only checked and set when given.
+    pub owner: Option<String>,
+    pub encoding: Encoding,
+    /// Copy the source's bytes unchanged (a `from` file with no encoding).
+    pub raw: bool,
     pub sudo: bool,
+}
+
+/// How a file's text is written. Copied files (`from`) are written byte for
+/// byte unless an encoding is given, in which case they're read as UTF-8.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Encoding {
+    #[default]
+    Utf8,
+    Utf8Bom,
+    /// UTF-16 little endian, with a byte order mark.
+    Utf16Le,
+    /// UTF-16 big endian, with a byte order mark.
+    Utf16Be,
+    Latin1,
+    Ascii,
+}
+
+impl Encoding {
+    pub const NAMES: &[&str] = &[
+        "utf-8",
+        "utf-8-bom",
+        "utf-16le",
+        "utf-16be",
+        "latin1",
+        "ascii",
+    ];
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "utf-8" | "utf8" => Encoding::Utf8,
+            "utf-8-bom" | "utf8-bom" => Encoding::Utf8Bom,
+            "utf-16le" | "utf16le" | "utf-16" => Encoding::Utf16Le,
+            "utf-16be" | "utf16be" => Encoding::Utf16Be,
+            "latin1" | "latin-1" | "iso-8859-1" => Encoding::Latin1,
+            "ascii" | "us-ascii" => Encoding::Ascii,
+            _ => return None,
+        })
+    }
+
+    pub fn encode(self, text: &str) -> Result<Vec<u8>> {
+        Ok(match self {
+            Encoding::Utf8 => text.as_bytes().to_vec(),
+            Encoding::Utf8Bom => [&[0xEF, 0xBB, 0xBF][..], text.as_bytes()].concat(),
+            Encoding::Utf16Le => [0xFF, 0xFE]
+                .into_iter()
+                .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+                .collect(),
+            Encoding::Utf16Be => [0xFE, 0xFF]
+                .into_iter()
+                .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+                .collect(),
+            Encoding::Latin1 | Encoding::Ascii => {
+                let max = if self == Encoding::Latin1 { 0xFF } else { 0x7F };
+                let name = if self == Encoding::Latin1 {
+                    "latin1"
+                } else {
+                    "ascii"
+                };
+                text.chars()
+                    .map(|c| match u8::try_from(c as u32) {
+                        Ok(b) if u32::from(b) <= max => Ok(b),
+                        _ => Err(anyhow::anyhow!("{c:?} can't be written as {name}")),
+                    })
+                    .collect::<Result<_>>()?
+            }
+        })
+    }
+
+    /// Decode for showing a diff.
+    pub fn decode(self, bytes: &[u8]) -> Option<String> {
+        match self {
+            Encoding::Utf8 | Encoding::Utf8Bom | Encoding::Ascii => {
+                let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+                String::from_utf8(bytes.to_vec()).ok()
+            }
+            Encoding::Latin1 => Some(bytes.iter().map(|&b| b as char).collect()),
+            Encoding::Utf16Le | Encoding::Utf16Be => {
+                let bytes = bytes.get(2..)?;
+                if bytes.len() % 2 != 0 {
+                    return None;
+                }
+                let units = bytes.chunks(2).map(|c| {
+                    if self == Encoding::Utf16Le {
+                        u16::from_le_bytes([c[0], c[1]])
+                    } else {
+                        u16::from_be_bytes([c[0], c[1]])
+                    }
+                });
+                char::decode_utf16(units)
+                    .collect::<std::result::Result<String, _>>()
+                    .ok()
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum FileSource {
     Inline(String),
-    /// Copy of a file, relative to the task file's directory.
+    /// Copy of a file. Relative paths are relative to the file that uses them.
     Copy(String),
 }
 
@@ -102,6 +204,10 @@ impl Step {
             Step::Run(script) => script.clone(),
             Step::File(file) => format!("file {}", file.path),
             Step::Call { template, args } => format!("{template} {args}").trim().to_string(),
+            Step::Block(block) => block
+                .guards
+                .first()
+                .map_or_else(|| "block".to_string(), Guard::describe),
         }
     }
 }
@@ -163,6 +269,9 @@ impl TaskFile {
         origin: &str,
     ) -> Result<()> {
         for step in &block.steps {
+            if let Step::Block(inner) = step {
+                self.check_calls(inner, stack, origin)?;
+            }
             if let Step::Call { template, .. } = step {
                 let Some(called) = self.templates.get(template) else {
                     bail!("{origin}: unknown directive or template '{template}'");
@@ -180,6 +289,9 @@ impl TaskFile {
 
     fn template_needs<'a>(&'a self, block: &'a Block, needs: &mut BTreeSet<&'a str>) {
         for step in &block.steps {
+            if let Step::Block(inner) = step {
+                self.template_needs(inner, needs);
+            }
             if let Step::Call { template, .. } = step {
                 let template = &self.templates[template];
                 needs.extend(template.needs.iter().map(String::as_str));
@@ -195,6 +307,19 @@ impl TaskFile {
             .values()
             .map(|t| &t.body)
             .chain(self.templates.values().map(|t| &t.body));
-        blocks.flat_map(|b| b.locks.iter().cloned()).collect()
+        let mut names = BTreeSet::new();
+        for block in blocks {
+            collect_locks(block, &mut names);
+        }
+        names
+    }
+}
+
+fn collect_locks(block: &Block, names: &mut BTreeSet<String>) {
+    names.extend(block.locks.iter().cloned());
+    for step in &block.steps {
+        if let Step::Block(inner) = step {
+            collect_locks(inner, names);
+        }
     }
 }

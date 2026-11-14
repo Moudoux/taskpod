@@ -1,11 +1,12 @@
 use anyhow::Result;
 use clap::Parser;
+use console::style;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
-use taskpod::exec::{Options, Runner, select, summarize};
-use taskpod::term::term;
+use taskpod::exec::{Mode, Options, Runner, select, summarize};
+use taskpod::ui::ui;
 use taskpod::vars::Scope;
 
 #[derive(Parser)]
@@ -19,9 +20,13 @@ pub struct Args {
     #[arg(short, long, num_args = 1..)]
     pub run: Vec<String>,
 
-    /// Show what would run without changing anything. Runs `if` and `unless` checks
+    /// Show every task and step, and what would change. Runs `if` and `unless` checks, changes nothing
     #[arg(short, long, visible_short_alias = 'n')]
     pub dry_run: bool,
+
+    /// Compare with the system: show only what would change, with file diffs
+    #[arg(short = 'D', long, conflicts_with = "dry_run")]
+    pub diff: bool,
 
     /// Show what a task would do, same as --dry-run --run TASK
     #[arg(short, long, value_name = "TASK")]
@@ -31,6 +36,10 @@ pub struct Args {
     #[arg(short, long)]
     pub list: bool,
 
+    /// Check the file for errors without running anything
+    #[arg(long)]
+    pub check: bool,
+
     /// Tasks to skip
     #[arg(short, long, num_args = 1..)]
     pub skip: Vec<String>,
@@ -39,13 +48,17 @@ pub struct Args {
     #[arg(long)]
     pub ignore_conditions: bool,
 
-    /// How many tasks to run at once. With 1, commands use the terminal directly
+    /// How many tasks to run at once
     #[arg(short, long, default_value_t = default_jobs())]
     pub jobs: usize,
 
-    /// Show every command and up to date step
+    /// Stream every command and its output
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Plain output without spinners, also used when not on a terminal
+    #[arg(long)]
+    pub plain: bool,
 }
 
 fn default_jobs() -> usize {
@@ -54,12 +67,13 @@ fn default_jobs() -> usize {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    taskpod::term::init(args.verbose);
+    taskpod::ui::init(args.verbose, args.plain);
     match run(args) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(error) => {
-            eprintln!("{} {error:#}", term().paint("1;31", "error:"));
+            ui().end();
+            eprintln!("{} {error:#}", style("error:").red().bold());
             ExitCode::FAILURE
         }
     }
@@ -69,14 +83,25 @@ fn run(mut args: Args) -> Result<bool> {
     let start = Instant::now();
     let file = taskpod::parser::parse_file(&args.file)?;
 
+    if args.check {
+        println!("{} {} is valid", style("✓").green(), args.file.display());
+        return Ok(true);
+    }
+
     if args.list {
         let scope = Scope::root(&file.vars, &file.ctx);
-        let term = term();
+        let width = file
+            .tasks
+            .keys()
+            .map(|n| n.chars().count())
+            .max()
+            .unwrap_or(0);
         for task in file.tasks.values() {
             let desc = task
                 .desc
                 .as_deref()
-                .map(|d| scope.expand(d).unwrap_or_else(|_| d.to_string()));
+                .map(|d| scope.expand(d).unwrap_or_else(|_| d.to_string()))
+                .unwrap_or_default();
             let mut tags = Vec::new();
             if task.manual {
                 tags.push("manual".to_string());
@@ -87,13 +112,14 @@ fn run(mut args: Args) -> Result<bool> {
             let tags = if tags.is_empty() {
                 String::new()
             } else {
-                format!(" [{}]", tags.join(", "))
+                format!("[{}] ", tags.join(", "))
             };
+            let name = format!("{:width$}", task.name);
             println!(
-                "{}{}  {}",
-                term.paint("1", &task.name),
-                tags,
-                term.paint("2", desc.as_deref().unwrap_or(""))
+                "{}  {}{}",
+                style(name).bold(),
+                style(tags).cyan(),
+                style(desc).dim()
             );
         }
         return Ok(true);
@@ -104,8 +130,13 @@ fn run(mut args: Args) -> Result<bool> {
         args.run = vec![task];
     }
 
+    let mode = match (args.dry_run, args.diff) {
+        (_, true) => Mode::Diff,
+        (true, _) => Mode::DryRun,
+        _ => Mode::Run,
+    };
     let opts = Options {
-        dry_run: args.dry_run,
+        mode,
         ignore_guards: args.ignore_conditions,
         jobs: args.jobs.max(1),
         skip: args.skip.into_iter().collect::<HashSet<_>>(),
@@ -115,10 +146,10 @@ fn run(mut args: Args) -> Result<bool> {
 
     let scope = runner.root_scope();
     if let Some(guard) = runner.failing_guard(&file.guards, &scope, &file.ctx.dir)? {
-        term().info(&format!("Nothing to do: {}", guard.describe()));
+        ui().line(format!("Nothing to do: {}", guard.describe()));
         return Ok(true);
     }
 
     let outcomes = runner.run(&order);
-    Ok(summarize(&outcomes, start, opts.dry_run))
+    Ok(summarize(&outcomes, start, &opts, &args.file))
 }
