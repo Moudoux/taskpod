@@ -5,7 +5,7 @@
 # would be the project's own src/.
 
 pkgname=taskpod
-pkgver=0.11.2
+pkgver=0.11.3
 pkgrel=1
 pkgdesc="Declarative task runner: tasks declare dependencies and run in parallel"
 arch=(x86_64 aarch64)
