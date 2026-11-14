@@ -36,6 +36,18 @@ pub struct Args {
     #[arg(short, long)]
     pub list: bool,
 
+    /// Show the tasks and what they need, without running anything: as a tree,
+    /// or as Graphviz (`dot`) or Mermaid. With --run, only those tasks and their needs
+    #[arg(
+        short,
+        long,
+        value_name = "FORMAT",
+        num_args = 0..=1,
+        default_missing_value = "tree",
+        conflicts_with_all = ["list", "check", "json"]
+    )]
+    pub graph: Option<GraphFormat>,
+
     /// Check the file for errors without running anything
     #[arg(long)]
     pub check: bool,
@@ -63,6 +75,16 @@ pub struct Args {
     #[arg(long, value_name = "FILE")]
     pub age_key: Option<PathBuf>,
 
+    /// Print the result of a dry run or diff as JSON on stdout, for editors, instead of
+    /// the usual output. Never asks anything
+    #[arg(long, conflicts_with_all = ["check", "list"])]
+    pub json: bool,
+
+    /// Don't decrypt secrets: steps and tasks that need them are reported as not checked.
+    /// Only for dry runs and diffs
+    #[arg(long)]
+    pub no_secrets: bool,
+
     /// Tasks to skip
     #[arg(short, long, num_args = 1..)]
     pub skip: Vec<String>,
@@ -84,16 +106,30 @@ pub struct Args {
     pub plain: bool,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum GraphFormat {
+    Tree,
+    Dot,
+    Mermaid,
+}
+
 fn default_jobs() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get())
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    taskpod::ui::init(args.verbose, args.plain);
+    taskpod::ui::init(args.verbose, args.plain, args.json);
+    let (json, file, mode, pull) = (args.json, args.file.clone(), mode(&args), args.pull);
     match run(args) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
+        Err(error) if json => {
+            let error = format!("{error:#}");
+            let document = taskpod::exec::json::error(&file, mode, pull, &error);
+            println!("{document}");
+            ExitCode::FAILURE
+        }
         Err(error) => {
             ui().end();
             let error = format!("{error:#}");
@@ -107,11 +143,28 @@ fn main() -> ExitCode {
     }
 }
 
+fn mode(args: &Args) -> Mode {
+    match (args.dry_run || args.inspect.is_some(), args.diff) {
+        (_, true) => Mode::Diff,
+        (true, _) => Mode::DryRun,
+        _ => Mode::Run,
+    }
+}
+
 fn run(mut args: Args) -> Result<bool> {
     let start = Instant::now();
+    let mode = mode(&args);
+    if mode == Mode::Run && !args.check && !args.list && args.graph.is_none() {
+        if args.json {
+            anyhow::bail!("--json only works with --dry-run or --diff");
+        }
+        if args.no_secrets {
+            anyhow::bail!("--no-secrets only works with --dry-run or --diff");
+        }
+    }
     // Checking and listing only read the file, they don't need the machine.
     let remote = match &args.host {
-        Some(host) if !args.check && !args.list => {
+        Some(host) if !args.check && !args.list && args.graph.is_none() => {
             Some(std::sync::Arc::new(taskpod::remote::Remote::connect(host)?))
         }
         _ => None,
@@ -122,6 +175,9 @@ fn run(mut args: Args) -> Result<bool> {
     }
     if let Some(key) = &args.age_key {
         file.ctx.secrets.set_age_key(std::path::absolute(key)?);
+    }
+    if args.no_secrets {
+        file.ctx.secrets.disable();
     }
 
     if args.check {
@@ -167,16 +223,22 @@ fn run(mut args: Args) -> Result<bool> {
         return Ok(true);
     }
 
+    if let Some(format) = args.graph {
+        use taskpod::exec::graph::{Format, render};
+        let format = match format {
+            GraphFormat::Tree => Format::Tree,
+            GraphFormat::Dot => Format::Dot,
+            GraphFormat::Mermaid => Format::Mermaid,
+        };
+        print!("{}", render(&file, &select(&file, &args.run)?, format));
+        return Ok(true);
+    }
+
     if let Some(task) = args.inspect.take() {
         args.dry_run = true;
         args.run = vec![task];
     }
 
-    let mode = match (args.dry_run, args.diff) {
-        (_, true) => Mode::Diff,
-        (true, _) => Mode::DryRun,
-        _ => Mode::Run,
-    };
     let opts = Options {
         mode,
         ignore_guards: args.ignore_conditions,
@@ -191,11 +253,23 @@ fn run(mut args: Args) -> Result<bool> {
     let scope = runner.root_scope();
     let cwd = file.ctx.default_cwd(&file.ctx.dir);
     if let Some(guard) = runner.failing_guard(&file.guards, &scope, &cwd)? {
-        ui().line(format!("Nothing to do: {}", guard.describe()));
+        let reason = guard.describe();
+        if args.json {
+            let document = taskpod::exec::json::document(&args.file, &runner, &[], Some(&reason));
+            println!("{document}");
+        }
+        ui().line(format!("Nothing to do: {reason}"));
         return Ok(true);
     }
 
     let outcomes = runner.run(&order);
+    if args.json {
+        println!(
+            "{}",
+            taskpod::exec::json::document(&args.file, &runner, &outcomes, None)
+        );
+        return Ok(outcomes.iter().all(|(_, o)| o.ok()));
+    }
     let ok = summarize(&outcomes, start, &opts, &args.file);
     let edits = std::mem::take(&mut *runner.edits.lock().unwrap_or_else(|e| e.into_inner()));
     if edits.is_empty() {

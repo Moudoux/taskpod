@@ -26,6 +26,8 @@ pub struct Ui {
     pub fancy: bool,
     pub verbose: bool,
     interactive: bool,
+    /// `--json`: print nothing, the caller prints the result.
+    quiet: bool,
     prompt: Mutex<()>,
     total: Mutex<Option<ProgressBar>>,
     width: AtomicUsize,
@@ -67,15 +69,22 @@ pub fn redact(text: &str) -> Cow<'_, str> {
     Cow::Owned(text)
 }
 
-pub fn init(verbose: bool, plain: bool) {
-    if std::env::var_os("NO_COLOR").is_some() {
+/// Set up output. `quiet` (for `--json`) prints nothing, uses no colors and never asks.
+pub fn init(verbose: bool, plain: bool, quiet: bool) {
+    if quiet || std::env::var_os("NO_COLOR").is_some() {
         console::set_colors_enabled(false);
         console::set_colors_enabled_stderr(false);
     }
     let fancy = !plain
+        && !quiet
         && std::io::stderr().is_terminal()
         && std::env::var("TERM").map_or(true, |t| t != "dumb");
-    let _ = UI.set(Ui::new(fancy, verbose));
+    let mut ui = Ui::new(fancy, verbose);
+    if quiet {
+        ui.quiet = true;
+        ui.interactive = false;
+    }
+    let _ = UI.set(ui);
     let mut config = inquire::ui::RenderConfig::default_colored();
     config.prompt_prefix = inquire::ui::Styled::new("?").with_fg(inquire::ui::Color::LightYellow);
     config.answered_prompt_prefix =
@@ -99,6 +108,7 @@ impl Ui {
             fancy,
             verbose,
             interactive: std::io::stdin().is_terminal(),
+            quiet: false,
             prompt: Mutex::new(()),
             total: Mutex::new(None),
             width: AtomicUsize::new(0),
@@ -107,6 +117,9 @@ impl Ui {
 
     /// A permanent line, printed above the live display.
     pub fn line(&self, text: impl AsRef<str>) {
+        if self.quiet {
+            return;
+        }
         let text = redact(text.as_ref());
         if self.fancy {
             // Lines wider than the terminal would be dropped by the live
@@ -390,6 +403,13 @@ pub fn up_to_date(name: &str) -> String {
 
 pub fn skipped(name: &str, reason: &str) -> String {
     style(format!("○ {name} · skipped: {reason}"))
+        .dim()
+        .to_string()
+}
+
+/// A task a check couldn't look at, because it needs secrets (`--no-secrets`).
+pub fn unchecked(name: &str, reason: &str) -> String {
+    style(format!("? {name} · not checked: {reason}"))
         .dim()
         .to_string()
 }

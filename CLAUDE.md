@@ -21,6 +21,10 @@ idempotent. Its main use is setting up an Arch system from
 - `src/exec/step.rs`: running steps: shell, files (content/mode/owner, diffs), template calls and inline blocks.
   With `--pull` (`Options::pull`, combined with the Run/DryRun/Diff mode) file steps are compared the
   other way and queue edits on `Runner::edits`, which `main` applies at the end.
+- `src/exec/graph.rs`: `--graph` (tree, dot, mermaid) of the tasks `select` picks, from the file alone.
+- `src/exec/json.rs`: `--json` documents. `TaskRun` records each step as a `StepRecord` next to the
+  printed lines; `--no-secrets` errors (`secrets::NOT_CHECKED`, matched by text since lazy variables
+  stringify errors) make a step `unchecked`, or the task `Outcome::Unchecked` if a guard or variable needs one.
 - `src/exec/pull.rs`: mapping system content back onto templates (plain lines only, never secrets),
   writing string literals, and applying edits by the source spans the parser records (`FileOrigin`).
 - `src/exec/target.rs`: reading, stat-ing and writing files on the machine being configured, local or remote.
@@ -32,6 +36,8 @@ idempotent. Its main use is setting up an Arch system from
 - `editors/vscode/`: VS Code extension (TypeScript, built with bun). `src/index.ts` is its own
   line-based indexer of task files, separate from the Rust parser; update both when the syntax changes,
   along with the TextMate grammar, `src/docs.ts` and [Task.xml](Task.xml).
+  Live checks: `src/live.ts` reads `--json` (no vscode imports, unit tested), `src/checks.ts` runs
+  checks for files enabled in workspace state and shows results; bump `JSON_VERSION` in both with the shape.
 - `dist/arch/PKGBUILD`: Arch package, builds from the repo (`cd dist/arch && makepkg -si`).
   Its `pkgver` must match `Cargo.toml`; CI checks this.
 

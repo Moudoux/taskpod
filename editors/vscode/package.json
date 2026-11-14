@@ -1,8 +1,8 @@
 {
   "name": "taskpod",
   "displayName": "Taskpod",
-  "description": "Syntax highlighting, completion, hover docs, go to definition and diagnostics for taskpod .task files",
-  "version": "0.6.0",
+  "description": "Syntax highlighting, completion, hover docs, go to definition, diagnostics and live checks against the system for taskpod .task files",
+  "version": "0.7.0",
   "publisher": "moudoux",
   "license": "UNLICENSED",
   "repository": {
@@ -68,6 +68,29 @@
         "command": "taskpod.diffTask",
         "title": "Compare task with the system",
         "category": "Taskpod"
+      },
+      {
+        "command": "taskpod.enableChecks",
+        "title": "Check this file against this system",
+        "category": "Taskpod",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "taskpod.disableChecks",
+        "title": "Stop checking this file",
+        "category": "Taskpod",
+        "icon": "$(eye-closed)"
+      },
+      {
+        "command": "taskpod.refreshChecks",
+        "title": "Check again",
+        "category": "Taskpod",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "taskpod.showCheck",
+        "title": "Show check result",
+        "category": "Taskpod"
       }
     ],
     "menus": {
@@ -95,6 +118,22 @@
         {
           "command": "taskpod.diffTask",
           "when": "false"
+        },
+        {
+          "command": "taskpod.enableChecks",
+          "when": "editorLangId == taskpod && !taskpod.checksEnabled"
+        },
+        {
+          "command": "taskpod.disableChecks",
+          "when": "editorLangId == taskpod && taskpod.checksEnabled"
+        },
+        {
+          "command": "taskpod.refreshChecks",
+          "when": "editorLangId == taskpod && taskpod.checksEnabled"
+        },
+        {
+          "command": "taskpod.showCheck",
+          "when": "false"
         }
       ]
     },
@@ -115,6 +154,17 @@
           "type": "boolean",
           "default": true,
           "description": "Show Run, Dry run and Diff above each task."
+        },
+        "taskpod.checkSecrets": {
+          "type": "boolean",
+          "default": false,
+          "description": "Let live checks decrypt secrets. Off by default, so checks never ask for a PIN or security key touch: steps that need secrets show as not checked."
+        },
+        "taskpod.checkTimeout": {
+          "type": "number",
+          "default": 120,
+          "minimum": 5,
+          "description": "Seconds a live check may take before it's stopped."
         }
       }
     }

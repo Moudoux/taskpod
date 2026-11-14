@@ -590,3 +590,234 @@ fn pull_never_writes_secrets() {
     super::pull::apply(&edits);
     assert!(!std::fs::read_to_string(&main).unwrap().contains("hunter2"));
 }
+
+/// Check `source` with `--no-secrets` if `no_secrets`, and return the `--json` document.
+#[cfg(unix)]
+fn check_json(
+    source: &str,
+    dir: &Path,
+    mode: Mode,
+    setup: impl FnOnce(&mut TaskFile),
+) -> serde_json::Value {
+    let mut file = parse_str(source, dir).unwrap_or_else(|e| panic!("{e:#}"));
+    setup(&mut file);
+    let mut opts = options(1);
+    opts.mode = mode;
+    let runner = Runner::new(&file, &opts);
+    let outcomes = runner.run(&select(&file, &[]).unwrap());
+    json::document(&dir.join("main.task"), &runner, &outcomes, None)
+}
+
+#[cfg(unix)]
+fn task<'a>(document: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    document["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == name)
+        .unwrap_or_else(|| panic!("no task {name} in {document:#}"))
+}
+
+#[cfg(unix)]
+#[test]
+fn json_reports_each_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("same"), "same\n").unwrap();
+    std::fs::write(dir.path().join("differs"), "a\nb\nc\n").unwrap();
+    // A fake sops that would leave a mark: --no-secrets must never start it.
+    let fake = dir.path().join("fake-sops");
+    crate::test_util::write_script(
+        &fake,
+        "#!/bin/sh\ntouch \"$(dirname \"$4\")/decrypted\"\ncat \"$4\"\n",
+    );
+    std::fs::write(
+        dir.path().join("secrets.json"),
+        r#"{"token": "tok-123456"}"#,
+    )
+    .unwrap();
+    let source = r#"
+        secrets "secrets.json"
+        task current {
+            file "same" "same\n"
+        }
+        task changes {
+            file "differs" "a\nB\nc\n"
+            run echo hi
+        }
+        task guarded {
+            if false
+            run echo never
+        }
+        task broken {
+            file "out" from "missing-source"
+        }
+        task after-broken {
+            needs broken
+            run true
+        }
+        task secret-guard {
+            if test "{{ secrets.token }}" = x
+            run true
+        }
+        subtask secret-sub of secret-guard {
+            run true
+        }
+        task secret-step {
+            file "same" "same\n"
+            file "token" "{{ secrets.token }}"
+        }
+    "#;
+    let document = check_json(source, dir.path(), Mode::Diff, |file| {
+        file.ctx.secrets.set_program(fake.display().to_string());
+        file.ctx.secrets.disable();
+    });
+    assert!(!dir.path().join("decrypted").exists(), "sops ran");
+    assert_eq!(document["version"], 1);
+    assert_eq!(document["mode"], "diff");
+    assert!(document["error"].is_null());
+
+    let current = task(&document, "current");
+    assert_eq!(current["outcome"], "up-to-date");
+    assert_eq!(current["line"], 3);
+    assert!(
+        current["file"].as_str().unwrap().ends_with("<string>"),
+        "{current}"
+    );
+    assert_eq!(current["steps"][0]["kind"], "ok");
+
+    let changes = task(&document, "changes");
+    assert_eq!(changes["outcome"], "would-change");
+    let file = &changes["steps"][0];
+    assert_eq!(file["kind"], "change");
+    assert!(
+        file["label"]
+            .as_str()
+            .unwrap()
+            .ends_with("differs · content"),
+        "{file}"
+    );
+    assert_eq!(
+        file["diff"],
+        serde_json::json!(["@@ -1,3 +1,3 @@", " a", "-b", "+B", " c"])
+    );
+    assert_eq!(
+        changes["steps"][1],
+        serde_json::json!({"depth": 0, "kind": "run", "label": "echo hi"})
+    );
+
+    let guarded = task(&document, "guarded");
+    assert_eq!(guarded["outcome"], "skipped");
+    assert_eq!(guarded["reason"], "if false");
+
+    let broken = task(&document, "broken");
+    assert_eq!(broken["outcome"], "failed");
+    assert!(
+        broken["reason"]
+            .as_str()
+            .unwrap()
+            .contains("missing-source"),
+        "{broken}"
+    );
+    let blocked = task(&document, "after-broken");
+    assert_eq!(blocked["outcome"], "blocked");
+    assert_eq!(blocked["reason"], "broken");
+
+    let guard = task(&document, "secret-guard");
+    assert_eq!(guard["outcome"], "unchecked");
+    assert!(
+        guard["reason"].as_str().unwrap().contains("secret 'token'"),
+        "{guard}"
+    );
+    let sub = task(&document, "secret-sub");
+    assert_eq!(sub["outcome"], "skipped");
+    assert_eq!(sub["reason"], "secret-guard wasn't checked");
+
+    let step = task(&document, "secret-step");
+    assert_eq!(step["outcome"], "up-to-date");
+    assert_eq!(step["unchecked"], 1);
+    assert_eq!(step["steps"][1]["kind"], "unchecked");
+    assert_eq!(step["steps"][1]["label"], "file token");
+
+    // Without --no-secrets, the same file decrypts.
+    let document = check_json(source, dir.path(), Mode::Diff, |file| {
+        file.ctx.secrets.set_program(fake.display().to_string());
+    });
+    assert!(dir.path().join("decrypted").exists());
+    assert_eq!(task(&document, "secret-guard")["outcome"], "skipped");
+    assert_eq!(task(&document, "secret-step")["outcome"], "would-change");
+}
+
+#[cfg(unix)]
+#[test]
+fn json_dry_runs_and_nested_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = r#"
+        template make {
+            unless test -e {{ 1 }}
+            run touch {{ 1 }}
+        }
+        task t {
+            make here
+            make "$(pwd)"
+            if true {
+                run echo inside
+            }
+        }
+    "#;
+    let document = check_json(source, dir.path(), Mode::DryRun, |_| {});
+    assert_eq!(document["mode"], "dry-run");
+    let steps = &task(&document, "t")["steps"];
+    let kinds: Vec<(u64, &str, &str)> = steps
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["depth"].as_u64().unwrap(),
+                s["kind"].as_str().unwrap(),
+                s["label"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (0, "change", "make here"),
+            (1, "run", "touch here"),
+            (0, "ok", "make \"$(pwd)\""),
+            (0, "change", "if true"),
+            (1, "run", "echo inside"),
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn json_redacts_secrets_and_colors() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("fake-sops");
+    crate::test_util::write_script(&fake, "#!/bin/sh\ncat \"$4\"\n");
+    std::fs::write(
+        dir.path().join("secrets.json"),
+        r#"{"key": "json-secret-987"}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("conf"), "key=old-value\nother\n").unwrap();
+    let source = r#"
+        secrets "secrets.json"
+        task conf {
+            file "conf" "key={{ secrets.key }}\nother\n"
+        }
+    "#;
+    let document = check_json(source, dir.path(), Mode::Diff, |file| {
+        file.ctx.secrets.set_program(fake.display().to_string());
+    });
+    let text = document.to_string();
+    assert!(!text.contains("json-secret-987"), "{text}");
+    assert!(!text.contains("old-value"), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text}");
+    let steps = &task(&document, "conf")["steps"];
+    assert_eq!(steps[0]["diff"][1], "-••••");
+    assert_eq!(steps[0]["diff"][2], "+key=••••");
+    assert_eq!(steps[1]["kind"], "note");
+}

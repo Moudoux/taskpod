@@ -1,7 +1,7 @@
 //! Running the steps of one task.
 
 use super::target::{self, Current, describe};
-use super::{Mode, Outcome, Runner, pull, sudo};
+use super::{Mode, Outcome, Runner, StepKind, StepRecord, TaskReport, pull, sudo};
 use crate::ast::{Block, Encoding, FileSource, FileStep, Guard, Step, Task};
 use crate::ui::{self, TaskLine, ui};
 use crate::vars::{Scope, Vars, expand_tilde};
@@ -57,6 +57,8 @@ pub(crate) struct TaskRun<'r> {
     /// Lines shown under the task's status line when it's done: the plan in
     /// checks, what changed in a live display.
     lines: Vec<String>,
+    /// The same steps as data, for `--json`.
+    report: TaskReport,
     failed: bool,
 }
 
@@ -70,6 +72,7 @@ impl<'r> TaskRun<'r> {
             changed: false,
             line: None,
             lines: Vec::new(),
+            report: TaskReport::default(),
             failed: false,
         }
     }
@@ -131,6 +134,54 @@ impl<'r> TaskRun<'r> {
         lines
     }
 
+    pub fn take_report(&mut self) -> TaskReport {
+        std::mem::take(&mut self.report)
+    }
+
+    fn record(&mut self, depth: usize, kind: StepKind, label: &str) {
+        self.report.steps.push(StepRecord {
+            depth,
+            kind,
+            label: label.to_string(),
+            diff: None,
+        });
+    }
+
+    /// Attach diff lines to the last step; lines that aren't part of a
+    /// unified diff (notes about binary content or hidden secrets) become notes.
+    fn record_diff(&mut self, depth: usize, lines: &[String]) {
+        let mut diff = Vec::new();
+        let mut notes = Vec::new();
+        for line in lines {
+            let plain = console::strip_ansi_codes(line).into_owned();
+            if plain.starts_with(['@', '+', '-', ' ']) {
+                diff.push(plain);
+            } else {
+                notes.push(plain);
+            }
+        }
+        if let Some(step) = self.report.steps.last_mut()
+            && !diff.is_empty()
+        {
+            step.diff = Some(diff);
+        }
+        for note in notes {
+            self.record(depth, StepKind::Note, &note);
+        }
+    }
+
+    /// A step that needs secrets, in a check with `--no-secrets`.
+    fn unchecked(&mut self, depth: usize, label: &str) {
+        self.report.unchecked += 1;
+        self.record(depth, StepKind::Unchecked, label);
+        self.push(
+            depth,
+            style(format!("? {label} · uses secrets, not checked"))
+                .dim()
+                .to_string(),
+        );
+    }
+
     pub fn desc(&self, scope: &Scope) -> String {
         match &self.task.desc {
             Some(desc) => scope.expand(desc).unwrap_or_else(|_| desc.clone()),
@@ -155,6 +206,7 @@ impl<'r> TaskRun<'r> {
     /// Something changes (or would, in a check).
     fn change(&mut self, depth: usize, label: &str) {
         self.changed = true;
+        self.record(depth, StepKind::Change, label);
         match &self.line {
             Some(line) if line.shows_live_output() => line.status(&ui::change(label)),
             Some(line) => {
@@ -167,6 +219,7 @@ impl<'r> TaskRun<'r> {
 
     /// Something is already as it should be.
     fn current(&mut self, depth: usize, label: &str) {
+        self.record(depth, StepKind::Ok, label);
         match self.mode() {
             Mode::DryRun => self.push(depth, ui::ok(label)),
             Mode::Run if ui().verbose => {
@@ -190,31 +243,43 @@ impl<'r> TaskRun<'r> {
                 sudo::ensure(&self.task.name, &self.runner.file.ctx)?;
             }
         }
-        let runner = self.runner;
         for step in &block.steps {
-            match step {
-                Step::Run(script) => self.run_step(&scope.expand(script)?, depth)?,
-                Step::File(file) => self.file(file, scope, depth)?,
-                Step::Call { template, args } => {
-                    let template = &runner.file.templates[template];
-                    let args = scope.expand(args)?;
-                    let label = format!("{} {args}", template.name).trim().to_string();
-                    let arg_vars = Vars::for_args(&args);
-                    let call_scope = scope.child(&arg_vars);
-                    let inner = call_scope.child(&template.vars);
-                    self.nested(&template.body, &inner, depth, &label)?;
-                }
-                Step::Block(inner) => {
-                    let label = inner
-                        .guards
-                        .first()
-                        .map_or_else(|| "block".into(), Guard::describe);
-                    let label = scope.expand(&label).unwrap_or(label);
-                    self.nested(inner, scope, depth, &label)?;
-                }
+            let result = self.step(step, scope, depth);
+            // Checks with `--no-secrets` go on past steps that need secrets.
+            if let Err(e) = &result
+                && self.checking()
+                && crate::secrets::not_checked(e)
+            {
+                self.unchecked(depth, &unexpanded_label(step));
+                continue;
             }
+            result?;
         }
         Ok(())
+    }
+
+    fn step(&mut self, step: &'r Step, scope: &Scope, depth: usize) -> Result<()> {
+        match step {
+            Step::Run(script) => self.run_step(&scope.expand(script)?, depth),
+            Step::File(file) => self.file(file, scope, depth),
+            Step::Call { template, args } => {
+                let template = &self.runner.file.templates[template];
+                let args = scope.expand(args)?;
+                let label = format!("{} {args}", template.name).trim().to_string();
+                let arg_vars = Vars::for_args(&args);
+                let call_scope = scope.child(&arg_vars);
+                let inner = call_scope.child(&template.vars);
+                self.nested(&template.body, &inner, depth, &label)
+            }
+            Step::Block(inner) => {
+                let label = inner
+                    .guards
+                    .first()
+                    .map_or_else(|| "block".into(), Guard::describe);
+                let label = scope.expand(&label).unwrap_or(label);
+                self.nested(inner, scope, depth, &label)
+            }
+        }
     }
 
     /// A template call or inline block: check its guards, then run it.
@@ -231,6 +296,8 @@ impl<'r> TaskRun<'r> {
         // The block only counts as a change if a step inside it changes something.
         let changed_before = std::mem::replace(&mut self.changed, false);
         let mark = self.lines.len();
+        let step_mark = self.report.steps.len();
+        let unchecked_before = self.report.unchecked;
         self.status(label);
         let result = self.block(block, scope, depth + 1);
         let inner_changed = self.changed;
@@ -244,6 +311,20 @@ impl<'r> TaskRun<'r> {
             self.lines
                 .insert(mark, format!("{indent}{}", ui::ok(label)));
         }
+        let kind = if inner_changed || result.is_err() {
+            StepKind::Change
+        } else if self.report.unchecked > unchecked_before {
+            StepKind::Unchecked
+        } else {
+            StepKind::Ok
+        };
+        let record = StepRecord {
+            depth,
+            kind,
+            label: label.to_string(),
+            diff: None,
+        };
+        self.report.steps.insert(step_mark, record);
         result
     }
 
@@ -253,6 +334,7 @@ impl<'r> TaskRun<'r> {
             return Ok(());
         }
         self.changed = true;
+        self.record(depth, StepKind::Run, script.trim_end());
         if self.checking() {
             for line in script.lines() {
                 self.push(depth, ui::command(line));
@@ -383,7 +465,9 @@ impl<'r> TaskRun<'r> {
                 if let Some(old) = &existing
                     && old != &content
                 {
-                    for line in diff_lines(old, &content, file.encoding) {
+                    let lines = diff_lines(old, &content, file.encoding);
+                    self.record_diff(depth + 1, &lines);
+                    for line in lines {
                         self.push(depth + 1, line);
                     }
                 }
@@ -422,10 +506,9 @@ impl<'r> TaskRun<'r> {
         let system = match target::read(ctx, &self.task.name, path, as_root)? {
             Current::Content(bytes) => bytes,
             Current::Missing => {
-                self.push(
-                    depth,
-                    ui::ok(&format!("{label} · not on the system, nothing to pull")),
-                );
+                let text = format!("{label} · not on the system, nothing to pull");
+                self.record(depth, StepKind::Ok, &text);
+                self.push(depth, ui::ok(&text));
                 return Ok(());
             }
             Current::Unreadable => {
@@ -434,7 +517,9 @@ impl<'r> TaskRun<'r> {
                 } else {
                     ", add `sudo` to the step to read it as root"
                 };
-                self.push(depth, ui::change(&format!("{label} · can't read it{hint}")));
+                let text = format!("{label} · can't read it{hint}");
+                self.record(depth, StepKind::Change, &text);
+                self.push(depth, ui::change(&text));
                 return Ok(());
             }
         };
@@ -481,8 +566,10 @@ impl<'r> TaskRun<'r> {
                 self.current(depth, &label);
             } else {
                 self.changed = true;
+                self.record(depth, StepKind::Change, &label);
                 self.push(depth, ui::change(&label));
                 for note in notes {
+                    self.record_diff(depth + 1, std::slice::from_ref(&note));
                     self.push(depth + 1, note);
                 }
             }
@@ -494,6 +581,7 @@ impl<'r> TaskRun<'r> {
             Mode::DryRun => notes,
             Mode::Diff | Mode::Run => details.into_iter().chain(notes).collect(),
         };
+        self.record_diff(depth + 1, &shown);
         if !write {
             for line in shown {
                 self.push(depth + 1, line);
@@ -528,6 +616,20 @@ impl<'r> TaskRun<'r> {
             self.push(depth + 1, style("not pulled").dim().to_string());
         }
         Ok(())
+    }
+}
+
+/// A step's label from the task file as written, for a step that couldn't be
+/// expanded: it names secrets, never their values.
+fn unexpanded_label(step: &Step) -> String {
+    match step {
+        Step::Run(script) => first_line(script),
+        Step::File(file) => format!("file {}", file.path),
+        Step::Call { template, args } => format!("{template} {args}").trim().to_string(),
+        Step::Block(inner) => inner
+            .guards
+            .first()
+            .map_or_else(|| "block".into(), Guard::describe),
     }
 }
 

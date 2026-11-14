@@ -4,7 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { BUILTIN_VARS, ENCODINGS, KEYWORDS, keywordMarkdown, type Place } from "./docs";
+import { LiveChecks, REPORT_SCHEME } from "./checks";
 import { type Index, type RefKind, parse, resolveVar, symbolAt } from "./index";
+import { hoverMarkdown, title } from "./live";
 import { type SecretKey, secretKeys } from "./secrets";
 
 const LANGUAGE = "taskpod";
@@ -17,6 +19,12 @@ interface FileIndex {
 }
 
 const cache = new Map<string, { version: number; index: Index }>();
+let checks: LiveChecks | undefined;
+
+/** The line of each task in a document. */
+function taskLines(document: vscode.TextDocument): Map<string, number> {
+  return new Map(indexOf(document).tasks.map((t) => [t.name, t.line]));
+}
 
 function indexOf(document: vscode.TextDocument): Index {
   const key = document.uri.toString();
@@ -184,13 +192,19 @@ class Provider
     vscode.CompletionItemProvider,
     vscode.CodeLensProvider
 {
+  readonly onDidChangeCodeLenses = checks?.onDidChangeResults;
+
   provideHover(document: vscode.TextDocument, position: vscode.Position): vscode.Hover | undefined {
     const files = project(document);
     const index = files[0].index;
     const symbol = symbolAt(index, position.line, position.character);
     if (symbol) {
       let markdown: string | undefined;
-      if (symbol.kind === "task") markdown = taskDoc(files, symbol.name);
+      if (symbol.kind === "task") {
+        markdown = taskDoc(files, symbol.name);
+        const result = symbol.definition ? checks?.tasksIn(document.uri).get(symbol.name) : undefined;
+        if (result) markdown = `${markdown ?? ""}\n\n---\n\n${hoverMarkdown(result, checks?.checkedAt(document.uri, symbol.name))}`;
+      }
       if (symbol.kind === "template") markdown = templateDoc(document, files, symbol.name);
       if (symbol.kind === "var") {
         const def = resolveVar(index, symbol.name, position.line) ?? files.slice(1).flatMap((f) => f.index.vars).find((v) => v.name === symbol.name && !v.owner);
@@ -379,15 +393,25 @@ class Provider
   }
 
   provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
-    if (!vscode.workspace.getConfiguration("taskpod").get("codeLens", true)) return [];
+    const actions = vscode.workspace.getConfiguration("taskpod").get("codeLens", true);
+    const results = checks?.tasksIn(document.uri);
     return indexOf(document).tasks.flatMap((t) => {
       const at = new vscode.Range(t.line, 0, t.line, 0);
       const args = [document.uri, t.name];
-      return [
-        new vscode.CodeLens(at, { title: "$(play) Run", command: "taskpod.runTask", arguments: args }),
-        new vscode.CodeLens(at, { title: "Dry run", command: "taskpod.dryRunTask", arguments: args }),
-        new vscode.CodeLens(at, { title: "Diff", command: "taskpod.diffTask", arguments: args }),
-      ];
+      const lenses: vscode.CodeLens[] = [];
+      const result = results?.get(t.name);
+      if (result) {
+        const tooltip = "Result of the last live check on this system. Click for the full diff.";
+        lenses.push(new vscode.CodeLens(at, { title: title(result), tooltip, command: "taskpod.showCheck", arguments: args }));
+      }
+      if (actions) {
+        lenses.push(
+          new vscode.CodeLens(at, { title: "$(play) Run", command: "taskpod.runTask", arguments: args }),
+          new vscode.CodeLens(at, { title: "Dry run", command: "taskpod.dryRunTask", arguments: args }),
+          new vscode.CodeLens(at, { title: "Diff", command: "taskpod.diffTask", arguments: args }),
+        );
+      }
+      return lenses;
     });
   }
 }
@@ -493,7 +517,14 @@ async function runTaskpod(uri: vscode.Uri | undefined, flags: string[]): Promise
   t.sendText([binary, target.fsPath, ...flags].map(quote).join(" "));
 }
 
+function activeTaskFile(uri?: vscode.Uri): vscode.Uri | undefined {
+  const target = uri ?? vscode.window.activeTextEditor?.document.uri;
+  return target?.scheme === "file" ? target : undefined;
+}
+
 export function activate(context: vscode.ExtensionContext): void {
+  const live = new LiveChecks(context.workspaceState, taskLines);
+  checks = live;
   const provider = new Provider();
   const lintDiagnostics = vscode.languages.createDiagnosticCollection("taskpod");
   const checkDiagnostics = vscode.languages.createDiagnosticCollection("taskpod-check");
@@ -503,7 +534,13 @@ export function activate(context: vscode.ExtensionContext): void {
     if (document.languageId !== LANGUAGE) return;
     const key = document.uri.toString();
     clearTimeout(timers.get(key));
-    timers.set(key, setTimeout(() => lintDiagnostics.set(document.uri, lint(document)), 250));
+    timers.set(
+      key,
+      setTimeout(() => {
+        lintDiagnostics.set(document.uri, lint(document));
+        for (const editor of vscode.window.visibleTextEditors) if (editor.document === document) live.decorate(editor);
+      }, 250),
+    );
   };
   const recheck = async (document: vscode.TextDocument) => {
     if (document.languageId !== LANGUAGE || document.uri.scheme !== "file") return;
@@ -512,6 +549,28 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   context.subscriptions.push(
+    live,
+    vscode.workspace.registerTextDocumentContentProvider(REPORT_SCHEME, live),
+    vscode.window.onDidChangeActiveTextEditor(() => live.updateStatus()),
+    vscode.window.onDidChangeVisibleTextEditors((editors) => editors.forEach((e) => live.decorate(e))),
+    vscode.commands.registerCommand("taskpod.enableChecks", async (uri?: vscode.Uri) => {
+      const target = activeTaskFile(uri);
+      if (target) await live.setEnabled(target, true);
+    }),
+    vscode.commands.registerCommand("taskpod.disableChecks", async (uri?: vscode.Uri) => {
+      const target = activeTaskFile(uri);
+      if (target) await live.setEnabled(target, false);
+    }),
+    vscode.commands.registerCommand("taskpod.refreshChecks", (uri?: vscode.Uri) => {
+      const target = activeTaskFile(uri);
+      if (target && live.isEnabled(target)) live.schedule(target, 0);
+      else live.refreshAll();
+    }),
+    vscode.commands.registerCommand("taskpod.showCheck", async (uri: vscode.Uri, task: string) => {
+      const document = await vscode.workspace.openTextDocument(live.reportUri(uri, task));
+      await vscode.languages.setTextDocumentLanguage(document, "diff");
+      await vscode.window.showTextDocument(document, { preview: true, viewColumn: vscode.ViewColumn.Beside });
+    }),
     lintDiagnostics,
     checkDiagnostics,
     vscode.languages.registerHoverProvider(SELECTOR, provider),
@@ -525,9 +584,13 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidOpenTextDocument((d) => {
       relint(d);
       void recheck(d);
+      if (d.languageId === LANGUAGE) live.schedule(d.uri, 0);
     }),
     vscode.workspace.onDidChangeTextDocument((e) => relint(e.document)),
-    vscode.workspace.onDidSaveTextDocument((d) => void recheck(d)),
+    vscode.workspace.onDidSaveTextDocument((d) => {
+      void recheck(d);
+      if (d.languageId === LANGUAGE) live.saved(d.uri);
+    }),
     vscode.workspace.onDidCloseTextDocument((d) => {
       lintDiagnostics.delete(d.uri);
       checkDiagnostics.delete(d.uri);
@@ -543,7 +606,9 @@ export function activate(context: vscode.ExtensionContext): void {
   for (const document of vscode.workspace.textDocuments) {
     relint(document);
     void recheck(document);
+    if (document.languageId === LANGUAGE) live.schedule(document.uri, 0);
   }
+  live.updateStatus();
 }
 
 export function deactivate(): void {}

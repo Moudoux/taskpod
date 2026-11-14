@@ -38,16 +38,25 @@ taskpod FILE -H pi@rpi     # configure another machine over SSH
 taskpod FILE -r a b        # run tasks a and b, and what they need
 taskpod FILE -i a          # what task a would do
 taskpod FILE -l            # list tasks
+taskpod FILE -g            # task graph: each task with what runs before it (with -r: only those)
+taskpod FILE -g dot        # the graph for Graphviz (| dot -Tsvg > tasks.svg), or -g mermaid
 taskpod FILE --check       # check the file for errors
 taskpod FILE --secrets s.yaml  # secrets for {{ secrets.name }}, see below
 taskpod FILE -s a          # skip task a
 taskpod FILE -j 4          # at most 4 tasks at once (default: one per CPU)
 taskpod FILE -v            # stream every command and its output
 taskpod FILE --plain       # no live display, output prefixed by task
+taskpod FILE -D --json     # the diff as JSON, for editors
+taskpod FILE -D --no-secrets  # don't decrypt: steps that need secrets show as not checked
 ```
 
 Diffs and dry runs run the `if` and `unless` checks (which shouldn't change
 anything), compare files byte for byte, mode and owner, and show unified diffs.
+`--json` prints the result of a diff or dry run (`-d`) as one JSON document
+on stdout, with plain text and secrets hidden, instead of the usual output;
+it never asks anything. `--no-secrets` keeps a check from decrypting secrets
+(no PIN or key touch): a step that needs one is reported as not checked, and
+so is a task whose `if`, `unless` or variables need one.
 
 While running, each task gets a live spinner showing its latest output above
 an overall progress bar; a failed task prints its last output. Questions
@@ -198,7 +207,8 @@ for every `v*` tag. Builds of other commits are under the CI run's artifacts.
 ## VS Code
 
 [editors/vscode](editors/vscode) has an extension with highlighting,
-completion, hover docs, go to definition, diagnostics and run buttons. CI
+completion, hover docs, go to definition, diagnostics, run buttons and live
+checks, which show above each task whether this system matches it. CI
 builds it as a `.vsix`, attached to releases; to build it yourself:
 
 ```sh

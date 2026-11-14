@@ -20,6 +20,15 @@ use std::sync::{Arc, OnceLock};
 /// The prefix of secret names in templates: `{{ secrets.github.token }}`.
 pub const PREFIX: &str = "secrets.";
 
+/// In the error for a secret used with `--no-secrets`. Errors pass through
+/// lazy variables as text, so this is how a check recognises them.
+pub const NOT_CHECKED: &str = "not checked, --no-secrets doesn't decrypt secrets";
+
+/// Whether `error` comes from a secret used with `--no-secrets`.
+pub fn not_checked(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains(NOT_CHECKED)
+}
+
 type Loaded = std::result::Result<BTreeMap<String, String>, String>;
 
 #[derive(Debug, Clone)]
@@ -35,6 +44,8 @@ pub struct Secrets {
     /// otherwise sops' own key file.
     identity: Option<PathBuf>,
     values: Arc<OnceLock<Loaded>>,
+    /// `--no-secrets`: never decrypt, every secret is an error.
+    disabled: bool,
 }
 
 impl Default for Secrets {
@@ -46,6 +57,7 @@ impl Default for Secrets {
             age_program: "age".into(),
             identity: None,
             values: Arc::default(),
+            disabled: false,
         }
     }
 }
@@ -70,12 +82,20 @@ impl Secrets {
         self.identity = Some(identity);
     }
 
+    /// Never decrypt: using a secret is an error that [`not_checked`] recognises.
+    pub fn disable(&mut self) {
+        self.disabled = true;
+    }
+
     pub fn set_program(&mut self, program: impl Into<String>) {
         self.program = program.into();
     }
 
     /// The value of `name` (without the `secrets.` prefix), decrypting the files if needed.
     pub fn get(&self, name: &str) -> std::result::Result<String, String> {
+        if self.disabled {
+            return Err(format!("secret '{name}': {NOT_CHECKED}"));
+        }
         if self.files.is_empty() {
             return Err(format!(
                 "secret '{name}' is used, but no secrets file was given \

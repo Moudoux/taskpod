@@ -1,5 +1,7 @@
 //! Running tasks: selection, parallel scheduling, dry runs and diffs.
 
+pub mod graph;
+pub mod json;
 pub mod pull;
 mod step;
 pub mod sudo;
@@ -59,12 +61,48 @@ pub enum Outcome {
     Failed(String),
     /// A task it needs failed.
     Blocked(String),
+    /// A check couldn't look at it: its checks or variables need secrets,
+    /// and `--no-secrets` was given. Not a failure.
+    Unchecked(String),
 }
 
 impl Outcome {
-    fn ok(&self) -> bool {
+    pub fn ok(&self) -> bool {
         !matches!(self, Outcome::Failed(_) | Outcome::Blocked(_))
     }
+}
+
+/// What a step of a task does, or would do, for `--json`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StepKind {
+    /// A file or block that changes (or would).
+    Change,
+    /// A command that runs (or would).
+    Run,
+    /// Already as it should be.
+    Ok,
+    /// Extra information, such as why a diff is incomplete.
+    Note,
+    /// Needs secrets, so a check with `--no-secrets` didn't look at it.
+    Unchecked,
+}
+
+#[derive(Debug, Clone)]
+pub struct StepRecord {
+    /// How deep in template calls and inline blocks.
+    pub depth: usize,
+    pub kind: StepKind,
+    pub label: String,
+    /// Unified diff lines, for file changes in a diff.
+    pub diff: Option<Vec<String>>,
+}
+
+/// The steps of one finished task.
+#[derive(Debug, Clone, Default)]
+pub struct TaskReport {
+    pub steps: Vec<StepRecord>,
+    /// Steps not checked because they need secrets.
+    pub unchecked: usize,
 }
 
 /// Ask a yes/no question.
@@ -185,6 +223,8 @@ pub struct Runner<'a> {
     pub locks: HashMap<String, Mutex<()>>,
     /// Changes `--pull` will make to the task files.
     pub edits: Mutex<Vec<pull::Edit>>,
+    /// The steps of each task that ran, for `--json`.
+    pub reports: Mutex<HashMap<String, TaskReport>>,
 }
 
 impl<'a> Runner<'a> {
@@ -201,6 +241,7 @@ impl<'a> Runner<'a> {
                 .map(|n| (n, Mutex::new(())))
                 .collect(),
             edits: Mutex::default(),
+            reports: Mutex::default(),
         }
     }
 
@@ -292,7 +333,11 @@ impl<'a> Runner<'a> {
                         && !self.opts.pull
                         && outcomes[index[parent.as_str()]] != Some(Outcome::Ran)
                     {
-                        Some(Outcome::Skipped(format!("{parent} had nothing to do")))
+                        let why = match outcomes[index[parent.as_str()]] {
+                            Some(Outcome::Unchecked(_)) => "wasn't checked",
+                            _ => "had nothing to do",
+                        };
+                        Some(Outcome::Skipped(format!("{parent} {why}")))
                     } else {
                         None
                     };
@@ -360,9 +405,13 @@ impl<'a> Runner<'a> {
         };
         let start = Instant::now();
         let mut run = TaskRun::new(self, task);
-        let outcome = run
-            .run()
-            .unwrap_or_else(|e| Outcome::Failed(format!("{e:#}")));
+        let outcome = run.run().unwrap_or_else(|e| {
+            if self.opts.checking() && crate::secrets::not_checked(&e) {
+                Outcome::Unchecked(format!("{e:#}"))
+            } else {
+                Outcome::Failed(format!("{e:#}"))
+            }
+        });
         let elapsed = format!("· {:.1?}", start.elapsed());
         let root = self.root_scope();
         let desc = run.desc(&root.child(&task.vars));
@@ -373,6 +422,10 @@ impl<'a> Runner<'a> {
             (false, false) => format!("· {desc} {elapsed}"),
         };
         let lines = run.finish();
+        self.reports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task.name.clone(), run.take_report());
         self.report(task, &outcome, &detail, &lines);
         outcome
     }
@@ -387,6 +440,7 @@ impl<'a> Runner<'a> {
             Outcome::Ran => Some(ui::done(name, detail)),
             Outcome::UpToDate if !diff || ui.verbose => Some(ui::up_to_date(name)),
             Outcome::Skipped(reason) if !diff || ui.verbose => Some(ui::skipped(name, reason)),
+            Outcome::Unchecked(reason) => Some(ui::unchecked(name, reason)),
             Outcome::Failed(error) => Some(ui::failed(name, error)),
             Outcome::Blocked(dep) => Some(ui::failed(name, &format!("not run, {dep} failed"))),
             _ => None,
@@ -412,6 +466,12 @@ pub fn summarize(
     let ran = count(|o| *o == Outcome::Ran);
     let current = count(|o| *o == Outcome::UpToDate);
     let skipped = count(|o| matches!(o, Outcome::Skipped(_)));
+    let unchecked = count(|o| matches!(o, Outcome::Unchecked(_)));
+    let not_checked = if unchecked > 0 {
+        format!(", {unchecked} not checked (secrets)")
+    } else {
+        String::new()
+    };
     let failed: Vec<&str> = outcomes
         .iter()
         .filter(|(_, o)| !o.ok())
@@ -437,7 +497,7 @@ pub fn summarize(
             "{} {} {elapsed}",
             style("✓").green().bold(),
             style(format!(
-                "Nothing would change, the system matches {}",
+                "Nothing would change, the system matches {}{not_checked}",
                 file.display()
             ))
             .bold()
@@ -462,6 +522,9 @@ pub fn summarize(
     } else {
         parts.push(format!("{current} up to date"));
         parts.push(format!("{skipped} skipped"));
+    }
+    if unchecked > 0 {
+        parts.push(format!("{unchecked} not checked (secrets)"));
     }
     if !failed.is_empty() {
         parts.push(format!("{} failed ({})", failed.len(), failed.join(", ")));
