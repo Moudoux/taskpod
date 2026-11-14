@@ -72,20 +72,64 @@ fn read_remote(remote: &Remote, path: &Path, sudo: bool) -> Result<Current> {
     })
 }
 
+/// Prints the octal mode and `user:group` of `$1`, with GNU (Linux, busybox)
+/// or BSD (macOS) `stat`.
+const STAT: &str = r#"if stat -c %a / >/dev/null 2>&1; then
+  stat -c '%a %U:%G' -- "$1"
+else
+  stat -f '%Mp%Lp %Su:%Sg' -- "$1"
+fi"#;
+
+/// Run as root: writes stdin to `$1` with mode `$2`, passing the remaining
+/// arguments (`-o user -g group`) to `install`, after creating parent
+/// directories. BSD `install` has no `-D` and can't read `/dev/stdin`, so the
+/// content goes through a private temporary file first.
+const INSTALL: &str = r#"p=$1 mode=$2; shift 2
+if [ -d "$p" ] && [ ! -L "$p" ]; then echo "$p is a directory" >&2; exit 1; fi
+mkdir -p -- "$(dirname -- "$p")" || exit 1
+t=$(umask 077 && mktemp "${TMPDIR:-/tmp}/taskpod.XXXXXX") || exit 1
+trap 'rm -f "$t"' EXIT
+cat > "$t" || exit 1
+install -m "$mode" "$@" "$t" "$p""#;
+
+/// A path as a command argument: one starting with `-` gets a `./`, since
+/// not every tool (BSD `chmod`) takes `--`.
+fn arg(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    if path.starts_with('-') {
+        format!("./{path}")
+    } else {
+        path.into_owned()
+    }
+}
+
+/// `install` arguments that set the owner.
+fn owner_args(owner: Option<&str>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(owner) = owner {
+        let (user, group) = owner.split_once(':').unwrap_or((owner, ""));
+        args.extend(["-o".into(), user.into()]);
+        if !group.is_empty() {
+            args.extend(["-g".into(), group.into()]);
+        }
+    }
+    args
+}
+
 /// Permission bits and `user:group` of a file, if it exists.
 pub fn stat(ctx: &Ctx, path: &Path) -> Option<(u32, String)> {
     let output = match &ctx.remote {
         Some(remote) => {
-            let script = format!("stat -c '%a %U:%G' -- {}", quote(&path.to_string_lossy()));
+            let script = format!("set -- {}\n{STAT}", quote(&arg(path)));
             remote.output(&script, &[]).ok()?
         }
         None => {
             if !path.exists() {
                 return None;
             }
-            std::process::Command::new("stat")
-                .args(["-c", "%a %U:%G"])
-                .arg(path)
+            std::process::Command::new("sh")
+                .args(["-c", STAT, "sh"])
+                .arg(arg(path))
                 .stdin(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
@@ -129,20 +173,22 @@ fn write_remote(
     owner: Option<&str>,
     sudo: bool,
 ) -> Result<()> {
-    let p = quote(&path.to_string_lossy());
+    let p = quote(&arg(path));
     let script = if sudo || owner.is_some() {
+        let args: Vec<String> = owner_args(owner).iter().map(|a| quote(a)).collect();
         format!(
-            "sudo {} /dev/stdin {p}",
-            install_args(mode, owner).join(" ")
+            "sudo sh -c {} sh {p} {mode:o} {}",
+            quote(INSTALL),
+            args.join(" ")
         )
     } else {
         // Like a local write: through symlinks, and never readable with
         // looser permissions than `mode`, even for a moment.
         format!(
             "mkdir -p -- \"$(dirname -- {p})\" || exit 1\n\
-             if [ -e {p} ]; then chmod {mode:o} -- {p} || exit 1; fi\n\
+             if [ -e {p} ]; then chmod {mode:o} {p} || exit 1; fi\n\
              (umask 077 && cat > {p}) || exit 1\n\
-             chmod {mode:o} -- {p}\n"
+             chmod {mode:o} {p}\n"
         )
     };
     let output = remote.output(&script, content)?;
@@ -154,24 +200,6 @@ fn write_remote(
         );
     }
     Ok(())
-}
-
-/// `install` arguments that create parent directories and set the mode and owner.
-fn install_args(mode: u32, owner: Option<&str>) -> Vec<String> {
-    let mut args = vec![
-        "install".into(),
-        "-D".into(),
-        "-m".into(),
-        format!("{mode:o}"),
-    ];
-    if let Some(owner) = owner {
-        let (user, group) = owner.split_once(':').unwrap_or((owner, ""));
-        args.extend(["-o".into(), quote(user)]);
-        if !group.is_empty() {
-            args.extend(["-g".into(), quote(group)]);
-        }
-    }
-    args
 }
 
 fn write_local(path: &Path, content: &[u8], mode: u32) -> Result<()> {
@@ -205,22 +233,14 @@ fn write_local(path: &Path, content: &[u8], mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// Write a file as root with `sudo install`, which also creates parent
-/// directories and sets the owner.
+/// Write a file as root with `install`, which also sets the owner.
 fn write_with_sudo(path: &Path, content: &[u8], mode: u32, owner: Option<&str>) -> Result<()> {
-    let mut command = std::process::Command::new("sudo");
     // Local arguments aren't parsed by a shell, so they're passed unquoted.
-    command.args(["install", "-D", "-m", &format!("{mode:o}")]);
-    if let Some(owner) = owner {
-        let (user, group) = owner.split_once(':').unwrap_or((owner, ""));
-        command.args(["-o", user]);
-        if !group.is_empty() {
-            command.args(["-g", group]);
-        }
-    }
-    let mut child = command
-        .arg("/dev/stdin")
-        .arg(path)
+    let mut child = std::process::Command::new("sudo")
+        .args(["sh", "-c", INSTALL, "sh"])
+        .arg(arg(path))
+        .arg(format!("{mode:o}"))
+        .args(owner_args(owner))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
