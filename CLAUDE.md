@@ -32,6 +32,8 @@ idempotent. Its main use is setting up an Arch system from
 - `src/exec/pull.rs`: mapping system content back onto templates (plain lines only, never secrets),
   writing string literals, and applying edits by the source spans the parser records (`FileOrigin`).
 - `src/exec/target.rs`: reading, stat-ing and writing files on the machine being configured, local or remote.
+  Root writes (`INSTALL`, local and remote) `install` to a `.taskpod.XXXXXX` file beside the target
+  and `mv` it over, so watchers never see it missing; user writes truncate in place.
 - `src/remote.rs`: `--host`: one ssh master connection per run, every command a POSIX script sent over
   stdin to a fixed bootstrap. Remote sudo passwords go through an askpass helper. `Ctx::remote` is set
   before parsing, since `include ... if` checks run on the target.

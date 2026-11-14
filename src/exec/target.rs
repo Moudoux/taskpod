@@ -151,14 +151,25 @@ fi"#;
 /// content goes through a private temporary file first. `install` replaces
 /// a symlink rather than writing through it, so a symlink is resolved first,
 /// like other writes and `stat` do.
+///
+/// `install` unlinks an existing destination before creating it again, and
+/// a program watching the directory (opensnitchd's rules) can react to the
+/// file going missing. So it installs to a dotted temporary file, with no
+/// extension a watcher would load, in the target's own directory, and
+/// renames that over the target: the target is never missing.
 const INSTALL: &str = r#"p=$1 mode=$2; shift 2
 if [ -L "$p" ]; then p=$(readlink -f -- "$p") || exit 1; fi
 if [ -d "$p" ]; then echo "$p is a directory" >&2; exit 1; fi
-mkdir -p -- "$(dirname -- "$p")" || exit 1
+d=$(dirname -- "$p")
+mkdir -p -- "$d" || exit 1
+t= n=
+trap 'rm -f ${t:+"$t"} ${n:+"$n"}' EXIT
 t=$(umask 077 && mktemp "${TMPDIR:-/tmp}/taskpod.XXXXXX") || exit 1
-trap 'rm -f "$t"' EXIT
 cat > "$t" || exit 1
-install -m "$mode" "$@" "$t" "$p""#;
+n=$(umask 077 && mktemp "$d/.taskpod.XXXXXX") || exit 1
+install -m "$mode" "$@" "$t" "$n" || exit 1
+mv -f "$n" "$p" || exit 1
+n="#;
 
 /// A path as a command argument: one starting with `-` gets a `./`, since
 /// not every tool (BSD `chmod`) takes `--`.
@@ -497,4 +508,138 @@ pub fn remove_dir(ctx: &Ctx, task: &str, path: &Path, sudo: bool) -> Result<()> 
         );
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::INSTALL;
+    use std::io::Write;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    /// Wraps the real `name` in `bin`, running `before` first.
+    fn wrap(bin: &Path, name: &str, before: &str) {
+        let real = Command::new("sh")
+            .args(["-c", &format!("command -v {name}")])
+            .output()
+            .unwrap();
+        let real = String::from_utf8(real.stdout).unwrap();
+        crate::test_util::write_script(
+            &bin.join(name),
+            &format!("#!/bin/sh\n{before}\nexec '{}' \"$@\"\n", real.trim()),
+        );
+    }
+
+    /// Runs `INSTALL` (as the user) with the wrappers in `bin` first on `PATH`.
+    fn install(dir: &Path, path: &Path, content: &str) -> std::process::Output {
+        let tmp = dir.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path_var = format!(
+            "{}:{}",
+            dir.join("bin").display(),
+            std::env::var("PATH").unwrap()
+        );
+        let mut child = Command::new("sh")
+            .args(["-c", INSTALL, "sh"])
+            .arg(path)
+            .arg("640")
+            .env("PATH", path_var)
+            .env("TMPDIR", &tmp)
+            .env("LOG", dir.join("log"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(content.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn root_writes_replace_the_target_without_it_going_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // `install` records its destination; `mv` records its arguments and
+        // whether the target was still there when it was replaced.
+        wrap(
+            &bin,
+            "install",
+            r#"for a; do d=$a; done; echo "install $d" >> "$LOG""#,
+        );
+        wrap(
+            &bin,
+            "mv",
+            r#"[ -e "$3" ] && s=present || s=missing; echo "mv $2 $3 $s" >> "$LOG""#,
+        );
+        let rules = dir.path().join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        let target = rules.join("allow.json");
+        std::fs::write(&target, "old\n").unwrap();
+
+        let output = install(dir.path(), &target, "new\n");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+
+        let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        // Installed to a dotted temporary file next to the target...
+        let temp = lines[0].strip_prefix("install ").unwrap();
+        let temp = Path::new(temp);
+        assert_eq!(temp.parent(), Some(rules.as_path()), "{log}");
+        let name = temp.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with(".taskpod."), "{log}");
+        // ...then renamed over it, which was there until then.
+        assert_eq!(
+            lines[1],
+            format!("mv {} {} present", temp.display(), target.display())
+        );
+        // Nothing is left behind.
+        assert_eq!(names(&rules), ["allow.json"]);
+        assert!(names(&dir.path().join("tmp")).is_empty());
+    }
+
+    #[test]
+    fn failed_root_writes_clean_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        wrap(&bin, "mv", "exit 1");
+        let rules = dir.path().join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        let target = rules.join("allow.json");
+        std::fs::write(&target, "old\n").unwrap();
+
+        let output = install(dir.path(), &target, "new\n");
+        assert!(!output.status.success());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+        assert_eq!(names(&rules), ["allow.json"]);
+        assert!(names(&dir.path().join("tmp")).is_empty());
+
+        // A new file in a new directory works too.
+        std::fs::remove_file(bin.join("mv")).unwrap();
+        let new = dir.path().join("new/dir/file.conf");
+        let output = install(dir.path(), &new, "x\n");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "x\n");
+        assert_eq!(names(&dir.path().join("new/dir")), ["file.conf"]);
+    }
 }

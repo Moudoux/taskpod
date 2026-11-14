@@ -114,7 +114,8 @@ task setup {
     #   mode 600           permission bits, default 644, or 755 for content starting with #!
     #   owner user:group   checked and set, writes with sudo
     #   encoding utf-16le  utf-8 (default), utf-8-bom, utf-16le, utf-16be, latin1 or ascii
-    #   sudo               write as root
+    #   sudo               write as root, renaming a new file over the old one, so
+    #                      programs watching the directory never see it go missing
     #   new                taskpod created it: --undo deletes it (see Undo below)
     #   keep               --undo leaves it as it is
     # Content is a string, a """ block, or `from "path"` (relative to this file,
