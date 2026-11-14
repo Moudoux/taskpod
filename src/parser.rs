@@ -8,7 +8,6 @@ use crate::ast::*;
 use crate::vars::{Ctx, Prompt, Scope, Var, Vars, expand_tilde};
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 const MAX_INCLUDE_DEPTH: usize = 16;
 
@@ -386,13 +385,13 @@ impl<'s> Parser<'s> {
         self.skip_inline_ws();
         if let Some(prompt) = self.prompt()? {
             self.end_of_line()?;
-            return Ok((name, Var::Prompt(prompt, OnceLock::new())));
+            return Ok((name, Var::Prompt(prompt, Default::default())));
         }
         let var = match self.peek() {
             Some('"' | '\'') => Var::Template(self.string()?),
             Some('$') if self.rest().starts_with("$(") => {
                 let command = self.command_substitution()?;
-                Var::Shell(command, OnceLock::new())
+                Var::Shell(command, Default::default())
             }
             _ => Var::Literal(self.word("a value")?),
         };
@@ -903,6 +902,8 @@ fn is_keyword(word: &str) -> bool {
             | "workdir"
             | "let"
             | "run"
+            | "undo"
+            | "keep"
             | "file"
     )
 }

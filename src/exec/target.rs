@@ -83,9 +83,12 @@ fi"#;
 /// Run as root: writes stdin to `$1` with mode `$2`, passing the remaining
 /// arguments (`-o user -g group`) to `install`, after creating parent
 /// directories. BSD `install` has no `-D` and can't read `/dev/stdin`, so the
-/// content goes through a private temporary file first.
+/// content goes through a private temporary file first. `install` replaces
+/// a symlink rather than writing through it, so a symlink is resolved first,
+/// like other writes and `stat` do.
 const INSTALL: &str = r#"p=$1 mode=$2; shift 2
-if [ -d "$p" ] && [ ! -L "$p" ]; then echo "$p is a directory" >&2; exit 1; fi
+if [ -L "$p" ]; then p=$(readlink -f -- "$p") || exit 1; fi
+if [ -d "$p" ]; then echo "$p is a directory" >&2; exit 1; fi
 mkdir -p -- "$(dirname -- "$p")" || exit 1
 t=$(umask 077 && mktemp "${TMPDIR:-/tmp}/taskpod.XXXXXX") || exit 1
 trap 'rm -f "$t"' EXIT

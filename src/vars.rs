@@ -9,6 +9,10 @@ use std::sync::{Arc, OnceLock};
 /// How deep variables may reference other variables before we assume a cycle.
 const MAX_DEPTH: usize = 32;
 
+/// The value of a lazy variable once it was worked out, shared by copies of
+/// the variable that would give the same value.
+pub type Cache = Arc<OnceLock<std::result::Result<String, String>>>;
+
 #[derive(Debug)]
 pub enum Var {
     /// Used as is, e.g. values loaded from an env file.
@@ -16,9 +20,34 @@ pub enum Var {
     /// Templated each time it is used.
     Template(String),
     /// Output of a shell command, run the first time the variable is used.
-    Shell(String, OnceLock<std::result::Result<String, String>>),
+    Shell(String, Cache),
     /// The answer to a question, asked the first time the variable is used.
-    Prompt(Prompt, OnceLock<std::result::Result<String, String>>),
+    Prompt(Prompt, Cache),
+}
+
+impl Var {
+    /// A copy for a new template call. Lazy values that use `{{ }}` may
+    /// depend on the call's arguments, so they get worked out again; the
+    /// others keep the value they have.
+    fn for_call(&self) -> Var {
+        let fresh = |cache: &Cache, templated: bool| {
+            if templated {
+                Cache::default()
+            } else {
+                Arc::clone(cache)
+            }
+        };
+        match self {
+            Var::Literal(value) => Var::Literal(value.clone()),
+            Var::Template(text) => Var::Template(text.clone()),
+            Var::Shell(command, cache) => {
+                Var::Shell(command.clone(), fresh(cache, command.contains("{{")))
+            }
+            Var::Prompt(prompt, cache) => {
+                Var::Prompt(prompt.clone(), fresh(cache, prompt.is_templated()))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +58,21 @@ pub enum Prompt {
     Choose(String, Vec<String>),
     /// Free text, with an optional default.
     Input(String, Option<String>),
+}
+
+impl Prompt {
+    fn is_templated(&self) -> bool {
+        let templated = |text: &String| text.contains("{{");
+        match self {
+            Prompt::Confirm(question) => templated(question),
+            Prompt::Choose(question, options) => {
+                templated(question) || options.iter().any(templated)
+            }
+            Prompt::Input(question, default) => {
+                templated(question) || default.iter().any(templated)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -49,6 +93,16 @@ impl Vars {
 
     pub fn contains(&self, name: &str) -> bool {
         self.0.contains_key(name)
+    }
+
+    /// A template's variables for one call of it, see [`Var::for_call`].
+    pub fn for_call(&self) -> Self {
+        Vars(
+            self.0
+                .iter()
+                .map(|(name, var)| (name.clone(), var.for_call()))
+                .collect(),
+        )
     }
 
     /// Variables for a template call: `args` is the whole argument string,
@@ -485,13 +539,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn template_calls_work_out_their_own_values() {
+        let ctx = ctx();
+        let mut template = Vars::default();
+        template.set("up", Var::Shell("echo {{ 1 }}".into(), Cache::default()));
+        template.set("fixed", Var::Shell("echo same".into(), Cache::default()));
+        let mut seen = Vec::new();
+        for arg in ["a", "b"] {
+            let args = Vars::for_args(arg);
+            let root = Scope::root(&args, &ctx);
+            let call = template.for_call();
+            seen.push(root.child(&call).expand("{{ up }} {{ fixed }}").unwrap());
+        }
+        assert_eq!(seen, ["a same", "b same"]);
+        // A value without `{{ }}` is worked out once, for every call.
+        let Some(Var::Shell(_, cache)) = template.get("fixed") else {
+            panic!()
+        };
+        assert!(cache.get().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn shell_vars_run_once() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = Ctx::new(dir.path().to_path_buf());
         let mut vars = Vars::default();
         vars.set(
             "n",
-            Var::Shell("echo x >> count; wc -l < count".into(), OnceLock::new()),
+            Var::Shell("echo x >> count; wc -l < count".into(), Cache::default()),
         );
         let scope = Scope::root(&vars, &ctx);
         assert_eq!(

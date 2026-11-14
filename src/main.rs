@@ -249,6 +249,14 @@ fn run(mut args: Args) -> Result<bool> {
         args.run = vec![task];
     }
 
+    // A misspelt --skip would otherwise run the very task meant to be skipped.
+    if let Some(unknown) = args.skip.iter().find(|n| !file.tasks.contains_key(*n)) {
+        let names: Vec<&str> = file.tasks.keys().map(String::as_str).collect();
+        anyhow::bail!(
+            "--skip: no task named '{unknown}' (tasks: {})",
+            names.join(", ")
+        );
+    }
     let opts = Options {
         mode,
         ignore_guards: args.ignore_conditions,

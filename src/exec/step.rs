@@ -276,7 +276,8 @@ impl<'r> TaskRun<'r> {
                 let label = format!("{} {args}", template.name).trim().to_string();
                 let arg_vars = Vars::for_args(&args);
                 let call_scope = scope.child(&arg_vars);
-                let inner = call_scope.child(&template.vars);
+                let template_vars = template.vars.for_call();
+                let inner = call_scope.child(&template_vars);
                 self.nested(&template.body, &inner, depth, &label)
             }
             Step::Block(inner) => {

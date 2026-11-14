@@ -448,16 +448,22 @@ fn remote_sudo_uses_the_password() {
         "#!/bin/sh\n[ \"$1\" = -A ] || exit 9\nshift\n[ \"$(\"$SUDO_ASKPASS\")\" = \"pa'ss \\$w\" ] || exit 8\n[ \"$1\" = -k ] && exit 0\nexec \"$@\"\n",
     );
     remote.set_sudo_password("pa'ss $w");
+    // Writes as root go through symlinks, like the other writes.
+    std::fs::write(home.join("real.conf"), "old\n").unwrap();
+    std::os::unix::fs::symlink(home.join("real.conf"), home.join("link.conf")).unwrap();
     let source = r#"
         task root {
             run sudo sh -c 'echo ok > rooted'
             file "~/etc/x.conf" sudo "x\n"
+            file "~/link.conf" sudo "linked\n"
         }
     "#;
     let outcomes = run_remote(source, dir.path(), &remote, &options(1));
     assert_eq!(outcomes["root"], Outcome::Ran, "{outcomes:?}");
     assert_eq!(read(&home, "rooted").trim(), "ok");
     assert_eq!(read(&home, "etc/x.conf"), "x\n");
+    assert!(home.join("link.conf").is_symlink());
+    assert_eq!(read(&home, "real.conf"), "linked\n");
     // The helper directory is cleaned up.
     let leftovers = std::fs::read_dir(std::env::var("XDG_RUNTIME_DIR").unwrap_or("/tmp".into()))
         .unwrap()
