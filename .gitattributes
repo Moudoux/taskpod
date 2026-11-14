@@ -1,0 +1,2 @@
+# GitHub has no taskpod grammar, shell is the closest. Keep it out of the language stats.
+*.task linguist-language=Shell linguist-detectable=false
