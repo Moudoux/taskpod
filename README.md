@@ -67,12 +67,6 @@ Prebuilt Linux and Windows (x86_64) binaries are attached to
 [GitHub releases](https://github.com/Moudoux/taskpod/releases), built by CI
 for every `v*` tag. Builds of other commits are under the CI run's artifacts.
 
-## My system
-
-`arch/` (gitignored) sets up my Arch install, the taskpod version of my
-arch-config scripts: `taskpod arch/main.task -D` to compare, `taskpod arch/main.task`
-to apply. Longer config files sit next to it in `arch/files/`.
-
 ## VS Code
 
 [editors/vscode](editors/vscode) has an extension with highlighting,

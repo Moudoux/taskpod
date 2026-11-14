@@ -4,9 +4,6 @@
 .env
 /test*
 
-# My system config, see README
-/arch/
-
 # makepkg output (see dist/arch/PKGBUILD)
 dist/arch/pkg/
 dist/arch/src/
