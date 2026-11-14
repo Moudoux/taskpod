@@ -75,6 +75,28 @@ pub struct FileStep {
     /// Copy the source's bytes unchanged (a `from` file with no encoding).
     pub raw: bool,
     pub sudo: bool,
+    /// Where the step is written, so `--pull` can rewrite it.
+    pub origin: FileOrigin,
+}
+
+/// Positions in the task file of a file step's parts.
+#[derive(Debug, Clone, Default)]
+pub struct FileOrigin {
+    pub file: std::path::PathBuf,
+    /// Right after the path string, where a `mode` can be added.
+    pub after_path: usize,
+    /// The mode's value, if given.
+    pub mode: Option<Span>,
+    /// The inline content's string literal, quotes included.
+    pub content: Option<Span>,
+}
+
+/// A piece of source text and where it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
 }
 
 /// How a file's text is written. Copied files (`from`) are written byte for

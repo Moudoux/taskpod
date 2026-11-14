@@ -1,12 +1,13 @@
 //! Running the steps of one task.
 
-use super::{Mode, Outcome, Runner, sudo};
+use super::target::{self, Current, describe};
+use super::{Mode, Outcome, Runner, pull, sudo};
 use crate::ast::{Block, Encoding, FileSource, FileStep, Guard, Step, Task};
 use crate::ui::{self, TaskLine, ui};
 use crate::vars::{Scope, Vars, expand_tilde};
 use anyhow::{Context, Result, anyhow, bail};
 use console::style;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::MutexGuard;
@@ -77,8 +78,9 @@ impl<'r> TaskRun<'r> {
         self.runner.opts.mode
     }
 
+    /// Only looking: a check or a pull, nothing runs.
     fn checking(&self) -> bool {
-        self.mode() != Mode::Run
+        self.runner.opts.checking()
     }
 
     pub fn run(&mut self) -> Result<Outcome> {
@@ -185,7 +187,7 @@ impl<'r> TaskRun<'r> {
                 _locks.push(self.lock(name));
             }
             if block.sudo {
-                sudo::ensure(&self.task.name)?;
+                sudo::ensure(&self.task.name, &self.runner.file.ctx)?;
             }
         }
         let runner = self.runner;
@@ -246,6 +248,10 @@ impl<'r> TaskRun<'r> {
     }
 
     fn run_step(&mut self, script: &str, depth: usize) -> Result<()> {
+        // Commands can't be pulled back.
+        if self.runner.opts.pull {
+            return Ok(());
+        }
         self.changed = true;
         if self.checking() {
             for line in script.lines() {
@@ -277,12 +283,12 @@ impl<'r> TaskRun<'r> {
     }
 
     fn exec(&mut self, script: &str) -> Result<()> {
-        if sudo::mentions_sudo(script) {
-            sudo::ensure(&self.task.name)?;
-        }
         let ctx = &self.runner.file.ctx;
-        let mut command = ctx.command(script, &self.cwd);
+        if sudo::mentions_sudo(script) {
+            sudo::ensure(&self.task.name, ctx)?;
+        }
         let status = if self.task.interactive {
+            let mut command = ctx.interactive_command(script, &self.cwd)?;
             let name = &self.task.name;
             ui().suspend(|| {
                 eprintln!(
@@ -294,9 +300,9 @@ impl<'r> TaskRun<'r> {
                 command.status()
             })
         } else {
-            self.piped(&mut command)
+            self.piped(ctx.command(script, &self.cwd))
         }
-        .with_context(|| format!("failed to start shell {:?}", ctx.shell[0]))?;
+        .with_context(|| format!("failed to start {:?}", ctx.program()))?;
         if !status.success() {
             bail!("`{}` exited with {}", first_line(script), describe(status));
         }
@@ -304,12 +310,9 @@ impl<'r> TaskRun<'r> {
     }
 
     /// Run with output going to the task's line.
-    fn piped(&self, command: &mut std::process::Command) -> std::io::Result<ExitStatus> {
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn()?;
+    fn piped(&self, mut spawn: crate::vars::Spawn) -> std::io::Result<ExitStatus> {
+        spawn.command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = spawn.spawn()?;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let line = self.line.as_ref();
@@ -325,7 +328,8 @@ impl<'r> TaskRun<'r> {
     }
 
     fn file(&mut self, file: &FileStep, scope: &Scope, depth: usize) -> Result<()> {
-        let path = PathBuf::from(expand_tilde(&scope.expand(&file.path)?));
+        let ctx = &self.runner.file.ctx;
+        let path = PathBuf::from(ctx.target_path(&scope.expand(&file.path)?));
         let path = if path.is_absolute() {
             path
         } else {
@@ -340,24 +344,31 @@ impl<'r> TaskRun<'r> {
             0o644
         });
         let owner = file.owner.as_deref().map(|o| scope.expand(o)).transpose()?;
+        if self.runner.opts.pull {
+            return self.pull_file(file, scope, depth, &path, &content, mode, owner.as_deref());
+        }
 
-        let existing = std::fs::read(&path).ok();
+        let existing = match target::read(ctx, &self.task.name, &path, false)? {
+            Current::Content(bytes) => Some(bytes),
+            Current::Missing | Current::Unreadable => None,
+        };
         let mut differences = Vec::new();
+        let stat = target::stat(ctx, &path);
         if existing.as_deref() != Some(&content) {
             differences.push(match &existing {
-                None if path.exists() => "can't read the current file".to_string(),
+                None if stat.is_some() => "can't read the current file".to_string(),
                 None => "new file".to_string(),
                 Some(_) => "content".to_string(),
             });
         }
-        if let Some(current) = file_mode(&path)
-            && current != mode
+        if let Some((current, _)) = &stat
+            && *current != mode
         {
             differences.push(format!("mode {current:o} → {mode:o}"));
         }
         if let Some(wanted) = &owner
-            && let Some(current) = file_owner(&path)
-            && !owner_matches(&current, wanted)
+            && let Some((_, current)) = &stat
+            && !owner_matches(current, wanted)
         {
             differences.push(format!("owner {current} → {wanted}"));
         }
@@ -378,13 +389,145 @@ impl<'r> TaskRun<'r> {
                 }
                 Ok(())
             }
-            Mode::Run if file.sudo || owner.is_some() => {
-                write_with_sudo(&self.task.name, &path, &content, mode, owner.as_deref())
-                    .with_context(|| format!("failed to write {shown}"))
-            }
-            Mode::Run => write_file(&path, &content, mode)
-                .with_context(|| format!("failed to write {shown}")),
+            Mode::Run => target::write(
+                ctx,
+                &self.task.name,
+                &path,
+                &content,
+                mode,
+                owner.as_deref(),
+                file.sudo,
+            )
+            .with_context(|| format!("failed to write {shown}")),
         }
+    }
+
+    /// `--pull` for one file step: what would change in the task files, and
+    /// with `Mode::Run`, queue the changes after asking.
+    #[allow(clippy::too_many_arguments)]
+    fn pull_file(
+        &mut self,
+        file: &FileStep,
+        scope: &Scope,
+        depth: usize,
+        path: &Path,
+        content: &[u8],
+        mode: u32,
+        owner: Option<&str>,
+    ) -> Result<()> {
+        let ctx = &self.runner.file.ctx;
+        let label = format!("file {}", path.display());
+        let write = self.mode() == Mode::Run;
+        let as_root = write && (file.sudo || owner.is_some());
+        let system = match target::read(ctx, &self.task.name, path, as_root)? {
+            Current::Content(bytes) => bytes,
+            Current::Missing => {
+                self.push(
+                    depth,
+                    ui::ok(&format!("{label} · not on the system, nothing to pull")),
+                );
+                return Ok(());
+            }
+            Current::Unreadable => {
+                let hint = if file.sudo || owner.is_some() {
+                    ""
+                } else {
+                    ", add `sudo` to the step to read it as root"
+                };
+                self.push(depth, ui::change(&format!("{label} · can't read it{hint}")));
+                return Ok(());
+            }
+        };
+        let mut edits = Vec::new();
+        let mut parts = Vec::new();
+        let mut details = Vec::new();
+        let mut notes = Vec::new();
+        if system != content {
+            match pull_content(file, scope, &ctx.dir, &system) {
+                Ok(pulled) => {
+                    if let Some(edit) = pulled.edit {
+                        edits.push(edit);
+                        parts.push("content".to_string());
+                    }
+                    details.extend(pulled.diff);
+                    notes.extend(pulled.refused);
+                }
+                Err(e) => notes.push(
+                    style(format!("content not pulled: {e:#}"))
+                        .yellow()
+                        .to_string(),
+                ),
+            }
+        }
+        if let Some((current, current_owner)) = target::stat(ctx, path) {
+            if current != mode {
+                edits.push(mode_edit(file, current));
+                parts.push(format!("mode {mode:o} → {current:o}"));
+            }
+            if let Some(wanted) = owner
+                && !owner_matches(&current_owner, wanted)
+            {
+                notes.push(
+                    style(format!(
+                        "owner is {current_owner}, not {wanted}; owners aren't pulled"
+                    ))
+                    .yellow()
+                    .to_string(),
+                );
+            }
+        }
+        if edits.is_empty() {
+            if notes.is_empty() {
+                self.current(depth, &label);
+            } else {
+                self.changed = true;
+                self.push(depth, ui::change(&label));
+                for note in notes {
+                    self.push(depth + 1, note);
+                }
+            }
+            return Ok(());
+        }
+        let label = format!("{label} · {}", parts.join(", "));
+        self.change(depth, &label);
+        let shown: Vec<String> = match self.mode() {
+            Mode::DryRun => notes,
+            Mode::Diff | Mode::Run => details.into_iter().chain(notes).collect(),
+        };
+        if !write {
+            for line in shown {
+                self.push(depth + 1, line);
+            }
+            return Ok(());
+        }
+        let accept = self.runner.opts.yes || {
+            // Show what would change before asking; the task's report comes later.
+            let ui = ui();
+            ui.line(format!(
+                "{} {}",
+                style(&self.task.name).bold(),
+                ui::change(&label)
+            ));
+            for line in &shown {
+                ui.line(format!("    {line}"));
+            }
+            ui.confirm("Pull this into the task files?")?
+        };
+        if accept {
+            self.runner
+                .edits
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(edits);
+            if self.runner.opts.yes {
+                for line in shown {
+                    self.push(depth + 1, line);
+                }
+            }
+        } else {
+            self.push(depth + 1, style("not pulled").dim().to_string());
+        }
+        Ok(())
     }
 }
 
@@ -397,17 +540,106 @@ fn first_line(script: &str) -> String {
     }
 }
 
+struct Pulled {
+    edit: Option<pull::Edit>,
+    diff: Vec<String>,
+    refused: Vec<String>,
+}
+
+/// The change to a file step's content that makes it match `system`.
+fn pull_content(file: &FileStep, scope: &Scope, dir: &Path, system: &[u8]) -> Result<Pulled> {
+    let decode = |bytes: &[u8]| {
+        file.encoding
+            .decode(bytes)
+            .ok_or_else(|| anyhow!("the system's file isn't valid {:?}", file.encoding))
+    };
+    match &file.source {
+        FileSource::Copy(source) => {
+            let source = copy_source(source, scope, dir)?;
+            let bytes = if file.raw {
+                system.to_vec()
+            } else {
+                decode(system)?.into_bytes()
+            };
+            if std::str::from_utf8(&bytes).is_ok_and(pull::has_secret) {
+                bail!("the system's file holds a secret value");
+            }
+            let old = std::fs::read(&source).unwrap_or_default();
+            Ok(Pulled {
+                diff: diff_lines(&old, &bytes, Encoding::Utf8),
+                edit: Some(pull::Edit::Copy {
+                    file: source,
+                    bytes,
+                }),
+                refused: Vec::new(),
+            })
+        }
+        FileSource::Inline(template) => {
+            let mapped = pull::map_back(template, scope, &decode(system)?)?;
+            if mapped.text == *template {
+                return Ok(Pulled {
+                    edit: None,
+                    diff: Vec::new(),
+                    refused: mapped.refused,
+                });
+            }
+            let span = file
+                .origin
+                .content
+                .as_ref()
+                .ok_or_else(|| anyhow!("the content's place in the task file is unknown"))?;
+            Ok(Pulled {
+                diff: diff_lines(template.as_bytes(), mapped.text.as_bytes(), Encoding::Utf8),
+                edit: Some(pull::Edit::Source {
+                    file: file.origin.file.clone(),
+                    start: span.start,
+                    end: span.end,
+                    original: span.text.clone(),
+                    text: pull::literal(&span.text, &mapped.text),
+                }),
+                refused: mapped.refused,
+            })
+        }
+    }
+}
+
+/// Set the step's mode to `mode`, adding `mode` if it isn't given.
+fn mode_edit(file: &FileStep, mode: u32) -> pull::Edit {
+    let origin = &file.origin;
+    match &origin.mode {
+        Some(span) => pull::Edit::Source {
+            file: origin.file.clone(),
+            start: span.start,
+            end: span.end,
+            original: span.text.clone(),
+            text: format!("{mode:o}"),
+        },
+        None => pull::Edit::Source {
+            file: origin.file.clone(),
+            start: origin.after_path,
+            end: origin.after_path,
+            original: String::new(),
+            text: format!(" mode {mode:o}"),
+        },
+    }
+}
+
+/// Where a `from` file is.
+fn copy_source(source: &str, scope: &Scope, dir: &Path) -> Result<PathBuf> {
+    let source = PathBuf::from(expand_tilde(&scope.expand(source)?));
+    Ok(if source.is_absolute() {
+        source
+    } else {
+        dir.join(source)
+    })
+}
+
 /// The bytes a file step writes.
 fn file_content(file: &FileStep, scope: &Scope, dir: &Path) -> Result<Vec<u8>> {
     match &file.source {
         FileSource::Inline(text) => file.encoding.encode(&scope.expand(text)?),
         FileSource::Copy(source) => {
-            let source = PathBuf::from(expand_tilde(&scope.expand(source)?));
-            let source = if source.is_absolute() {
-                source
-            } else {
-                dir.join(source)
-            };
+            let source = copy_source(source, scope, dir)?;
             let bytes = std::fs::read(&source)
                 .with_context(|| format!("failed to read {}", source.display()))?;
             if file.raw {
@@ -479,43 +711,6 @@ fn diff_lines(old: &[u8], new: &[u8], encoding: Encoding) -> Vec<String> {
     lines
 }
 
-fn describe(status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("status {code}"),
-        None => status.to_string(),
-    }
-}
-
-#[cfg(unix)]
-fn file_mode(path: &Path) -> Option<u32> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .ok()
-        .map(|m| m.permissions().mode() & 0o7777)
-}
-
-#[cfg(not(unix))]
-fn file_mode(_: &Path) -> Option<u32> {
-    None
-}
-
-/// `user:group` of a file.
-fn file_owner(path: &Path) -> Option<String> {
-    if !path.exists() {
-        return None;
-    }
-    let output = std::process::Command::new("stat")
-        .args(["-c", "%U:%G"])
-        .arg(path)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 /// Whether `current` (`user:group`) satisfies `wanted` (`user` or `user:group`).
 fn owner_matches(current: &str, wanted: &str) -> bool {
     if wanted.contains(':') {
@@ -523,82 +718,6 @@ fn owner_matches(current: &str, wanted: &str) -> bool {
     } else {
         current.split(':').next() == Some(wanted)
     }
-}
-
-fn write_file(path: &Path, content: &[u8], mode: u32) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        // Set the mode before writing, so content like secrets is never
-        // readable with looser permissions, even for a moment.
-        let permissions = || std::fs::Permissions::from_mode(mode);
-        if path.exists() {
-            std::fs::set_permissions(path, permissions())?;
-        }
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
-            .open(path)?
-            .write_all(content)?;
-        // The umask may have removed bits from a new file.
-        std::fs::set_permissions(path, permissions())?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = mode;
-        std::fs::write(path, content)?;
-    }
-    Ok(())
-}
-
-/// Write a file as root with `sudo install`, which also creates parent
-/// directories and sets the owner.
-fn write_with_sudo(
-    task: &str,
-    path: &Path,
-    content: &[u8],
-    mode: u32,
-    owner: Option<&str>,
-) -> Result<()> {
-    sudo::ensure(task)?;
-    let mut command = std::process::Command::new("sudo");
-    command.args(["install", "-D", "-m", &format!("{mode:o}")]);
-    if let Some(owner) = owner {
-        let (user, group) = owner.split_once(':').unwrap_or((owner, ""));
-        command.args(["-o", user]);
-        if !group.is_empty() {
-            command.args(["-g", group]);
-        }
-    }
-    let mut child = command
-        .arg("/dev/stdin")
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to run sudo")?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("no stdin for sudo"))?
-        .write_all(content)?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "sudo install exited with {}: {}",
-            describe(output.status),
-            stderr.trim()
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]

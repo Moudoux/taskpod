@@ -33,6 +33,8 @@ for a small real example.
 taskpod [FILE]             # run every task that isn't manual (FILE defaults to main.task)
 taskpod FILE -D            # diff: compare with the system, show only what would change
 taskpod FILE -d            # dry run: every task and step, and what would change
+taskpod FILE --pull        # bring changes made on the system back into the task files
+taskpod FILE -H pi@rpi     # configure another machine over SSH
 taskpod FILE -r a b        # run tasks a and b, and what they need
 taskpod FILE -i a          # what task a would do
 taskpod FILE -l            # list tasks
@@ -53,6 +55,48 @@ an overall progress bar; a failed task prints its last output. Questions
 `sudo` make taskpod authenticate once, through sudo itself so security keys
 work, and keep the credentials fresh, so parallel tasks never prompt at the
 same time. Tasks marked `interactive` run alone with the terminal.
+
+## Pulling changes back
+
+Changed a config on the system and want to keep it? `--pull` goes the other
+way: it compares every file step with the system (running `if` and `unless`
+checks like a diff, but no commands) and brings the system's version back
+into your task files, asking about each file. `--pull -D` shows the diffs
+without writing anything, `--pull -d` lists every file, and `--pull --yes`
+takes everything without asking.
+
+- A `from "path"` file gets the system's copy (decoded to UTF-8 when it has
+  an `encoding`).
+- Inline content is rewritten in the task file. If it uses `{{ variables }}`,
+  changed plain lines are pulled and changed lines with a variable are shown
+  for you to edit by hand, so values never end up in your task files. Lines
+  holding a secret value are never pulled, wherever they are.
+- A different mode updates (or adds) the step's `mode`. Owners aren't pulled,
+  and files missing on the system are left alone.
+
+A template's content is shared by every call, so a pulled change applies to
+all of them; two calls wanting different content is reported as a conflict.
+
+## Remote machines
+
+`taskpod main.task --host pi@raspberrypi` (or a `Host` from `~/.ssh/config`)
+configures another machine over SSH. Taskpod doesn't need to be installed
+there, only `sh` and the usual coreutils. The task file, variables, prompts
+and secrets are handled locally, and everything that touches the system runs
+remotely: `run` commands, `if`/`unless` checks, `$( )` variables, and file
+reads and writes. `~`, `{{ home }}` and `{{ user }}` are the remote ones, and
+commands run in the remote home unless a task sets `workdir`. Diffs, dry runs
+and `--pull` work the same way.
+
+SSH connects once (asking for a password or a key touch if it needs to), and
+every command reuses that connection. Commands are sent over stdin, so they
+and the secrets in them don't show up in `ps` of the ssh process, though the
+remote shell has them in its command line, like locally. If sudo on the
+remote machine needs a password, taskpod asks for it once and keeps it in
+memory; each command that runs then gets a `sudo` that's given the password
+through an askpass helper in a private temporary directory, removed when the
+command ends. Scripts that call `/usr/bin/sudo` by its full path bypass that.
+`--host` needs a Unix system to run on.
 
 ## Secrets
 

@@ -262,6 +262,20 @@ impl Ui {
         })
         .map_err(prompt_error)
     }
+
+    /// Ask for a password, without echoing it.
+    pub fn password(&self, question: &str) -> Result<String> {
+        if !self.interactive {
+            bail!("{question:?} needs an answer, but there's no terminal");
+        }
+        self.suspend(|| {
+            inquire::Password::new(question)
+                .without_confirmation()
+                .with_display_mode(inquire::PasswordDisplayMode::Hidden)
+                .prompt()
+        })
+        .map_err(prompt_error)
+    }
 }
 
 fn prompt_error(error: inquire::InquireError) -> anyhow::Error {
@@ -351,6 +365,16 @@ pub fn would_change(name: &str, detail: &str) -> String {
     format!(
         "{} {} {}",
         style("~").yellow().bold(),
+        style(name).bold(),
+        style(detail).dim()
+    )
+}
+
+/// A task whose files differ from the system, in `--pull`.
+pub fn differs(name: &str, detail: &str) -> String {
+    format!(
+        "{} {} {}",
+        style("⇠").yellow().bold(),
         style(name).bold(),
         style(detail).dim()
     )

@@ -21,7 +21,10 @@ static STATE: Mutex<State> = Mutex::new(State::Unknown);
 /// Make sure sudo has cached credentials. The first time, the live display
 /// pauses and sudo itself asks (password, security key or fingerprint), so
 /// taskpod never sees the password.
-pub fn ensure(task: &str) -> Result<()> {
+pub fn ensure(task: &str, ctx: &crate::vars::Ctx) -> Result<()> {
+    if let Some(remote) = &ctx.remote {
+        return remote.ensure_sudo(task);
+    }
     if cfg!(not(unix)) {
         return Ok(());
     }

@@ -1,12 +1,14 @@
 //! Running tasks: selection, parallel scheduling, dry runs and diffs.
 
+pub mod pull;
 mod step;
 pub mod sudo;
+mod target;
 
 use crate::ast::{Guard, Task, TaskFile};
 use crate::parser::guard_passes;
 use crate::ui::{self, ui};
-use crate::vars::{Scope, expand_tilde};
+use crate::vars::Scope;
 use anyhow::{Result, bail};
 use console::style;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -32,11 +34,17 @@ pub struct Options {
     pub jobs: usize,
     /// Tasks to treat as skipped.
     pub skip: HashSet<String>,
+    /// Bring system changes back into the task files instead; `mode` says
+    /// whether to write them (`Run`) or only show them.
+    pub pull: bool,
+    /// Pull without asking about each file.
+    pub yes: bool,
 }
 
 impl Options {
+    /// Whether tasks are only looked at, one at a time: checks and pulls.
     pub fn checking(&self) -> bool {
-        self.mode != Mode::Run
+        self.mode != Mode::Run || self.pull
     }
 }
 
@@ -175,6 +183,8 @@ pub struct Runner<'a> {
     /// Normal tasks hold this shared, interactive tasks exclusively.
     pub exclusive: RwLock<()>,
     pub locks: HashMap<String, Mutex<()>>,
+    /// Changes `--pull` will make to the task files.
+    pub edits: Mutex<Vec<pull::Edit>>,
 }
 
 impl<'a> Runner<'a> {
@@ -190,6 +200,7 @@ impl<'a> Runner<'a> {
                 .into_iter()
                 .map(|n| (n, Mutex::new(())))
                 .collect(),
+            edits: Mutex::default(),
         }
     }
 
@@ -199,13 +210,14 @@ impl<'a> Runner<'a> {
 
     /// The directory a task runs in.
     pub fn workdir(&self, task: &Task) -> Result<PathBuf> {
-        let base = &self.file.ctx.dir;
+        let ctx = &self.file.ctx;
+        let base = ctx.default_cwd(&ctx.dir);
         let Some(workdir) = &task.workdir else {
-            return Ok(base.clone());
+            return Ok(base);
         };
         let root = self.root_scope();
         let scope = root.child(&task.vars);
-        let dir = PathBuf::from(expand_tilde(&scope.expand(workdir)?));
+        let dir = PathBuf::from(ctx.target_path(&scope.expand(workdir)?));
         Ok(if dir.is_absolute() {
             dir
         } else {
@@ -258,6 +270,7 @@ impl<'a> Runner<'a> {
         let (sender, receiver) = mpsc::channel::<(usize, Outcome)>();
 
         let what = match self.opts.mode {
+            _ if self.opts.pull => "pulled",
             Mode::Run => "tasks",
             Mode::DryRun | Mode::Diff => "checked",
         };
@@ -276,6 +289,7 @@ impl<'a> Runner<'a> {
                     {
                         Some(Outcome::Blocked(dep.to_string()))
                     } else if let Some(parent) = &task.parent
+                        && !self.opts.pull
                         && outcomes[index[parent.as_str()]] != Some(Outcome::Ran)
                     {
                         Some(Outcome::Skipped(format!("{parent} had nothing to do")))
@@ -368,6 +382,7 @@ impl<'a> Runner<'a> {
         let name = task.name.as_str();
         let diff = self.opts.mode == Mode::Diff;
         let line = match outcome {
+            Outcome::Ran if self.opts.pull => Some(ui::differs(name, detail)),
             Outcome::Ran if self.opts.checking() => Some(ui::would_change(name, detail)),
             Outcome::Ran => Some(ui::done(name, detail)),
             Outcome::UpToDate if !diff || ui.verbose => Some(ui::up_to_date(name)),
@@ -405,6 +420,18 @@ pub fn summarize(
     let elapsed = style(format!("in {:.1?}", start.elapsed())).dim();
     let ui = ui();
     ui.line("");
+    if opts.pull && ran == 0 && failed.is_empty() {
+        ui.line(format!(
+            "{} {} {elapsed}",
+            style("✓").green().bold(),
+            style(format!(
+                "Nothing to pull, {} matches the system",
+                file.display()
+            ))
+            .bold()
+        ));
+        return true;
+    }
     if opts.checking() && ran == 0 && failed.is_empty() {
         ui.line(format!(
             "{} {} {elapsed}",
@@ -417,13 +444,15 @@ pub fn summarize(
         ));
         return true;
     }
-    let verb = if opts.checking() {
+    let verb = if opts.pull {
+        "differ"
+    } else if opts.checking() {
         "would change"
     } else {
         "ran"
     };
     let mut parts = vec![format!("{ran} {verb}")];
-    if opts.mode == Mode::Diff {
+    if opts.mode == Mode::Diff || opts.pull {
         let changed: Vec<&str> = outcomes
             .iter()
             .filter(|(_, o)| *o == Outcome::Ran)

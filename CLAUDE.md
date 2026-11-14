@@ -19,6 +19,14 @@ idempotent. Its main use is setting up an Arch system from
 - `src/exec/mod.rs`: task selection, the parallel scheduler (job slots, named locks,
   an RwLock so `interactive` tasks run alone), summaries. Modes: run, dry run (`-d`), diff (`-D`).
 - `src/exec/step.rs`: running steps: shell, files (content/mode/owner, diffs), template calls and inline blocks.
+  With `--pull` (`Options::pull`, combined with the Run/DryRun/Diff mode) file steps are compared the
+  other way and queue edits on `Runner::edits`, which `main` applies at the end.
+- `src/exec/pull.rs`: mapping system content back onto templates (plain lines only, never secrets),
+  writing string literals, and applying edits by the source spans the parser records (`FileOrigin`).
+- `src/exec/target.rs`: reading, stat-ing and writing files on the machine being configured, local or remote.
+- `src/remote.rs`: `--host`: one ssh master connection per run, every command a POSIX script sent over
+  stdin to a fixed bootstrap. Remote sudo passwords go through an askpass helper. `Ctx::remote` is set
+  before parsing, since `include ... if` checks run on the target.
 - `src/exec/sudo.rs`: authenticates once through `sudo -v` and keeps credentials fresh.
 - `src/ui.rs`: indicatif live display and inquire prompts; plain prefixed lines without a terminal.
 - `editors/vscode/`: VS Code extension (TypeScript, built with bun). `src/index.ts` is its own
@@ -41,7 +49,9 @@ Linux and Windows binaries; `v*` tags create a GitHub release.
 ## Rules
 
 - Tests must never call sudo. To test anything that might, put a fake `sudo` that fails
-  first on `PATH`. Dry runs and diffs only run `if`/`unless` checks, so keep checks read-only.
+  first on `PATH`. Remote tests use a fake `ssh` that runs commands locally (`fake_remote` in
+  `src/exec/tests.rs`). Write fake executables with `test_util::write_script`, which avoids
+  "text file busy" races with parallel tests. Dry runs and diffs only run `if`/`unless` checks, so keep checks read-only.
 - `.gitignore` patterns are anchored to the root (`/test*`), so source files aren't ignored by accident.
 - Pushing straight to master is fine. Commits use the GitHub noreply address set in this
   repo's git config. Commits are signed with a YubiKey, which needs a touch, so a commit

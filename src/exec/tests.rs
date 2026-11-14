@@ -7,6 +7,8 @@ fn options(jobs: usize) -> Options {
         ignore_guards: false,
         jobs,
         skip: HashSet::new(),
+        pull: false,
+        yes: false,
     }
 }
 
@@ -281,12 +283,10 @@ fn diff_mode_and_encodings() {
 #[cfg(unix)]
 #[test]
 fn secrets_fill_files_and_commands() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     // A fake sops that prints the "encrypted" file as is.
     let fake = dir.path().join("fake-sops");
-    std::fs::write(&fake, "#!/bin/sh\ncat \"$4\"\n").unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_util::write_script(&fake, "#!/bin/sh\ncat \"$4\"\n");
     std::fs::write(
         dir.path().join("secrets.json"),
         r#"{"wifi": {"password": "hunter2-wifi"}, "token": "tok-123456"}"#,
@@ -329,4 +329,264 @@ fn secrets_fill_files_and_commands() {
         "{:?}",
         outcomes["missing"]
     );
+}
+
+/// A fake `ssh` that runs commands here, in `home`, with `bin` first on PATH.
+#[cfg(unix)]
+fn fake_remote(dir: &Path) -> (std::sync::Arc<crate::remote::Remote>, PathBuf) {
+    let home = dir.join("home");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let ssh = dir.join("ssh");
+    let script = format!(
+        r#"#!/bin/sh
+master=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift 2 ;;
+    -O) exit 0 ;;
+    -M) master=1; shift ;;
+    -t|-T) shift ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+shift
+[ $master = 1 ] && exec cat > /dev/null
+cd '{home}' && HOME='{home}' PATH='{bin}':$PATH exec sh -c "$*"
+"#,
+        home = home.display(),
+        bin = bin.display()
+    );
+    crate::test_util::write_script(&ssh, &script);
+    let remote = crate::remote::Remote::connect_with("box", ssh.to_str().unwrap()).unwrap();
+    (std::sync::Arc::new(remote), home)
+}
+
+#[cfg(unix)]
+fn run_remote(
+    source: &str,
+    dir: &Path,
+    remote: &std::sync::Arc<crate::remote::Remote>,
+    opts: &Options,
+) -> HashMap<String, Outcome> {
+    let mut file = parse_str(source, dir).unwrap_or_else(|e| panic!("{e:#}"));
+    file.ctx.remote = Some(remote.clone());
+    let order = select(&file, &[]).unwrap();
+    Runner::new(&file, opts).run(&order).into_iter().collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn runs_over_ssh() {
+    let dir = tempfile::tempdir().unwrap();
+    let (remote, home) = fake_remote(dir.path());
+    let source = r#"
+        let who = $(echo "$HOME")
+        task remote {
+            if test -d "{{ home }}"
+            run pwd > here
+            file "~/conf/a.txt" mode 600 "home={{ home }} who={{ who }} it's\n"
+            unless test -e nothing {
+                run echo block > block
+            }
+        }
+        task elsewhere {
+            workdir "sub"
+            run mkdir -p ~/sub
+            run pwd > here
+        }
+    "#;
+    std::fs::create_dir_all(home.join("sub")).unwrap();
+    let outcomes = run_remote(source, dir.path(), &remote, &options(2));
+    assert_eq!(outcomes["remote"], Outcome::Ran, "{outcomes:?}");
+    assert_eq!(outcomes["elsewhere"], Outcome::Ran, "{outcomes:?}");
+    let home_text = home.display().to_string();
+    assert_eq!(read(&home, "here").trim(), home_text);
+    assert_eq!(read(&home, "sub/here").trim(), format!("{home_text}/sub"));
+    assert_eq!(read(&home, "block").trim(), "block");
+    assert_eq!(
+        read(&home, "conf/a.txt"),
+        format!("home={home_text} who={home_text} it's\n")
+    );
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(home.join("conf/a.txt"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    // Nothing was written next to the task file.
+    assert!(!dir.path().join("here").exists());
+
+    // A second run finds the file up to date.
+    let source = "task again {\n file \"~/conf/a.txt\" mode 600 \"x\"\n}\ntask same {\n file \"~/conf/b.txt\" \"b\"\n}\n";
+    std::fs::write(home.join("conf/b.txt"), "b").unwrap();
+    std::fs::set_permissions(
+        home.join("conf/b.txt"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let mut opts = options(1);
+    opts.mode = Mode::DryRun;
+    let outcomes = run_remote(source, dir.path(), &remote, &opts);
+    assert_eq!(outcomes["again"], Outcome::Ran);
+    assert_eq!(outcomes["same"], Outcome::UpToDate);
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_sudo_uses_the_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let (remote, home) = fake_remote(dir.path());
+    // A fake sudo that only works through askpass with the right password.
+    let sudo = dir.path().join("bin/sudo");
+    crate::test_util::write_script(
+        &sudo,
+        "#!/bin/sh\n[ \"$1\" = -A ] || exit 9\nshift\n[ \"$(\"$SUDO_ASKPASS\")\" = \"pa'ss \\$w\" ] || exit 8\n[ \"$1\" = -k ] && exit 0\nexec \"$@\"\n",
+    );
+    remote.set_sudo_password("pa'ss $w");
+    let source = r#"
+        task root {
+            run sudo sh -c 'echo ok > rooted'
+            file "~/etc/x.conf" sudo "x\n"
+        }
+    "#;
+    let outcomes = run_remote(source, dir.path(), &remote, &options(1));
+    assert_eq!(outcomes["root"], Outcome::Ran, "{outcomes:?}");
+    assert_eq!(read(&home, "rooted").trim(), "ok");
+    assert_eq!(read(&home, "etc/x.conf"), "x\n");
+    // The helper directory is cleaned up.
+    let leftovers = std::fs::read_dir(std::env::var("XDG_RUNTIME_DIR").unwrap_or("/tmp".into()))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.starts_with("taskpod.") && e.path().join("password").exists()
+        })
+        .count();
+    assert_eq!(leftovers, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn pulls_system_changes_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display().to_string();
+    let main = dir.path().join("main.task");
+    let source = format!(
+        r#"let name = "pod"
+task files {{
+    file "{d}/out/copy.conf" from "files/copy.conf"
+    file "{d}/out/inline.conf" mode 600 """
+        # managed
+        name={{{{ name }}}}
+        keep
+        """
+    file "{d}/out/plain" "same"
+}}
+subtask after of files {{
+    run touch {d}/ran
+    file "{d}/out/sub" "sub\n"
+}}
+"#
+    );
+    std::fs::write(&main, &source).unwrap();
+    std::fs::create_dir_all(dir.path().join("files")).unwrap();
+    std::fs::write(dir.path().join("files/copy.conf"), "old copy\n").unwrap();
+    // Write everything, then change it on the "system".
+    let file = crate::parser::parse_file(&main).unwrap();
+    let order = select(&file, &[]).unwrap();
+    let outcomes: HashMap<_, _> = Runner::new(&file, &options(1))
+        .run(&order)
+        .into_iter()
+        .collect();
+    assert_eq!(outcomes["files"], Outcome::Ran);
+    let out = dir.path().join("out");
+    std::fs::write(out.join("copy.conf"), "new copy\n").unwrap();
+    std::fs::write(
+        out.join("inline.conf"),
+        "# managed!\nname=changed\nkeep\nadded {{ x }}\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(out.join("plain"), std::fs::Permissions::from_mode(0o640)).unwrap();
+    std::fs::write(out.join("sub"), "sub2\n").unwrap();
+    std::fs::remove_file(dir.path().join("ran")).unwrap();
+
+    let pull = |mode: Mode| {
+        let file = crate::parser::parse_file(&main).unwrap();
+        let order = select(&file, &[]).unwrap();
+        let mut opts = options(4);
+        opts.mode = mode;
+        opts.pull = true;
+        opts.yes = true;
+        let runner = Runner::new(&file, &opts);
+        let outcomes: HashMap<_, _> = runner.run(&order).into_iter().collect();
+        let edits = std::mem::take(&mut *runner.edits.lock().unwrap());
+        (outcomes, edits)
+    };
+    // Previews change nothing.
+    for mode in [Mode::DryRun, Mode::Diff] {
+        let (outcomes, edits) = pull(mode);
+        assert_eq!(outcomes["files"], Outcome::Ran);
+        assert!(edits.is_empty());
+    }
+    assert_eq!(std::fs::read_to_string(&main).unwrap(), source);
+
+    let (outcomes, edits) = pull(Mode::Run);
+    assert_eq!(outcomes["files"], Outcome::Ran);
+    assert_eq!(outcomes["after"], Outcome::Ran, "subtasks are pulled too");
+    assert!(!dir.path().join("ran").exists(), "commands don't run");
+    let applied = super::pull::apply(&edits);
+    assert!(applied.problems.is_empty(), "{:?}", applied.problems);
+    assert_eq!(read(dir.path(), "files/copy.conf"), "new copy\n");
+    let pulled = std::fs::read_to_string(&main).unwrap();
+    // The templated line was kept, the plain ones pulled, `{{` escaped.
+    assert!(
+        pulled.contains("        # managed!\n        name={{ name }}\n        keep\n        added \\{{ x }}\n        \"\"\""),
+        "{pulled}"
+    );
+    assert!(
+        pulled.contains(r#"file "{d}/out/plain" mode 640 "same""#.replace("{d}", &d).as_str()),
+        "{pulled}"
+    );
+    assert!(pulled.contains(r#""sub2\n""#), "{pulled}");
+    // The pulled file parses and renders what the system has, apart from the refused line.
+    let file = crate::parser::parse_file(&main).unwrap();
+    let (outcomes, _) = {
+        let order = select(&file, &[]).unwrap();
+        let mut opts = options(1);
+        opts.mode = Mode::Diff;
+        let runner = Runner::new(&file, &opts);
+        let outcomes: HashMap<_, _> = runner.run(&order).into_iter().collect();
+        (outcomes, ())
+    };
+    assert_eq!(
+        outcomes["files"],
+        Outcome::Ran,
+        "name=changed still differs"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pull_never_writes_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display().to_string();
+    crate::ui::add_redactions([&"hunter2-secret".to_string()]);
+    let main = dir.path().join("main.task");
+    let source = format!("task t {{\n file \"{d}/s.conf\" \"a\\n\"\n}}\n");
+    std::fs::write(&main, &source).unwrap();
+    std::fs::write(dir.path().join("s.conf"), "a\npassword=hunter2-secret\n").unwrap();
+    let file = crate::parser::parse_file(&main).unwrap();
+    let order = select(&file, &[]).unwrap();
+    let mut opts = options(1);
+    opts.pull = true;
+    opts.yes = true;
+    let runner = Runner::new(&file, &opts);
+    runner.run(&order);
+    let edits = std::mem::take(&mut *runner.edits.lock().unwrap());
+    super::pull::apply(&edits);
+    assert!(!std::fs::read_to_string(&main).unwrap().contains("hunter2"));
 }

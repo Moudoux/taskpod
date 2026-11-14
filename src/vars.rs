@@ -3,8 +3,8 @@
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, OnceLock};
 
 /// How deep variables may reference other variables before we assume a cycle.
 const MAX_DEPTH: usize = 32;
@@ -74,6 +74,31 @@ pub struct Ctx {
     pub exports: Vec<(String, String)>,
     /// `{{ secrets.name }}` values, decrypted when first used.
     pub secrets: crate::secrets::Secrets,
+    /// Run on this machine over SSH instead of locally.
+    pub remote: Option<Arc<crate::remote::Remote>>,
+}
+
+/// A command ready to start, with what to write to its stdin.
+pub struct Spawn {
+    pub command: Command,
+    input: Option<Vec<u8>>,
+}
+
+impl Spawn {
+    /// Start it, writing its input (if any) in the background. Without
+    /// input, stdin is closed.
+    pub fn spawn(mut self) -> std::io::Result<Child> {
+        let stdin = if self.input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        };
+        let mut child = self.command.stdin(stdin).spawn()?;
+        if let (Some(input), Some(stdin)) = (self.input, child.stdin.take()) {
+            std::thread::spawn(move || crate::remote::write_all(stdin, &input));
+        }
+        Ok(child)
+    }
 }
 
 impl Ctx {
@@ -83,10 +108,36 @@ impl Ctx {
             dir,
             exports: Vec::new(),
             secrets: Default::default(),
+            remote: None,
         }
     }
 
-    pub fn command(&self, script: &str, cwd: &Path) -> Command {
+    /// A shell command running `script` in `cwd`, on the remote machine if there is one.
+    pub fn command(&self, script: &str, cwd: &Path) -> Spawn {
+        match &self.remote {
+            Some(remote) => {
+                let (command, input) = remote.command(&self.remote_script(script, cwd, false), &[]);
+                Spawn {
+                    command,
+                    input: Some(input),
+                }
+            }
+            None => Spawn {
+                command: self.local_command(script, cwd),
+                input: None,
+            },
+        }
+    }
+
+    /// A command running `script` with the terminal, for interactive tasks.
+    pub fn interactive_command(&self, script: &str, cwd: &Path) -> Result<Command> {
+        match &self.remote {
+            Some(remote) => remote.interactive_command(&self.remote_script(script, cwd, true)),
+            None => Ok(self.local_command(script, cwd)),
+        }
+    }
+
+    fn local_command(&self, script: &str, cwd: &Path) -> Command {
         let mut command = Command::new(&self.shell[0]);
         command
             .args(&self.shell[1..])
@@ -96,27 +147,102 @@ impl Ctx {
         command
     }
 
+    /// A remote POSIX script that runs `script` with the configured shell.
+    fn remote_script(&self, script: &str, cwd: &Path, tty: bool) -> String {
+        use crate::remote::quote;
+        let mut out = String::new();
+        if !cwd.as_os_str().is_empty() {
+            out.push_str(&format!(
+                "cd -- {} || exit 1\n",
+                quote(&cwd.to_string_lossy())
+            ));
+        }
+        for (key, value) in &self.exports {
+            out.push_str(&format!("{key}={}; export {key}\n", quote(value)));
+        }
+        let argv: Vec<String> = self
+            .shell
+            .iter()
+            .map(String::as_str)
+            .chain([script])
+            .map(quote)
+            .collect();
+        out.push_str(&argv.join(" "));
+        // The script itself came over stdin; don't let commands read the rest of it.
+        if !tty {
+            out.push_str(" </dev/null");
+        }
+        out.push('\n');
+        out
+    }
+
+    /// Where commands run when nothing else is said: `local` here, the home
+    /// directory on a remote machine.
+    pub fn default_cwd(&self, local: &Path) -> PathBuf {
+        match &self.remote {
+            Some(remote) => PathBuf::from(&remote.home),
+            None => local.to_path_buf(),
+        }
+    }
+
+    /// The home directory of the machine being configured.
+    pub fn home(&self) -> Option<String> {
+        match &self.remote {
+            Some(remote) => Some(remote.home.clone()),
+            None => home_dir(),
+        }
+    }
+
+    /// The user on the machine being configured.
+    pub fn user(&self) -> Option<String> {
+        match &self.remote {
+            Some(remote) => Some(remote.user.clone()),
+            None => std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .ok(),
+        }
+    }
+
+    /// Expand a leading `~/` in a path on the machine being configured.
+    pub fn target_path(&self, path: &str) -> String {
+        match &self.remote {
+            Some(remote) => match path.strip_prefix("~/") {
+                Some(rest) => format!("{}/{rest}", remote.home),
+                None if path == "~" => remote.home.clone(),
+                None => path.to_string(),
+            },
+            None => expand_tilde(path),
+        }
+    }
+
+    /// What a command failing to start is reported as.
+    pub fn program(&self) -> &str {
+        if self.remote.is_some() {
+            "ssh"
+        } else {
+            &self.shell[0]
+        }
+    }
+
     /// Run a check and report whether it succeeded. Output is discarded.
     pub fn check(&self, script: &str, cwd: &Path) -> Result<bool> {
-        let status = self
-            .command(script, cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| anyhow!("failed to start shell {:?}: {e}", self.shell[0]))?;
+        let mut spawn = self.command(script, cwd);
+        spawn.command.stdout(Stdio::null()).stderr(Stdio::null());
+        let status = spawn
+            .spawn()
+            .and_then(|mut child| child.wait())
+            .map_err(|e| anyhow!("failed to start {:?}: {e}", self.program()))?;
         Ok(status.success())
     }
 
     /// Run a command and return its trimmed stdout.
     pub fn capture(&self, script: &str, cwd: &Path) -> std::result::Result<String, String> {
-        let output = self
-            .command(script, cwd)
-            .stdin(Stdio::null())
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .output()
-            .map_err(|e| format!("failed to start shell {:?}: {e}", self.shell[0]))?;
+        let mut spawn = self.command(script, cwd);
+        spawn.command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output = spawn
+            .spawn()
+            .and_then(Child::wait_with_output)
+            .map_err(|e| format!("failed to start {:?}: {e}", self.program()))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
@@ -226,10 +352,8 @@ impl<'a> Scope<'a> {
             "pwd" => std::env::current_dir()
                 .ok()
                 .map(|p| p.display().to_string()),
-            "home" => home_dir(),
-            "user" => std::env::var("USER")
-                .or_else(|_| std::env::var("USERNAME"))
-                .ok(),
+            "home" => self.ctx.home(),
+            "user" => self.ctx.user(),
             "dir" => Some(self.ctx.dir.display().to_string()),
             _ => None,
         };
@@ -252,7 +376,8 @@ impl<'a> Scope<'a> {
                     let command = self
                         .expand_depth(command, depth + 1)
                         .map_err(|e| e.to_string())?;
-                    self.ctx.capture(&command, &self.ctx.dir)
+                    self.ctx
+                        .capture(&command, &self.ctx.default_cwd(&self.ctx.dir))
                 })
                 .clone()
                 .map_err(|e| anyhow!("variable '{name}': {e}")),

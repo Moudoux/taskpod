@@ -4,6 +4,9 @@
 #   taskpod spec.task          run every task that isn't manual
 #   taskpod spec.task -D       compare with the system: only what would change, with file diffs
 #   taskpod spec.task -d       dry run: every task and step, change nothing
+#   taskpod spec.task --pull   bring changed files back from the system into
+#                              the task files, -D or -d only show what would change
+#   taskpod spec.task -H host  run on another machine over SSH, nothing to install there
 #   taskpod spec.task -r hello run one task, and the tasks it needs
 #   taskpod spec.task -l       list tasks
 #   taskpod spec.task --check  check the file for errors

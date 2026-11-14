@@ -44,6 +44,20 @@ pub struct Args {
     #[arg(long, value_name = "FILE")]
     pub secrets: Vec<PathBuf>,
 
+    /// Bring changes made on the system back into the task files: file content
+    /// and modes. Asks about each file; with -d or -D, only shows what would change
+    #[arg(short, long)]
+    pub pull: bool,
+
+    /// With --pull, pull every change without asking
+    #[arg(short, long, requires = "pull")]
+    pub yes: bool,
+
+    /// Configure another machine over SSH (user@host or a Host from ~/.ssh/config).
+    /// taskpod doesn't need to be installed there
+    #[arg(short = 'H', long, value_name = "HOST")]
+    pub host: Option<String>,
+
     /// Tasks to skip
     #[arg(short, long, num_args = 1..)]
     pub skip: Vec<String>,
@@ -90,7 +104,14 @@ fn main() -> ExitCode {
 
 fn run(mut args: Args) -> Result<bool> {
     let start = Instant::now();
-    let mut file = taskpod::parser::parse_file(&args.file)?;
+    // Checking and listing only read the file, they don't need the machine.
+    let remote = match &args.host {
+        Some(host) if !args.check && !args.list => {
+            Some(std::sync::Arc::new(taskpod::remote::Remote::connect(host)?))
+        }
+        _ => None,
+    };
+    let mut file = taskpod::parser::parse_file_on(&args.file, remote)?;
     for path in &args.secrets {
         file.ctx.secrets.add(std::path::absolute(path)?);
     }
@@ -153,16 +174,35 @@ fn run(mut args: Args) -> Result<bool> {
         ignore_guards: args.ignore_conditions,
         jobs: args.jobs.max(1),
         skip: args.skip.into_iter().collect::<HashSet<_>>(),
+        pull: args.pull,
+        yes: args.yes,
     };
     let order = select(&file, &args.run)?;
     let runner = Runner::new(&file, &opts);
 
     let scope = runner.root_scope();
-    if let Some(guard) = runner.failing_guard(&file.guards, &scope, &file.ctx.dir)? {
+    let cwd = file.ctx.default_cwd(&file.ctx.dir);
+    if let Some(guard) = runner.failing_guard(&file.guards, &scope, &cwd)? {
         ui().line(format!("Nothing to do: {}", guard.describe()));
         return Ok(true);
     }
 
     let outcomes = runner.run(&order);
-    Ok(summarize(&outcomes, start, &opts, &args.file))
+    let ok = summarize(&outcomes, start, &opts, &args.file);
+    let edits = std::mem::take(&mut *runner.edits.lock().unwrap_or_else(|e| e.into_inner()));
+    if edits.is_empty() {
+        return Ok(ok);
+    }
+    let applied = taskpod::exec::pull::apply(&edits);
+    for file in &applied.written {
+        ui().line(format!(
+            "{} pulled into {}",
+            style("✓").green(),
+            file.display()
+        ));
+    }
+    for problem in &applied.problems {
+        ui().line(format!("{} {problem}", style("✗").red()));
+    }
+    Ok(ok && applied.problems.is_empty())
 }

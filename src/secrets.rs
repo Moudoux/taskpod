@@ -187,19 +187,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn decrypts_once_and_merges_files() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         // A fake sops that prints the file as is and counts its runs.
         let fake = dir.path().join("fake-sops");
-        std::fs::write(
+        crate::test_util::write_script(
             &fake,
-            format!(
+            &format!(
                 "#!/bin/sh\necho x >> {}/runs\ncat \"$4\"\n",
                 dir.path().display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         std::fs::write(dir.path().join("a.json"), r#"{"x": "one", "y": "a"}"#).unwrap();
         std::fs::write(dir.path().join("b.json"), r#"{"y": "b"}"#).unwrap();
         let mut secrets = Secrets::default();

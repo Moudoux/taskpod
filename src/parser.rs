@@ -14,9 +14,19 @@ const MAX_INCLUDE_DEPTH: usize = 16;
 
 /// Parse a task file and everything it includes.
 pub fn parse_file(path: &Path) -> Result<TaskFile> {
+    parse_file_on(path, None)
+}
+
+/// Parse a task file for configuring `remote`, which `include ... if` checks run on.
+pub fn parse_file_on(
+    path: &Path,
+    remote: Option<std::sync::Arc<crate::remote::Remote>>,
+) -> Result<TaskFile> {
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let mut file = TaskFile::new(Ctx::new(dir));
+    let mut ctx = Ctx::new(dir);
+    ctx.remote = remote;
+    let mut file = TaskFile::new(ctx);
     parse_into(&mut file, &path, 0)?;
     file.link()?;
     Ok(file)
@@ -110,7 +120,8 @@ impl<'s> Parser<'s> {
                     let path = self.resolve(&path);
                     if let Some(guard) = guard {
                         let scope = Scope::root(&file.vars, &file.ctx);
-                        if !guard_passes(&guard, &scope, &self.dir())? {
+                        let cwd = file.ctx.default_cwd(&self.dir());
+                        if !guard_passes(&guard, &scope, &cwd)? {
                             continue;
                         }
                     }
@@ -462,6 +473,11 @@ impl<'s> Parser<'s> {
     /// `file "path" [mode 755] [owner user:group] [encoding utf-16le] [sudo] ("content" | from "path")`
     fn file_step(&mut self) -> Result<FileStep> {
         let path = self.string()?;
+        let mut origin = FileOrigin {
+            file: self.path.clone(),
+            after_path: self.pos,
+            ..FileOrigin::default()
+        };
         let mut mode = None;
         let mut owner = None;
         let mut encoding = None;
@@ -469,7 +485,10 @@ impl<'s> Parser<'s> {
         let source = loop {
             self.skip_inline_ws();
             if let Some('"' | '\'') = self.peek() {
-                break FileSource::Inline(self.string()?);
+                let start = self.pos;
+                let text = self.string()?;
+                origin.content = Some(self.span(start));
+                break FileSource::Inline(text);
             }
             let start = self.pos;
             match self
@@ -477,7 +496,10 @@ impl<'s> Parser<'s> {
                 .as_str()
             {
                 "mode" => {
+                    self.skip_inline_ws();
+                    let value_start = self.pos;
                     let value = self.word("a file mode")?;
+                    origin.mode = Some(self.span(value_start));
                     let parsed = u32::from_str_radix(&value, 8)
                         .ok()
                         .filter(|m| *m <= 0o7777)
@@ -543,7 +565,17 @@ impl<'s> Parser<'s> {
             },
             raw,
             sudo,
+            origin,
         })
+    }
+
+    /// The source from `start` to here.
+    fn span(&self, start: usize) -> Span {
+        Span {
+            start,
+            end: self.pos,
+            text: self.src[start..self.pos].to_string(),
+        }
     }
 
     // ---- Lexing -----------------------------------------------------------
@@ -888,6 +920,16 @@ fn dedent(text: &str, indent: Option<usize>) -> String {
         (Some(first), Some(last)) => stripped[first..=last].join("\n"),
         _ => String::new(),
     }
+}
+
+/// The value of one string literal, as the parser reads it.
+pub fn string_literal(text: &str) -> Result<String> {
+    let mut parser = Parser::new(text, PathBuf::from("<string>"));
+    let value = parser.string()?;
+    if !parser.rest().trim().is_empty() {
+        bail!("more than one string");
+    }
+    Ok(value)
 }
 
 pub fn guard_passes(guard: &Guard, scope: &Scope, cwd: &Path) -> Result<bool> {
