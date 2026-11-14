@@ -263,9 +263,16 @@ export function parse(text: string): Index {
       case "ask":
         if (stack.length && /\{\s*$/.test(rest)) stack.push({ kind: "block", owner: frame?.owner, ownerKind: frame?.ownerKind });
         return;
-      case "file": {
+      case "file":
+      case "directory":
+      case "line": {
         const found = strings(line);
         if (found[0]) index.paths.push({ path: found[0].value, kind: "target", line: number, start: found[0].start, end: found[0].end });
+        const base = keyword === "line" && line.match(/\bbase\s+("[^"]*"|'[^']*')/);
+        if (base) {
+          const start = base.index! + base[0].indexOf(base[1]) + 1;
+          index.paths.push({ path: base[1].slice(1, -1), kind: "target", line: number, start, end: start + base[1].length - 2 });
+        }
         const from = line.match(/\bfrom\s+("[^"]*"|'[^']*')/);
         if (from) {
           const start = from.index! + from[0].indexOf(from[1]) + 1;

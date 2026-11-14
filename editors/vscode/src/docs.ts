@@ -1,6 +1,7 @@
 // Documentation for taskpod keywords, shown on hover and in completions.
 
-export type Place = "top" | "body" | "file";
+/** Where a keyword goes: the top level, a task body, or the options of a `file` or `line` step. */
+export type Place = "top" | "body" | "file" | "line";
 
 export interface KeywordDoc {
   /** Where the keyword can be used. */
@@ -116,9 +117,9 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
     snippet: "lock ${1:name}",
   },
   sudo: {
-    places: ["body", "file"],
+    places: ["body", "file", "line"],
     summary:
-      "Ask for sudo once before running, so parallel tasks never prompt at the same time. Commands that call `sudo` do this automatically. On a `file`, writes the file as root.",
+      "Ask for sudo once before running, so parallel tasks never prompt at the same time. Commands that call `sudo` do this automatically. On a `file` or `line`, reads and writes the file as root.",
     syntax: "sudo",
     snippet: "sudo",
   },
@@ -156,16 +157,16 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
     snippet: "undo ${1:command}",
   },
   keep: {
-    places: ["body", "file"],
+    places: ["body", "file", "line"],
     summary:
-      "`--undo` leaves what this task or block did in place, and doesn't count its commands as impossible to undo. On a `file`, undo leaves the file as it is.",
+      "`--undo` leaves what this task or block did in place, and doesn't count its commands as impossible to undo. On a `file`, undo leaves the file as it is; on a `line`, the line stays.",
     syntax: "keep",
     snippet: "keep",
   },
   new: {
-    places: ["file"],
+    places: ["file", "line"],
     summary:
-      "The file didn't exist before taskpod, so `--undo` deletes it. Only needed for files written before taskpod kept an undo journal: since then, undo knows what was there.",
+      "The file didn't exist before taskpod, so `--undo` deletes it; on a `line`, taskpod added the line. Only needed for what taskpod wrote before it kept an undo journal: since then, undo knows what was there.",
     syntax: 'file "~/.config/app.conf" new from "files/app.conf"',
     snippet: "new",
   },
@@ -176,6 +177,46 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
     syntax:
       'file "/etc/x.conf" sudo """\n    contents\n    """\nfile "~/.config/y" mode 600 owner me:me encoding utf-16le from "files/y"',
     snippet: 'file "${1:path}" """\n\t$0\n\t"""',
+  },
+  directory: {
+    places: ["body"],
+    summary:
+      "Copies every file in a `from` directory (subdirectories included) to the same place under the path, each like its own `file` step with the same options: written only when it differs, pulled back with `--pull`, undone with `--undo`. Files on the system that the directory doesn't have are left alone, and `--pull` copies them into it.",
+    syntax: 'directory "/etc/opensnitchd/rules" sudo new from "files/etc/opensnitchd/rules"',
+    snippet: 'directory "${1:path}" from "${2:files/path}"',
+  },
+  line: {
+    places: ["body"],
+    summary:
+      "Makes sure a file has this line, leaving the rest of it, its mode and owner as they are: for files a package or you own, like PAM configs or `~/.bashrc`. Missing, the line goes before the first other line starting with `before`, after the last starting with `after` (both ignoring indentation), or at the end, and on the wrong side it's moved. Lines are compared ignoring spacing; with `match`, a line starting with that is replaced. The file must exist, unless a `base` says what to start from. The journal records what taskpod added or replaced, so `--undo` puts back only that; a line with no record is left, unless the step says `new`.",
+    syntax: 'line "/etc/pam.d/sudo" sudo before "auth" "auth sufficient pam_u2f.so cue"\nline "~/.bashrc" ". ~/.scripts/functions.sh"',
+    snippet: 'line "${1:path}" "${2:text}"',
+  },
+  base: {
+    places: ["line"],
+    summary:
+      "When the file doesn't exist, start from a copy of this one (on the machine being configured), with its mode and owner: for overrides of vendor files, like `/etc/pam.d/kde` over `/usr/lib/pam.d/kde`. `--undo` deletes the file once it's the same as the base again.",
+    syntax: 'base "/usr/lib/pam.d/kde"',
+    snippet: 'base "${1:path}"',
+  },
+  match: {
+    places: ["line"],
+    summary:
+      "A line starting with this (ignoring indentation) is this step's line: it's replaced with the step's text instead of a second line being added, and `--undo` puts back what it replaced.",
+    syntax: 'match "auth sufficient pam_u2f.so"',
+    snippet: 'match "${1:start}"',
+  },
+  before: {
+    places: ["line"],
+    summary: "Add the line before the first line starting with this text (ignoring indentation). If none does, the step fails.",
+    syntax: 'before "auth"',
+    snippet: 'before "${1:start}"',
+  },
+  after: {
+    places: ["line"],
+    summary: "Add the line after the last line starting with this text (ignoring indentation). If none does, the step fails.",
+    syntax: 'after "[section]"',
+    snippet: 'after "${1:start}"',
   },
   mode: {
     places: ["file"],
@@ -198,7 +239,8 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   },
   from: {
     places: ["file"],
-    summary: "Copy the content from a file, relative to this task file. Ctrl+click to open it.",
+    summary:
+      "Copy the content from a file, relative to this task file, or for `directory`, every file in a directory. Ctrl+click to open a file.",
     syntax: 'from "files/etc/logid.cfg"',
     snippet: 'from "${1:path}"',
   },

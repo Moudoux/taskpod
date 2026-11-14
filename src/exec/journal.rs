@@ -122,3 +122,110 @@ pub fn record(ctx: &Ctx, task: &str, path: &Path, root: bool, previous: &Previou
 pub fn remove(ctx: &Ctx, task: &str, path: &Path, root: bool) -> Result<()> {
     target::remove(ctx, task, &entry(ctx, path, root)?, root)
 }
+
+/// What taskpod did to a file with `line` steps, kept next to the file
+/// entries, one per file.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Lines {
+    /// Taskpod created the file (from its `base`, if it had one).
+    pub created: bool,
+    /// The base's content when taskpod created the file.
+    pub base: Option<String>,
+    pub lines: Vec<LineRecord>,
+}
+
+/// One line taskpod wrote.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineRecord {
+    /// Which step it belongs to: the step's `match` prefix, or its text.
+    pub key: String,
+    /// The line as taskpod wrote it.
+    pub text: String,
+    /// The line it replaced, if it replaced one.
+    pub replaced: Option<String>,
+}
+
+impl Lines {
+    pub fn get(&self, key: &str) -> Option<&LineRecord> {
+        self.lines.iter().find(|l| l.key == key)
+    }
+}
+
+/// The line entry's file. A file entry's name never has `%` followed by
+/// something other than two hex digits, so `%lines` can't clash with one.
+fn lines_entry(ctx: &Ctx, path: &Path, root: bool) -> Result<PathBuf> {
+    let file = entry(ctx, path, root)?;
+    let name = file.file_name().unwrap_or_default().to_string_lossy();
+    Ok(file.with_file_name(format!("{name}%lines")))
+}
+
+/// The line entry for `path`: `None` if it can't be read (a root entry, in a
+/// check). With `sudo`, a root entry is read as root.
+pub fn read_lines(
+    ctx: &Ctx,
+    task: &str,
+    path: &Path,
+    root: bool,
+    sudo: bool,
+) -> Result<Option<Lines>> {
+    let file = lines_entry(ctx, path, root)?;
+    let bytes = match target::read(ctx, task, &file, sudo)? {
+        Current::Content(bytes) => bytes,
+        Current::Missing => return Ok(Some(Lines::default())),
+        Current::Unreadable => return Ok(None),
+    };
+    let damaged = || anyhow!("the journal entry {} is damaged", file.display());
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| damaged())?;
+    let text = |v: &Value| v.as_str().map(String::from);
+    let lines = value["lines"]
+        .as_array()
+        .ok_or_else(damaged)?
+        .iter()
+        .map(|l| {
+            Some(LineRecord {
+                key: text(&l["key"])?,
+                text: text(&l["text"])?,
+                replaced: text(&l["replaced"]),
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(damaged)?;
+    Ok(Some(Lines {
+        created: value["created"] == true,
+        base: text(&value["base"]),
+        lines,
+    }))
+}
+
+/// Save the line entry for `path`, or remove it once it has no lines.
+pub fn write_lines(ctx: &Ctx, task: &str, path: &Path, root: bool, lines: &Lines) -> Result<()> {
+    let file = lines_entry(ctx, path, root)?;
+    if lines.lines.is_empty() {
+        if target::stat(ctx, &file).is_none() {
+            return Ok(());
+        }
+        return target::remove(ctx, task, &file, root);
+    }
+    let records: Vec<Value> = lines
+        .lines
+        .iter()
+        .map(|l| json!({ "key": l.key, "text": l.text, "replaced": l.replaced }))
+        .collect();
+    let value = json!({
+        "path": path.display().to_string(),
+        "created": lines.created,
+        "base": lines.base,
+        "lines": records,
+    });
+    let shown = path.display();
+    target::write(
+        ctx,
+        task,
+        &file,
+        value.to_string().as_bytes(),
+        0o600,
+        None,
+        root,
+    )
+    .with_context(|| format!("failed to record {shown}'s lines in the undo journal"))
+}

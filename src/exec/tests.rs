@@ -1148,3 +1148,382 @@ fn undo_keeps_what_others_need() {
     let all = select_undo(&file, &["c".into(), "a".into(), "b".into()]).unwrap();
     assert_eq!(all, ["c", "a", "b"]);
 }
+
+#[cfg(unix)]
+#[test]
+fn copies_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |n: &str| dir.path().join(n);
+    std::fs::create_dir_all(path("files/rules/nested")).unwrap();
+    std::fs::write(path("files/rules/a.json"), "a\n").unwrap();
+    std::fs::write(path("files/rules/{{ b }}.json"), "b\n").unwrap();
+    std::fs::write(path("files/rules/nested/c.sh"), "#!/bin/sh\n").unwrap();
+    std::fs::create_dir_all(path("out")).unwrap();
+    std::fs::write(path("out/theirs.json"), "theirs\n").unwrap();
+    let source = r#"
+        task rules {
+            directory "out" new from "files/rules"
+        }
+    "#;
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["rules"],
+        Outcome::Ran
+    );
+    assert_eq!(read(dir.path(), "out/a.json"), "a\n");
+    assert_eq!(read(dir.path(), "out/{{ b }}.json"), "b\n");
+    assert_eq!(read(dir.path(), "out/nested/c.sh"), "#!/bin/sh\n");
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["rules"],
+        Outcome::UpToDate
+    );
+
+    // --pull brings changes back to the file they came from.
+    std::fs::write(path("out/a.json"), "changed\n").unwrap();
+    let main = path("main.task");
+    std::fs::write(&main, source).unwrap();
+    let file = crate::parser::parse_file(&main).unwrap();
+    let mut opts = options(1);
+    opts.pull = true;
+    opts.yes = true;
+    let runner = Runner::new(&file, &opts);
+    runner.run(&select(&file, &[]).unwrap());
+    let edits = runner.edits.lock().unwrap();
+    let applied = pull::apply(&edits);
+    assert!(applied.problems.is_empty(), "{:?}", applied.problems);
+    assert_eq!(read(dir.path(), "files/rules/a.json"), "changed\n");
+    // Files only on the system are pulled in too, unless they hold a secret.
+    assert_eq!(read(dir.path(), "files/rules/theirs.json"), "theirs\n");
+    drop(edits);
+
+    // Undo removes what it wrote, and leaves the system's own files.
+    std::fs::write(path("out/later.json"), "later\n").unwrap();
+    undo(source, dir.path(), Mode::Run, &[]);
+    assert!(!path("out/a.json").exists());
+    assert!(!path("out/nested/c.sh").exists());
+    assert_eq!(read(dir.path(), "out/later.json"), "later\n");
+}
+
+#[test]
+fn directories_are_copied_from_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = parse_str("task t {\n directory \"/a\" \"x\"\n}\n", dir.path())
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("copied `from`"), "{err}");
+    // A `file` from a directory says to use `directory`.
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    let source = "task t {\n file \"out\" from \"src/\"\n}\n";
+    let outcome = &run(source, dir.path(), &options(1), &[])["t"];
+    assert!(
+        matches!(outcome, Outcome::Failed(e) if e.contains("copy it with `directory`")),
+        "{outcome:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lines_are_added_and_undone() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = |n: &str| dir.path().join(n);
+    std::fs::write(
+        path("pam"),
+        "#%PAM-1.0\n  auth include system\nauth x\naccount y\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(path("pam"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(path("rc"), "alias a=b").unwrap();
+    std::fs::write(path("conf"), "[a]\nx=1\n[b]\n").unwrap();
+    let source = r#"
+        let script = "funcs.sh"
+        task lines {
+            line "pam" before "auth" "auth sufficient u2f"
+            line "rc" ". {{ script }}"
+            line "conf" after "x=" "y=2"
+        }
+    "#;
+    // A diff shows it and changes nothing.
+    let mut opts = options(1);
+    opts.mode = Mode::Diff;
+    assert_eq!(run(source, dir.path(), &opts, &[])["lines"], Outcome::Ran);
+    assert_eq!(read(dir.path(), "rc"), "alias a=b");
+
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["lines"],
+        Outcome::Ran
+    );
+    assert_eq!(
+        read(dir.path(), "pam"),
+        "#%PAM-1.0\nauth sufficient u2f\n  auth include system\nauth x\naccount y\n"
+    );
+    let mode = std::fs::metadata(path("pam")).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert_eq!(read(dir.path(), "rc"), "alias a=b\n. funcs.sh\n");
+    assert_eq!(read(dir.path(), "conf"), "[a]\nx=1\ny=2\n[b]\n");
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["lines"],
+        Outcome::UpToDate
+    );
+
+    // Undo takes the lines out, and only them.
+    assert_eq!(
+        undo(source, dir.path(), Mode::Run, &[])["lines"],
+        Outcome::Ran
+    );
+    assert_eq!(
+        read(dir.path(), "pam"),
+        "#%PAM-1.0\n  auth include system\nauth x\naccount y\n"
+    );
+    assert_eq!(read(dir.path(), "rc"), "alias a=b\n");
+    assert_eq!(read(dir.path(), "conf"), "[a]\nx=1\n[b]\n");
+    assert_eq!(
+        undo(source, dir.path(), Mode::Run, &[])["lines"],
+        Outcome::UpToDate
+    );
+
+    // Nowhere to put it, or no file: the step fails.
+    let source =
+        "task t {\n line \"conf\" before \"nope\" \"z\"\n}\ntask u {\n line \"missing\" \"z\"\n}\n";
+    let outcomes = run(source, dir.path(), &options(1), &[]);
+    assert!(
+        matches!(&outcomes["t"], Outcome::Failed(e) if e.contains("no line starts with \"nope\"")),
+        "{outcomes:?}"
+    );
+    assert!(
+        matches!(&outcomes["u"], Outcome::Failed(e) if e.contains("doesn't exist")),
+        "{outcomes:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lines_over_ssh() {
+    let dir = tempfile::tempdir().unwrap();
+    let (remote, home) = fake_remote(dir.path());
+    std::fs::write(home.join(".bashrc"), "export A=1\n").unwrap();
+    let source = "task t {\n line \"~/.bashrc\" \". ~/f.sh\"\n}\n";
+    assert_eq!(
+        run_remote(source, dir.path(), &remote, &options(1))["t"],
+        Outcome::Ran
+    );
+    assert_eq!(read(&home, ".bashrc"), "export A=1\n. ~/f.sh\n");
+    assert_eq!(
+        run_remote(source, dir.path(), &remote, &options(1))["t"],
+        Outcome::UpToDate
+    );
+}
+
+#[test]
+fn line_steps_parse() {
+    let err = |source: &str| match parse_str(source, Path::new("/tmp")) {
+        Ok(_) => panic!("parsed: {source}"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err("task t {\n line \"/a\" \"x\\ny\"\n}\n").contains("newline"));
+    assert!(err("task t {\n line \"/a\" \" \"\n}\n").contains("empty"));
+    assert!(err("task t {\n line \"/a\" before \"a\" after \"b\" \"x\"\n}\n").contains("only one"));
+    assert!(err("task t {\n line \"/a\" mode 600 \"x\"\n}\n").contains("unexpected 'mode'"));
+    let file = parse_str(
+        "task t {\n line \"/a\" sudo keep after \"b\" \"x\"\n}\n",
+        Path::new("/tmp"),
+    )
+    .unwrap();
+    let crate::ast::Step::Line(line) = &file.tasks["t"].body.steps[0] else {
+        panic!()
+    };
+    assert!(line.sudo && line.keep);
+    assert!(matches!(&line.place, Some(crate::ast::LinePlace::After(p)) if p == "b"));
+    assert_eq!(line.text, "x");
+}
+
+#[cfg(unix)]
+#[test]
+fn lines_start_from_a_base() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = |n: &str| dir.path().join(n);
+    std::fs::create_dir(path("vendor")).unwrap();
+    std::fs::write(path("vendor/kde"), "#%PAM-1.0\nauth\tinclude  login\n").unwrap();
+    std::fs::set_permissions(path("vendor/kde"), std::fs::Permissions::from_mode(0o640)).unwrap();
+    let source = r#"
+        task pam {
+            line "etc/kde" base "vendor/kde" before "auth" "auth sufficient u2f"
+        }
+    "#;
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["pam"],
+        Outcome::Ran
+    );
+    assert_eq!(
+        read(dir.path(), "etc/kde"),
+        "#%PAM-1.0\nauth sufficient u2f\nauth\tinclude  login\n"
+    );
+    let mode = std::fs::metadata(path("etc/kde"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o640);
+    // Lined up differently, it's the same line.
+    std::fs::write(
+        path("etc/kde"),
+        "#%PAM-1.0\nauth   sufficient\tu2f\nauth\tinclude  login\n",
+    )
+    .unwrap();
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["pam"],
+        Outcome::UpToDate
+    );
+    // Undone, it's the base again, so it goes.
+    assert_eq!(
+        undo(source, dir.path(), Mode::Run, &[])["pam"],
+        Outcome::Ran
+    );
+    assert!(!path("etc/kde").exists());
+    // With other changes, only the line goes.
+    run(source, dir.path(), &options(1), &[]);
+    std::fs::write(
+        path("etc/kde"),
+        "#%PAM-1.0\nauth sufficient u2f\nauth\tinclude  login\nmine\n",
+    )
+    .unwrap();
+    undo(source, dir.path(), Mode::Run, &[]);
+    assert_eq!(
+        read(dir.path(), "etc/kde"),
+        "#%PAM-1.0\nauth\tinclude  login\nmine\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lists_directories_over_ssh() {
+    let dir = tempfile::tempdir().unwrap();
+    let (remote, home) = fake_remote(dir.path());
+    std::fs::create_dir_all(home.join("rules/sub")).unwrap();
+    std::fs::write(home.join("rules/b"), "").unwrap();
+    std::fs::write(home.join("rules/sub/a"), "").unwrap();
+    let mut file = parse_str("", dir.path()).unwrap();
+    file.ctx.remote = Some(remote);
+    let list = |p: &Path| super::target::list(&file.ctx, "t", p, false).unwrap();
+    assert_eq!(list(&home.join("rules")), ["b", "sub/a"]);
+    assert!(list(&home.join("nothing")).is_empty());
+}
+
+/// Run an undo and return the task's report too.
+fn undo_report(source: &str, dir: &Path, task: &str) -> (Outcome, TaskReport) {
+    let file = parse_str(source, dir).unwrap_or_else(|e| panic!("{e:#}"));
+    let mut opts = options(1);
+    opts.undo = true;
+    opts.yes = true;
+    let runner = Runner::new(&file, &opts);
+    let outcomes: HashMap<_, _> = runner
+        .run(&select_undo(&file, &[]).unwrap())
+        .into_iter()
+        .collect();
+    let report = runner.reports.lock().unwrap().remove(task).unwrap();
+    (outcomes[task].clone(), report)
+}
+
+#[cfg(unix)]
+#[test]
+fn undo_only_takes_out_lines_taskpod_added() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |n: &str| dir.path().join(n);
+    // Already there before taskpod: undo leaves it, and says so.
+    std::fs::write(path("rc"), "a\n. f.sh\n").unwrap();
+    let source = "task t {\n line \"rc\" \". f.sh\"\n}\n";
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["t"],
+        Outcome::UpToDate
+    );
+    let (_, report) = undo_report(source, dir.path(), "t");
+    assert_eq!(report.cannot, 1);
+    assert_eq!(read(dir.path(), "rc"), "a\n. f.sh\n");
+    // `new` says taskpod added it.
+    let source = "task t {\n line \"rc\" new \". f.sh\"\n}\n";
+    undo(source, dir.path(), Mode::Run, &[]);
+    assert_eq!(read(dir.path(), "rc"), "a\n");
+
+    // Added by taskpod, then a copy by hand: undo takes out one.
+    run(source, dir.path(), &options(1), &[]);
+    std::fs::write(path("rc"), "a\n. f.sh\n. f.sh\n").unwrap();
+    undo(source, dir.path(), Mode::Run, &[]);
+    assert_eq!(read(dir.path(), "rc"), "a\n. f.sh\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn matched_lines_are_replaced_and_put_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |n: &str| dir.path().join(n);
+    std::fs::write(path("pam"), "#%PAM\nauth u2f.so old\nauth include x\n").unwrap();
+    let source = r#"
+        task t {
+            line "pam" match "auth u2f.so" before "auth" "auth u2f.so cue"
+        }
+    "#;
+    assert_eq!(run(source, dir.path(), &options(1), &[])["t"], Outcome::Ran);
+    assert_eq!(
+        read(dir.path(), "pam"),
+        "#%PAM\nauth u2f.so cue\nauth include x\n"
+    );
+    // Edited by hand: put right again, not added a second time.
+    std::fs::write(path("pam"), "#%PAM\nauth u2f.so mine\nauth include x\n").unwrap();
+    assert_eq!(run(source, dir.path(), &options(1), &[])["t"], Outcome::Ran);
+    assert_eq!(
+        read(dir.path(), "pam"),
+        "#%PAM\nauth u2f.so cue\nauth include x\n"
+    );
+    // Undo puts back what was there before taskpod.
+    undo(source, dir.path(), Mode::Run, &[]);
+    assert_eq!(
+        read(dir.path(), "pam"),
+        "#%PAM\nauth u2f.so old\nauth include x\n"
+    );
+
+    // Edited after taskpod wrote it, undo still finds it (and asks; --yes here).
+    run(source, dir.path(), &options(1), &[]);
+    std::fs::write(path("pam"), "#%PAM\nauth u2f.so edited\nauth include x\n").unwrap();
+    let (outcome, report) = undo_report(source, dir.path(), "t");
+    assert_eq!(outcome, Outcome::Ran);
+    assert!(
+        report
+            .steps
+            .iter()
+            .any(|s| s.label.contains("changed since taskpod wrote it")),
+        "{:?}",
+        report.steps
+    );
+    assert_eq!(
+        read(dir.path(), "pam"),
+        "#%PAM\nauth u2f.so old\nauth include x\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lines_move_to_their_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |n: &str| dir.path().join(n);
+    std::fs::write(path("pam"), "auth include x\nauth u2f\naccount y").unwrap();
+    let source = "task t {\n line \"pam\" before \"auth\" \"auth u2f\"\n}\n";
+    assert_eq!(run(source, dir.path(), &options(1), &[])["t"], Outcome::Ran);
+    assert_eq!(
+        read(dir.path(), "pam"),
+        "auth u2f\nauth include x\naccount y"
+    );
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["t"],
+        Outcome::UpToDate
+    );
+    // Moved, not added: it was there before taskpod, so undo leaves it.
+    let (_, report) = undo_report(source, dir.path(), "t");
+    assert_eq!(report.cannot, 1);
+
+    let source = "task t {\n line \"pam\" after \"account\" \"session z\"\n}\n";
+    run(source, dir.path(), &options(1), &[]);
+    assert_eq!(
+        read(dir.path(), "pam"),
+        "auth u2f\nauth include x\naccount y\nsession z\n"
+    );
+}

@@ -67,6 +67,14 @@ function expandHome(p: string): string {
   return p === "~" ? os.homedir() : p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p;
 }
 
+function isFile(path: string): boolean {
+  try {
+    return fs.statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /** A path from a task file: `~` is home, relative paths are relative to the file. */
 function resolvePath(p: string, from: vscode.Uri): string {
   const expanded = expandHome(p);
@@ -237,7 +245,7 @@ class Provider
     const pathRef = files[0].index.paths.find((p) => p.line === position.line && position.character >= p.start && position.character <= p.end);
     if (pathRef && !pathRef.path.includes("{{")) {
       const target = pathRef.kind === "target" ? expandHome(pathRef.path) : resolvePath(pathRef.path, document.uri);
-      if (fs.existsSync(target)) return new vscode.Location(vscode.Uri.file(target), new vscode.Position(0, 0));
+      if (isFile(target)) return new vscode.Location(vscode.Uri.file(target), new vscode.Position(0, 0));
     }
     return undefined;
   }
@@ -298,7 +306,8 @@ class Provider
     for (const p of indexOf(document).paths) {
       if (p.path.includes("{{")) continue;
       const target = p.kind === "target" ? expandHome(p.path) : resolvePath(p.path, document.uri);
-      if (!fs.existsSync(target)) continue;
+      // Directories (`directory "path" from "dir"`) can't be opened in an editor.
+      if (!isFile(target)) continue;
       const link = new vscode.DocumentLink(range(p), vscode.Uri.file(target));
       link.tooltip = p.kind === "target" ? "Open the file on this system" : "Open file";
       links.push(link);
@@ -351,12 +360,13 @@ class Provider
       return taskNames.filter((n) => n !== info.owner).map((n) => task(n, files.flatMap((f) => f.index.tasks).find((t) => t.name === n)?.desc));
     }
     if (/^\s*subtask\s+\S+\s+$/.test(before)) return [new vscode.CompletionItem("of", vscode.CompletionItemKind.Keyword)];
-    if (/^\s*file\s.*\bencoding\s+\S*$/.test(before)) {
+    if (/^\s*(file|directory)\s.*\bencoding\s+\S*$/.test(before)) {
       return ENCODINGS.map((e) => new vscode.CompletionItem(e, vscode.CompletionItemKind.EnumMember));
     }
-    if (/^\s*file\s+("[^"]*"|'[^']*')\s.*$/.test(before) || /^\s*file\s+("[^"]*"|'[^']*')\s*$/.test(before)) {
+    if (/^\s*(file|directory)\s+("[^"]*"|'[^']*')\s.*$/.test(before)) {
       return this.keywordItems("file");
     }
+    if (/^\s*line\s+("[^"]*"|'[^']*')\s.*$/.test(before)) return this.keywordItems("line");
     if (/^\s*let\s+\S+\s*=\s*$/.test(before)) {
       return [
         snippet("choose", 'choose "${1:Question?}" ${2:one} ${3:two}', "Ask to pick one of the options"),

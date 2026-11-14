@@ -250,7 +250,7 @@
       ]
     },
     "file": {
-      "begin": "^\\s*(file)\\b",
+      "begin": "^\\s*(file|directory|line)\\b",
       "beginCaptures": {
         "1": {
           "name": "keyword.other.file.taskpod"
@@ -295,7 +295,7 @@
           }
         },
         {
-          "match": "\\b(sudo|from|new|keep)\\b",
+          "match": "\\b(sudo|from|new|keep|before|after|base|match)\\b",
           "name": "keyword.other.taskpod"
         },
         {
@@ -312,7 +312,7 @@
       }
     },
     "call": {
-      "begin": "^\\s+(?!(?:desc|needs|lock|if|unless|ask|sudo|manual|interactive|workdir|keep|let|run|undo|file)\\b)([\\p{L}\\p{N}_.+-]+)(?=\\s|$)",
+      "begin": "^\\s+(?!(?:desc|needs|lock|if|unless|ask|sudo|manual|interactive|workdir|keep|let|run|undo|file|directory|line)\\b)([\\p{L}\\p{N}_.+-]+)(?=\\s|$)",
       "beginCaptures": {
         "1": {
           "name": "entity.name.function.call.taskpod"

@@ -66,6 +66,8 @@ pub enum Step {
     /// A shell script that undoes the block, only run by `--undo`.
     Undo(String),
     File(Box<FileStep>),
+    /// One line in a file that's otherwise left as it is.
+    Line(Box<LineStep>),
     /// A template call; the template's guards only apply to this step.
     Call {
         template: String,
@@ -75,9 +77,12 @@ pub enum Step {
     Block(Block),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileStep {
     pub path: String,
+    /// `directory`: each file in the `from` directory is written at the same
+    /// place under `path`, as if it had its own step.
+    pub dir: bool,
     pub source: FileSource,
     /// Permission bits, default 644 (755 for content starting with `#!`).
     pub mode: Option<u32>,
@@ -94,6 +99,40 @@ pub struct FileStep {
     pub keep: bool,
     /// Where the step is written, so `--pull` can rewrite it.
     pub origin: FileOrigin,
+}
+
+/// `line "path" [sudo] [new] [keep] [base "path"] [match "start"]
+/// [before|after "start"] "text"`: the file has this line (compared ignoring
+/// spacing). With `match`, a line starting with that is this one, and is
+/// replaced. Missing, it's added: before the first other line starting with
+/// `before`, after the last starting with `after` (both ignoring
+/// indentation), or at the end; on the wrong side, it's moved. `--undo` puts
+/// back what taskpod changed, from the journal.
+#[derive(Debug, Clone)]
+pub struct LineStep {
+    pub path: String,
+    pub text: String,
+    pub place: Option<LinePlace>,
+    /// A file on the target machine to start from when the file is missing,
+    /// like an override of a vendor file. `--undo` deletes the file once it's
+    /// the same as the base again.
+    pub base: Option<String>,
+    /// `match "start"`: a line starting with this (ignoring indentation)
+    /// counts as this step's line, and is replaced by the text.
+    pub matcher: Option<String>,
+    /// `new`: with no journal record, `--undo` takes it that taskpod added
+    /// the line (and created the file, if it has a base).
+    pub new: bool,
+    /// Read and write as root; the file keeps its owner and mode.
+    pub sudo: bool,
+    /// `--undo` leaves the line in.
+    pub keep: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum LinePlace {
+    Before(String),
+    After(String),
 }
 
 /// Positions in the task file of a file step's parts.
@@ -242,7 +281,7 @@ impl Encoding {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum FileSource {
     Inline(String),
     /// Copy of a file. Relative paths are relative to the file that uses them.
@@ -274,7 +313,9 @@ impl Step {
         match self {
             Step::Run(script) => script.clone(),
             Step::Undo(script) => format!("undo {script}"),
+            Step::File(file) if file.dir => format!("directory {}", file.path),
             Step::File(file) => format!("file {}", file.path),
+            Step::Line(line) => format!("line {}", line.path),
             Step::Call { template, args } => format!("{template} {args}").trim().to_string(),
             Step::Block(block) => block
                 .guards

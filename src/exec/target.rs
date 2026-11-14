@@ -72,6 +72,54 @@ fn read_remote(remote: &Remote, path: &Path, sudo: bool) -> Result<Current> {
     })
 }
 
+/// The files under a directory (through symlinks), as paths relative to it
+/// joined with `/`, sorted; empty if there's no directory. With `sudo`, a
+/// directory the user can't list is listed as root.
+pub fn list(ctx: &Ctx, task: &str, dir: &Path, sudo: bool) -> Result<Vec<String>> {
+    let script = "[ -d \"$1\" ] || exit 0\ncd -- \"$1\" && find -L . -type f";
+    let run = |root: bool| -> Result<std::process::Output> {
+        let dir = arg(dir);
+        match &ctx.remote {
+            Some(remote) => {
+                let sh = if root { "sudo sh" } else { "sh" };
+                let script = format!("{sh} -c {} sh {}", quote(script), quote(&dir));
+                remote.output(&script, &[])
+            }
+            None => {
+                let mut command = if root {
+                    let mut c = std::process::Command::new("sudo");
+                    c.arg("sh");
+                    c
+                } else {
+                    std::process::Command::new("sh")
+                };
+                command
+                    .args(["-c", script, "sh"])
+                    .arg(dir)
+                    .stdin(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output()
+                    .context("failed to list files")
+            }
+        }
+    };
+    let mut output = run(false)?;
+    if !output.status.success() && sudo {
+        sudo::ensure(task, ctx)?;
+        output = run(true)?;
+    }
+    if !output.status.success() {
+        bail!("couldn't list the files in {}", dir.display());
+    }
+    let mut names: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("./"))
+        .map(String::from)
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
 /// Prints the octal mode and `user:group` of `$1`, with GNU (Linux, busybox)
 /// or BSD (macOS) `stat`. Through symlinks, since writes go through them too.
 const STAT: &str = r#"if stat -c %a / >/dev/null 2>&1; then

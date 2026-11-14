@@ -290,8 +290,12 @@ impl<'s> Parser<'s> {
                     self.end_of_line()?;
                     body.block.keep = true;
                 }
-                "file" => {
-                    let file = self.file_step()?;
+                "line" => {
+                    let line = self.line_step()?;
+                    body.block.steps.push(Step::Line(Box::new(line)));
+                }
+                "file" | "directory" => {
+                    let file = self.file_step(keyword == "directory")?;
                     body.block.steps.push(Step::File(Box::new(file)));
                 }
                 _ => {
@@ -483,8 +487,9 @@ impl<'s> Parser<'s> {
         Ok(command)
     }
 
-    /// `file "path" [mode 755] [owner user:group] [encoding utf-16le] [sudo] ("content" | from "path")`
-    fn file_step(&mut self) -> Result<FileStep> {
+    /// `file "path" [mode 755] [owner user:group] [encoding utf-16le] [sudo] ("content" | from "path")`,
+    /// or `directory "path" ... from "dir"` for every file in a directory.
+    fn file_step(&mut self, dir: bool) -> Result<FileStep> {
         let path = self.string()?;
         let mut origin = FileOrigin {
             file: self.path.clone(),
@@ -573,10 +578,17 @@ impl<'s> Parser<'s> {
                 }
             }
         };
+        if dir && let FileSource::Inline(_) = source {
+            return Err(self.error_at(
+                origin.after_path,
+                "a directory is copied `from` one, like `directory \"/etc/app\" from \"files/app\"`",
+            ));
+        }
         self.end_of_line()?;
         let raw = encoding.is_none() && matches!(source, FileSource::Copy(_));
         Ok(FileStep {
             path,
+            dir,
             source,
             mode,
             owner,
@@ -591,6 +603,68 @@ impl<'s> Parser<'s> {
             keep,
             origin,
         })
+    }
+
+    /// `line "path" [sudo] [new] [keep] [base "path"] [match "start"] [before "start" | after "start"] "text"`
+    fn line_step(&mut self) -> Result<LineStep> {
+        let path = self.string()?;
+        let mut step = LineStep {
+            path,
+            text: String::new(),
+            place: None,
+            base: None,
+            matcher: None,
+            new: false,
+            sudo: false,
+            keep: false,
+        };
+        loop {
+            self.skip_inline_ws();
+            if let Some('"' | '\'') = self.peek() {
+                let start = self.pos;
+                step.text = self.string()?;
+                if step.text.contains('\n') {
+                    return Err(self.error_at(start, "a line can't have a newline in it"));
+                }
+                if step.text.trim().is_empty() {
+                    return Err(self.error_at(start, "the line is empty"));
+                }
+                break;
+            }
+            let start = self.pos;
+            match self
+                .word("the line, 'before', 'after', 'match', 'base', 'sudo', 'new' or 'keep'")?
+                .as_str()
+            {
+                "sudo" => step.sudo = true,
+                "keep" => step.keep = true,
+                "base" => step.base = Some(self.string()?),
+                "new" => step.new = true,
+                "match" => {
+                    let prefix = self.string()?;
+                    if prefix.trim().is_empty() {
+                        return Err(self.error_at(start, "'match' needs the start of a line"));
+                    }
+                    step.matcher = Some(prefix);
+                }
+                word @ ("before" | "after") => {
+                    if step.place.is_some() {
+                        return Err(self.error_at(start, "only one of 'before' or 'after'"));
+                    }
+                    let prefix = self.string()?;
+                    step.place = Some(if word == "before" {
+                        LinePlace::Before(prefix)
+                    } else {
+                        LinePlace::After(prefix)
+                    });
+                }
+                other => {
+                    return Err(self.error_at(start, format!("unexpected '{other}' in line step")));
+                }
+            }
+        }
+        self.end_of_line()?;
+        Ok(step)
     }
 
     /// The source from `start` to here.
@@ -905,6 +979,8 @@ fn is_keyword(word: &str) -> bool {
             | "undo"
             | "keep"
             | "file"
+            | "directory"
+            | "line"
     )
 }
 

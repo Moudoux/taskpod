@@ -112,3 +112,15 @@ test("highlights undo", async () => {
   expect(scopeOf(tokens, "        systemctl disable --now app")).toContain("meta.embedded.block.shell");
   expect(tokens.some(([, s]) => s.includes("entity.name.function.call"))).toBe(false);
 });
+
+test("highlights directory and line steps", async () => {
+  const tokenize = await tokenizer();
+  const tokens = tokenize(`task app {
+    directory "/etc/app" sudo from "files/app"
+    line "/etc/pam.d/sudo" sudo before "auth" "auth sufficient x"
+}`);
+  expect(scopeOf(tokens, "directory")).toContain("keyword.other.file");
+  expect(scopeOf(tokens, "line")).toContain("keyword.other.file");
+  expect(scopeOf(tokens, "before")).toContain("keyword.other.taskpod");
+  expect(tokens.some(([, s]) => s.includes("entity.name.function.call"))).toBe(false);
+});

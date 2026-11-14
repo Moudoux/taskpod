@@ -29,6 +29,7 @@ task apps {
         fi
     }
     file "/etc/x" sudo from "files/x"
+    directory "/etc/d" from "files/d"
     file "~/y" """
         text {{ name }}
         """
@@ -47,7 +48,7 @@ test("indexes definitions", () => {
   expect(apps.desc).toBe("Apps for {{ name }}");
   expect(apps.needs).toEqual(["yay"]);
   expect(apps.line).toBe(14);
-  expect(apps.endLine).toBe(31);
+  expect(apps.endLine).toBe(32);
   expect(index.tasks.find((t) => t.name === "after")!.parent).toBe("apps");
   expect(index.vars.map((v) => [v.name, v.owner])).toEqual([
     ["name", undefined],
@@ -67,8 +68,15 @@ test("indexes references and paths", () => {
     "include:other.task",
     "target:/etc/x",
     "from:files/x",
+    "target:/etc/d",
+    "from:files/d",
     "target:~/y",
   ]);
+});
+
+test("indexes line steps' paths on the system", () => {
+  const index = parse('task t {\n    line "/etc/pam.d/kde" sudo base "/usr/lib/pam.d/kde" "x"\n}\n');
+  expect(index.paths.map((p) => `${p.kind}:${p.path}`)).toEqual(["target:/etc/pam.d/kde", "target:/usr/lib/pam.d/kde"]);
 });
 
 test("tracks line context", () => {
@@ -77,9 +85,9 @@ test("tracks line context", () => {
   expect(index.lines[18].context).toBe("body");
   expect(index.lines[18].owner).toBe("apps");
   expect(index.lines[24].context).toBe("shell");
-  expect(index.lines[29].context).toBe("string");
-  expect(index.lines[33].owner).toBeUndefined();
-  expect(index.lines[34].owner).toBe("after");
+  expect(index.lines[30].context).toBe("string");
+  expect(index.lines[34].owner).toBeUndefined();
+  expect(index.lines[35].owner).toBe("after");
 });
 
 test("finds symbols and resolves variables", () => {

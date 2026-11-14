@@ -3,10 +3,10 @@
 use super::journal::{self, Entry, Previous};
 use super::target::{self, Current, describe};
 use super::{Mode, Outcome, Runner, StepKind, StepRecord, TaskReport, pull, sudo};
-use crate::ast::{Block, Encoding, FileSource, FileStep, Guard, Step, Task};
+use crate::ast::{Block, Encoding, FileSource, FileStep, Guard, LinePlace, LineStep, Step, Task};
 use crate::parser::guard_passes;
 use crate::ui::{self, TaskLine, ui};
-use crate::vars::{Scope, Vars, expand_tilde};
+use crate::vars::{Ctx, Scope, Vars, expand_tilde};
 use anyhow::{Context, Result, anyhow, bail};
 use console::style;
 use std::io::{BufRead, BufReader, Read};
@@ -270,6 +270,7 @@ impl<'r> TaskRun<'r> {
             // Only `--undo` runs these, see `undo_block`.
             Step::Undo(_) => Ok(()),
             Step::File(file) => self.file(file, scope, depth),
+            Step::Line(line) => self.line(line, scope, depth),
             Step::Call { template, args } => {
                 let template = &self.runner.file.templates[template];
                 let args = scope.expand(args)?;
@@ -431,6 +432,9 @@ impl<'r> TaskRun<'r> {
     }
 
     fn file(&mut self, file: &FileStep, scope: &Scope, depth: usize) -> Result<()> {
+        if file.dir {
+            return self.dir(file, scope, depth);
+        }
         let ctx = &self.runner.file.ctx;
         let path = PathBuf::from(ctx.target_path(&scope.expand(&file.path)?));
         let path = if path.is_absolute() {
@@ -512,6 +516,422 @@ impl<'r> TaskRun<'r> {
                 .with_context(|| format!("failed to write {shown}"))
             }
         }
+    }
+
+    /// `directory "path" from "dir"`: a file step for each file in the
+    /// source directory, at the same place under the step's path. Files on
+    /// the system that the source doesn't have are left alone.
+    fn dir(&mut self, file: &FileStep, scope: &Scope, depth: usize) -> Result<()> {
+        let FileSource::Copy(source) = &file.source else {
+            bail!("directory {}: needs `from` a directory", file.path);
+        };
+        let join = |base: &str, name: &str| format!("{}/{name}", base.trim_end_matches('/'));
+        let dir = copy_source(source, scope, &self.runner.file.ctx.dir)?;
+        let mut names = Vec::new();
+        list_files(&dir, "", &mut names)
+            .with_context(|| format!("failed to list {}", dir.display()))?;
+        if names.is_empty() {
+            bail!("{} has no files to copy", dir.display());
+        }
+        for name in &names {
+            // The names are literal text: escape `{{` so it isn't expanded.
+            let name = name.replace("{{", "\\{{");
+            let step = FileStep {
+                path: join(&file.path, &name),
+                dir: false,
+                source: FileSource::Copy(join(source, &name)),
+                ..file.clone()
+            };
+            self.file(&step, scope, depth)?;
+        }
+        if self.runner.opts.pull {
+            self.pull_new_files(file, scope, depth, &dir, &names)?;
+        }
+        Ok(())
+    }
+
+    /// `--pull` for a directory: files on the system that the source
+    /// directory doesn't have are copied into it.
+    fn pull_new_files(
+        &mut self,
+        file: &FileStep,
+        scope: &Scope,
+        depth: usize,
+        source: &Path,
+        names: &[String],
+    ) -> Result<()> {
+        let ctx = &self.runner.file.ctx;
+        let task = self.task.name.clone();
+        let dir = PathBuf::from(ctx.target_path(&scope.expand(&file.path)?));
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
+            self.cwd.join(dir)
+        };
+        let as_root = self.mode() == Mode::Run && file.sudo;
+        let system = match target::list(ctx, &task, &dir, as_root) {
+            Ok(system) => system,
+            Err(e) => {
+                let hint = if file.sudo {
+                    ""
+                } else {
+                    ", add `sudo` to list it as root"
+                };
+                let text = format!("directory {} · {e:#}{hint}", dir.display());
+                self.record(depth, StepKind::Change, &text);
+                self.push(depth, ui::change(&text));
+                return Ok(());
+            }
+        };
+        for name in system.iter().filter(|n| !names.contains(n)) {
+            let path = dir.join(name);
+            let target = source.join(name);
+            let label = format!("file {} · only on the system", path.display());
+            let refuse = |this: &mut Self, why: &str| {
+                this.changed = true;
+                this.record(depth, StepKind::Change, &label);
+                this.push(depth, ui::change(&label));
+                let note = style(format!("not pulled: {why}")).yellow().to_string();
+                this.record_diff(depth + 1, std::slice::from_ref(&note));
+                this.push(depth + 1, note);
+            };
+            let bytes = match target::read(ctx, &task, &path, as_root)? {
+                Current::Content(bytes) => bytes,
+                _ => {
+                    refuse(self, "can't read it");
+                    continue;
+                }
+            };
+            let bytes = if file.raw {
+                bytes
+            } else {
+                match file.encoding.decode(&bytes) {
+                    Some(text) => text.into_bytes(),
+                    None => {
+                        refuse(self, &format!("it isn't valid {}", file.encoding.name()));
+                        continue;
+                    }
+                }
+            };
+            if std::str::from_utf8(&bytes).is_ok_and(pull::has_secret) {
+                refuse(self, "it holds a secret value");
+                continue;
+            }
+            let label = format!("{label}, new in {}", target.display());
+            self.change(depth, &label);
+            let shown = match self.mode() {
+                Mode::DryRun => Vec::new(),
+                Mode::Diff | Mode::Run => diff_lines(&[], &bytes, Encoding::Utf8),
+            };
+            let edit = pull::Edit::Copy {
+                file: target,
+                bytes,
+            };
+            self.offer_pull(depth, &label, shown, vec![edit])?;
+        }
+        Ok(())
+    }
+
+    /// `line`: put the line in place if it isn't, recording in the journal
+    /// what taskpod changed; with `--undo`, put that back. The rest of the
+    /// file, its mode and owner stay as they are.
+    fn line(&mut self, step: &LineStep, scope: &Scope, depth: usize) -> Result<()> {
+        let ctx = &self.runner.file.ctx;
+        let line = ResolvedLine::new(step, scope, ctx, &self.cwd)?;
+        let label = format!("line {}", line.path.display());
+        if self.runner.opts.undo {
+            if step.keep {
+                self.current(depth, &format!("{label} · kept"));
+                return Ok(());
+            }
+            return self.undo_line_step(step, &line, depth, &label);
+        }
+        let as_root = step.sudo && self.mode() == Mode::Run && !self.runner.opts.pull;
+        let Some((existing, base)) = self.read_line_files(step, &line, as_root, depth, &label)?
+        else {
+            return Ok(());
+        };
+        let old = match (&existing, &base) {
+            (Some(old), _) => old.clone(),
+            (None, Some(base)) => base.clone(),
+            (None, None) => match &line.base {
+                Some(b) => bail!(
+                    "{} doesn't exist, nor does its base {}",
+                    line.path.display(),
+                    b.display()
+                ),
+                None => bail!("{} doesn't exist", line.path.display()),
+            },
+        };
+        let text = &line.text;
+        let Some((new, change)) =
+            ensure_line(&old, text, line.matcher.as_deref(), line.place.as_ref())?
+        else {
+            self.current(depth, &format!("{label} · in the file"));
+            return Ok(());
+        };
+        if self.runner.opts.pull {
+            let text = format!("{label} · not as the step says, nothing to pull");
+            self.record(depth, StepKind::Ok, &text);
+            self.push(depth, ui::ok(&text));
+            return Ok(());
+        }
+        let mut what = match &change {
+            LineChange::Added => format!("adds {text:?}"),
+            LineChange::Replaced(was) => format!("replaces {was:?} with {text:?}"),
+            LineChange::Moved => match &line.place {
+                Some(LinePlace::Before(p)) => format!("moves {text:?} before {p:?}"),
+                Some(LinePlace::After(p)) => format!("moves {text:?} after {p:?}"),
+                None => format!("moves {text:?}"),
+            },
+        };
+        if existing.is_none() {
+            let base = step.base.as_deref().unwrap_or_default();
+            what = format!("new file from {base}, {what}");
+        }
+        self.change(depth, &format!("{label} · {what}"));
+        match self.mode() {
+            Mode::DryRun => Ok(()),
+            Mode::Diff => {
+                let old = existing.unwrap_or_default();
+                self.show_diff(depth, &old, &new);
+                Ok(())
+            }
+            Mode::Run => {
+                let task = self.task.name.clone();
+                let root = step.sudo;
+                // What taskpod changed, before changing it.
+                let recorded =
+                    journal::read_lines(ctx, &task, &line.path, root, root)?.unwrap_or_default();
+                let mut lines = if existing.is_none() {
+                    // Records of a file that's gone since are stale.
+                    journal::Lines {
+                        created: true,
+                        base: base.clone(),
+                        lines: Vec::new(),
+                    }
+                } else {
+                    recorded.clone()
+                };
+                let key = line.key();
+                match lines.lines.iter_mut().find(|l| l.key == key) {
+                    Some(record) => record.text = text.clone(),
+                    None => {
+                        let replaced = match &change {
+                            LineChange::Added => Some(None),
+                            LineChange::Replaced(was) => Some(Some(was.clone())),
+                            // It was there before taskpod, only in the wrong place.
+                            LineChange::Moved => None,
+                        };
+                        if let Some(replaced) = replaced {
+                            lines.lines.push(journal::LineRecord {
+                                key,
+                                text: text.clone(),
+                                replaced,
+                            });
+                        }
+                    }
+                }
+                if lines != recorded {
+                    journal::write_lines(ctx, &task, &line.path, root, &lines)?;
+                }
+                // A new file gets its base's mode and owner.
+                let from = if existing.is_some() {
+                    Some(&line.path)
+                } else {
+                    line.base.as_ref()
+                };
+                self.write_line_file(step, &line.path, from, &new)
+            }
+        }
+    }
+
+    /// The step's file and its base, as text; `None` (reported) if one can't be read.
+    #[allow(clippy::type_complexity)]
+    fn read_line_files(
+        &mut self,
+        step: &LineStep,
+        line: &ResolvedLine,
+        as_root: bool,
+        depth: usize,
+        label: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        let ctx = &self.runner.file.ctx;
+        let task = self.task.name.clone();
+        let mut contents = Vec::new();
+        for p in std::iter::once(&line.path).chain(&line.base) {
+            match read_text(ctx, &task, p, as_root)? {
+                Some(text) => contents.push(text),
+                None => {
+                    let hint = if step.sudo {
+                        ""
+                    } else {
+                        ", add `sudo` to read it as root"
+                    };
+                    let text = format!("{label} · can't read {}{hint}", p.display());
+                    self.record(depth, StepKind::Change, &text);
+                    self.push(depth, ui::change(&text));
+                    return Ok(None);
+                }
+            }
+        }
+        let existing = contents.remove(0);
+        Ok(Some((existing, contents.pop().flatten())))
+    }
+
+    /// Write a `line` step's file with the mode and owner of `from`.
+    fn write_line_file(
+        &self,
+        step: &LineStep,
+        path: &Path,
+        from: Option<&PathBuf>,
+        content: &str,
+    ) -> Result<()> {
+        let ctx = &self.runner.file.ctx;
+        let (mode, owner) = from
+            .and_then(|p| target::stat(ctx, p))
+            .ok_or_else(|| anyhow!("can't stat {}", path.display()))?;
+        // Written as root, `install` would make root the owner.
+        let owner = step.sudo.then_some(owner.as_str());
+        target::write(
+            ctx,
+            &self.task.name,
+            path,
+            content.as_bytes(),
+            mode,
+            owner,
+            step.sudo,
+        )
+        .with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    fn show_diff(&mut self, depth: usize, old: &str, new: &str) {
+        let lines = diff_lines(old.as_bytes(), new.as_bytes(), Encoding::Utf8);
+        self.record_diff(depth + 1, &lines);
+        for line in lines {
+            self.push(depth + 1, line);
+        }
+    }
+
+    /// `--undo` for a `line` step: take out the line taskpod wrote, or put
+    /// back the one it replaced, and delete a file taskpod created once
+    /// nothing else of taskpod's is in it.
+    fn undo_line_step(
+        &mut self,
+        step: &LineStep,
+        line: &ResolvedLine,
+        depth: usize,
+        label: &str,
+    ) -> Result<()> {
+        let ctx = &self.runner.file.ctx;
+        let task = self.task.name.clone();
+        let root = step.sudo;
+        let write = !self.checking();
+        let Some((existing, base)) =
+            self.read_line_files(step, line, write && root, depth, label)?
+        else {
+            return Ok(());
+        };
+        let Some(old) = existing else {
+            self.current(depth, &format!("{label} · no file, nothing to undo"));
+            return Ok(());
+        };
+        let journal = journal::read_lines(ctx, &task, &line.path, root, write && root)?;
+        let key = line.key();
+        let found = journal.as_ref().and_then(|j| j.get(&key)).cloned();
+        let record = match found {
+            Some(record) => record,
+            // A root-only journal in a check, or `new`: taskpod added the line.
+            None if journal.is_none() || step.new => journal::LineRecord {
+                key: key.clone(),
+                text: line.text.clone(),
+                replaced: None,
+            },
+            None => {
+                if find_line(&split_lines(&old).0, &line.text, line.matcher.as_deref()).is_some() {
+                    let text = format!(
+                        "{label}: no record that taskpod added the line; mark the step `new` if it did, or `keep`"
+                    );
+                    self.cannot(depth, &text);
+                } else {
+                    self.current(depth, &format!("{label} · not in the file"));
+                }
+                return Ok(());
+            }
+        };
+        let mut journal = journal.unwrap_or_default();
+        let had_record = journal.get(&key).is_some();
+        let forget = |runner: &Runner, journal: &mut journal::Lines, all: bool| -> Result<()> {
+            if !write {
+                return Ok(());
+            }
+            let before = journal.lines.len();
+            journal.lines.retain(|l| !all && l.key != key);
+            if journal.lines.len() == before {
+                return Ok(());
+            }
+            journal::write_lines(&runner.file.ctx, &task, &line.path, root, journal)
+        };
+        let Some((new, edited)) = undo_line(
+            &old,
+            &record.text,
+            line.matcher.as_deref(),
+            record.replaced.as_deref(),
+        ) else {
+            self.current(depth, &format!("{label} · already gone"));
+            return forget(self.runner, &mut journal, false);
+        };
+        // A file taskpod created goes with the last of its lines.
+        let others = journal.lines.iter().any(|l| l.key != key);
+        let created =
+            !others && (journal.created || (!had_record && step.new && line.base.is_some()));
+        let is_base =
+            |text: &str| journal.base.as_deref() == Some(text) || base.as_deref() == Some(text);
+        let delete = created && (is_base(&new) || line.base.is_none() && new.trim().is_empty());
+        let changed = edited || created && !delete;
+        let what = if delete {
+            "delete the file, taskpod created it".to_string()
+        } else if let Some(was) = &record.replaced {
+            format!("put back {was:?}")
+        } else {
+            format!("remove {:?}", record.text)
+        };
+        let note = if edited {
+            " · the line changed since taskpod wrote it"
+        } else if changed {
+            " · taskpod created the file, but it has other changes now, so it stays"
+        } else {
+            ""
+        };
+        self.change(depth, &format!("{label} · {what}{note}"));
+        match self.mode() {
+            Mode::DryRun => return Ok(()),
+            Mode::Diff => {
+                if !delete {
+                    self.show_diff(depth, &old, &new);
+                }
+                return Ok(());
+            }
+            Mode::Run => {}
+        }
+        if edited
+            && !self.runner.opts.yes
+            && !ui().confirm(&format!(
+                "The line in {} changed since taskpod wrote it. Undo it anyway?",
+                line.path.display()
+            ))?
+        {
+            self.push(depth + 1, style("not undone").dim().to_string());
+            return Ok(());
+        }
+        if delete {
+            target::remove(ctx, &task, &line.path, root)
+                .with_context(|| format!("failed to undo {}", line.path.display()))?;
+        } else {
+            self.write_line_file(step, &line.path, Some(&line.path), &new)
+                .with_context(|| format!("failed to undo {}", line.path.display()))?;
+        }
+        forget(self.runner, &mut journal, delete || created)
     }
 
     /// Before the first write to a file, record what it was, for `--undo`.
@@ -916,8 +1336,20 @@ impl<'r> TaskRun<'r> {
             Mode::DryRun => notes,
             Mode::Diff | Mode::Run => details.into_iter().chain(notes).collect(),
         };
+        self.offer_pull(depth, &label, shown, edits)
+    }
+
+    /// Show a pulled change, and when writing, queue its edits (after asking,
+    /// unless `--yes`). The change itself was already reported.
+    fn offer_pull(
+        &mut self,
+        depth: usize,
+        label: &str,
+        shown: Vec<String>,
+        edits: Vec<pull::Edit>,
+    ) -> Result<()> {
         self.record_diff(depth + 1, &shown);
-        if !write {
+        if self.mode() != Mode::Run {
             for line in shown {
                 self.push(depth + 1, line);
             }
@@ -929,7 +1361,7 @@ impl<'r> TaskRun<'r> {
             ui.line(format!(
                 "{} {}",
                 style(&self.task.name).bold(),
-                ui::change(&label)
+                ui::change(label)
             ));
             for line in &shown {
                 ui.line(format!("    {line}"));
@@ -951,6 +1383,48 @@ impl<'r> TaskRun<'r> {
             self.push(depth + 1, style("not pulled").dim().to_string());
         }
         Ok(())
+    }
+}
+
+/// A `line` step with its variables filled in.
+struct ResolvedLine {
+    path: PathBuf,
+    text: String,
+    matcher: Option<String>,
+    place: Option<LinePlace>,
+    base: Option<PathBuf>,
+}
+
+impl ResolvedLine {
+    fn new(step: &LineStep, scope: &Scope, ctx: &Ctx, cwd: &Path) -> Result<Self> {
+        let target_path = |p: &str| -> Result<PathBuf> {
+            let path = PathBuf::from(ctx.target_path(&scope.expand(p)?));
+            Ok(if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            })
+        };
+        Ok(ResolvedLine {
+            path: target_path(&step.path)?,
+            text: scope.expand(&step.text)?,
+            matcher: step
+                .matcher
+                .as_deref()
+                .map(|m| scope.expand(m))
+                .transpose()?,
+            place: match &step.place {
+                Some(LinePlace::Before(p)) => Some(LinePlace::Before(scope.expand(p)?)),
+                Some(LinePlace::After(p)) => Some(LinePlace::After(scope.expand(p)?)),
+                None => None,
+            },
+            base: step.base.as_deref().map(target_path).transpose()?,
+        })
+    }
+
+    /// The step's records in the journal: its `match`, or else its text.
+    fn key(&self) -> String {
+        self.matcher.clone().unwrap_or_else(|| self.text.clone())
     }
 }
 
@@ -1107,12 +1581,208 @@ fn copy_source(source: &str, scope: &Scope, dir: &Path) -> Result<PathBuf> {
     })
 }
 
+/// A text file on the target machine: `Some(None)` when it's missing, `None`
+/// when it can't be read.
+fn read_text(ctx: &Ctx, task: &str, path: &Path, as_root: bool) -> Result<Option<Option<String>>> {
+    let mut current = target::read(ctx, task, path, false)?;
+    if matches!(current, Current::Unreadable) && as_root {
+        current = target::read(ctx, task, path, true)?;
+    }
+    Ok(match current {
+        Current::Content(bytes) => {
+            Some(Some(String::from_utf8(bytes).map_err(|_| {
+                anyhow!("{} isn't UTF-8 text", path.display())
+            })?))
+        }
+        Current::Missing => Some(None),
+        Current::Unreadable => None,
+    })
+}
+
+/// Whether a line is `text`, ignoring differences in spacing (columns
+/// lined up with tabs or spaces) and line endings.
+fn same_line(line: &str, text: &str) -> bool {
+    line.split_whitespace().eq(text.split_whitespace())
+}
+
+/// What a `line` step changes in a file's text.
+#[derive(Debug, Clone, PartialEq)]
+enum LineChange {
+    Added,
+    /// A line found with `match` was replaced: what it was.
+    Replaced(String),
+    /// It was on the wrong side of the `before` or `after` line.
+    Moved,
+}
+
+/// The lines of `text` with their endings, and the ending new lines get.
+fn split_lines(text: &str) -> (Vec<String>, &'static str) {
+    let ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    (
+        text.split_inclusive('\n').map(String::from).collect(),
+        ending,
+    )
+}
+
+fn starts_with(line: &str, prefix: &str) -> bool {
+    line.trim_start().starts_with(prefix)
+}
+
+/// A line's ending, `""` for a last line without one.
+fn ending_of(line: &str) -> &'static str {
+    if line.ends_with("\r\n") {
+        "\r\n"
+    } else if line.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    }
+}
+
+/// The index of the step's line: one that's `text`, or else one starting with
+/// `matcher`, with whether it's exactly the text.
+fn find_line(lines: &[String], text: &str, matcher: Option<&str>) -> Option<(usize, bool)> {
+    lines
+        .iter()
+        .position(|l| same_line(l, text))
+        .map(|i| (i, true))
+        .or_else(|| {
+            let m = matcher?;
+            lines
+                .iter()
+                .position(|l| starts_with(l, m))
+                .map(|i| (i, false))
+        })
+}
+
+/// Where a line goes by `place`, not counting the line at `skip`: `None`
+/// without a place, an error if no line starts with the prefix.
+fn line_anchor(
+    lines: &[String],
+    place: Option<&LinePlace>,
+    skip: Option<usize>,
+) -> Option<Result<usize>> {
+    let others = || (0..lines.len()).filter(move |&j| Some(j) != skip);
+    Some(match place? {
+        LinePlace::Before(prefix) => others()
+            .find(|&j| starts_with(&lines[j], prefix))
+            .ok_or_else(|| anyhow!("no line starts with {prefix:?} to put it before")),
+        LinePlace::After(prefix) => others()
+            .rfind(|&j| starts_with(&lines[j], prefix))
+            .map(|j| j + 1)
+            .ok_or_else(|| anyhow!("no line starts with {prefix:?} to put it after")),
+    })
+}
+
+/// Insert `line` (which ends in a newline) at `at`, giving the line before
+/// it a newline if it's a last line without one.
+fn insert_line(lines: &mut Vec<String>, at: usize, line: String, ending: &str) {
+    if at > 0 && ending_of(&lines[at - 1]).is_empty() {
+        lines[at - 1].push_str(ending);
+    }
+    lines.insert(at, line);
+}
+
+/// `old` with the step's line where it should be, and what changed; `None`
+/// if it's there already.
+fn ensure_line(
+    old: &str,
+    text: &str,
+    matcher: Option<&str>,
+    place: Option<&LinePlace>,
+) -> Result<Option<(String, LineChange)>> {
+    let (mut lines, ending) = split_lines(old);
+    let mut change = None;
+    match find_line(&lines, text, matcher) {
+        Some((i, exact)) => {
+            if !exact {
+                let was = lines[i].trim_end_matches(['\r', '\n']).to_string();
+                lines[i] = format!("{text}{}", ending_of(&lines[i]));
+                change = Some(LineChange::Replaced(was));
+            }
+            // On the wrong side of its anchor, it moves. With no anchor
+            // (besides itself), it's fine where it is.
+            let wrong = match line_anchor(&lines, place, Some(i)) {
+                Some(Ok(at)) => match place {
+                    Some(LinePlace::Before(_)) => i > at,
+                    _ => i < at,
+                },
+                _ => false,
+            };
+            if wrong {
+                let mut line = lines.remove(i);
+                if ending_of(&line).is_empty() {
+                    line.push_str(ending);
+                }
+                let at = line_anchor(&lines, place, None).expect("a place")?;
+                insert_line(&mut lines, at, line, ending);
+                change.get_or_insert(LineChange::Moved);
+            }
+        }
+        None => {
+            let at = match line_anchor(&lines, place, None) {
+                Some(at) => at?,
+                None => lines.len(),
+            };
+            insert_line(&mut lines, at, format!("{text}{ending}"), ending);
+            change = Some(LineChange::Added);
+        }
+    }
+    Ok(change.map(|c| (lines.concat(), c)))
+}
+
+/// `old` with the line taskpod wrote taken out, or the line it replaced put
+/// back; `None` if it isn't there. `true` when it was only found by `matcher`,
+/// so it changed since taskpod wrote it.
+fn undo_line(
+    old: &str,
+    written: &str,
+    matcher: Option<&str>,
+    replaced: Option<&str>,
+) -> Option<(String, bool)> {
+    let (mut lines, _) = split_lines(old);
+    let (i, exact) = find_line(&lines, written, matcher)?;
+    match replaced {
+        Some(was) => lines[i] = format!("{was}{}", ending_of(&lines[i])),
+        None => {
+            lines.remove(i);
+        }
+    }
+    Some((lines.concat(), !exact))
+}
+
+/// The files under `dir`, as paths relative to it joined with `/`, sorted.
+fn list_files(dir: &Path, prefix: &str, names: &mut Vec<String>) -> Result<()> {
+    let mut entries = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            bail!("{} isn't a UTF-8 name", entry.path().display());
+        };
+        let name = format!("{prefix}{name}");
+        // Through symlinks, like the file steps themselves.
+        if std::fs::metadata(entry.path())?.is_dir() {
+            list_files(&entry.path(), &format!("{name}/"), names)?;
+        } else {
+            names.push(name);
+        }
+    }
+    Ok(())
+}
+
 /// The bytes a file step writes.
 fn file_content(file: &FileStep, scope: &Scope, dir: &Path) -> Result<Vec<u8>> {
     match &file.source {
         FileSource::Inline(text) => file.encoding.encode(&scope.expand(text)?),
         FileSource::Copy(source) => {
             let source = copy_source(source, scope, dir)?;
+            if source.is_dir() {
+                bail!(
+                    "{} is a directory, copy it with `directory` instead of `file`",
+                    source.display()
+                );
+            }
             let bytes = std::fs::read(&source)
                 .with_context(|| format!("failed to read {}", source.display()))?;
             if file.raw {
