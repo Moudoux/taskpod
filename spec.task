@@ -1,35 +1,88 @@
-# A task can have any name
-task main {
-    description "An optional description of a task";
-    # There are three types of conditions: shell, exists, ask
-    # They can all be appended with a bang (!) to negate their output
-    # All conditions must pass for the task to run
-    condition exists "{{ pwd }}/spec.task";
-    # The commands that this task will run
-    run [
-        echo "Hello main!",
-        echo "This is a second shell command"
-    ];
-}
+# Taskpod task file reference. Every statement fits on one line; end a line
+# with \ to continue it on the next. Comments start with #.
+#
+#   taskpod spec.task          run every task that isn't manual
+#   taskpod spec.task -d       dry run: show what would run, change nothing
+#   taskpod spec.task -r hello run one task, and the tasks it needs
+#   taskpod spec.task -l       list tasks
 
-task print-user {
-    # Variables are defined per task, they can also be defined globally
-    variables [
-        "user" : "Test user"
-    ];
-    # All strings can be templated using {{ }} syntax
-    run echo "Hello {{ user }}";
+# Variables. Use them anywhere with {{ name }}. Strings in "double quotes"
+# understand \n, \t, \" and \; 'single quotes' are taken as written.
+let greeting = "Hello"
+let today = $(date +%A)        # shell output, run once when first used
+# Built in: {{ home }}, {{ user }}, {{ pwd }} and {{ dir }} (this file's
+# directory). Unknown names fall back to environment variables: {{ HOME }}.
+
+# Load KEY=value lines as variables, also exported to every command:
+#   env ".env"
+# Merge another file, paths are relative to this one; `if`/`unless` optional:
+#   include "desktop.task" if pacman -Q plasma-workspace
+# Commands run with `sh -ec` by default, change it with:
+#   shell "bash -eo pipefail -c"
+
+task main {
+    desc "{{ greeting }} on a {{ today }}"   # shown when the task runs
+    # Each `run` is a shell command, passed to the shell as written.
+    run echo "Hello main!"
+    # A block runs as one script, so `cd` and shell variables carry over.
+    run {
+        cd /tmp
+        name=$(whoami)
+        echo "Hello $name from $(pwd)"
+    }
 }
 
 task hello {
-    # A task can depend on other tasks that must be evaluated
-    # before this task is ran (this does not mean the dependent task must be ran)
-    depends main;
-    run echo "Hello";
+    # Run after these tasks. They run either way (unless skipped by a guard),
+    # but if one fails, this task doesn't run.
+    needs main
+    # Guards, all must pass for the task to run:
+    #   if <command>       run only if the command succeeds
+    #   unless <command>   skip if the command succeeds
+    #   ask "Question?"    ask first (a dry run assumes yes)
+    if test -d /tmp
+    unless test -e /tmp/taskpod-never-exists
+    run echo "Hello"
 }
 
-# Subtasks are tasks that run after their parent task has ran
-# They can be configured as any normal task
+# Subtasks run after their parent, and only if the parent changed something:
+# not when it was skipped or everything in it was already up to date.
 subtask world of hello {
-    run echo "world";
+    run echo "world"
 }
+
+# Templates are reusable steps. Call one with words after its name: inside
+# the template, {{ args }} is all of them and {{ 1 }}, {{ 2 }}, ... each one.
+# A template's guards only apply to that call, so a task can mix calls that
+# are already done with ones that still need to run.
+template note {
+    unless test -e /tmp/taskpod-{{ 1 }}
+    run echo "{{ args }}"
+}
+
+task notes {
+    note first one
+    note second
+}
+
+task setup {
+    manual                     # only runs with -r, or when another task needs it
+    workdir "/tmp"             # where commands run, default: this file's directory
+    let where = "{{ home }}"   # variables can be per task
+    # Files are written only when their content or mode differs. Mode is 644,
+    # or 755 for content starting with #!. Add `sudo` to write as root.
+    file "/tmp/taskpod-example/hello.sh" """
+        #!/bin/sh
+        echo "hello from {{ where }}"
+        """
+    file "/tmp/taskpod-example/copy.task" mode 600 from "spec.task"
+    run /tmp/taskpod-example/hello.sh
+}
+
+# More directives:
+#   lock name     tasks holding the same lock never run at the same time,
+#                 e.g. `lock pacman` for package installs
+#   sudo          ask for sudo before running; commands mentioning sudo do this
+#                 automatically, so parallel tasks never prompt at once
+#   interactive   this task gets the terminal: nothing else runs alongside it,
+#                 and its commands can ask questions

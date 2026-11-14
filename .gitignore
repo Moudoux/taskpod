@@ -1,5 +1,12 @@
 /target
 taskpod*
-/arch
 .env
 test*
+
+# My system config, see README
+/arch.task
+
+# makepkg output (see arch/PKGBUILD)
+arch/pkg/
+arch/src/
+arch/*.pkg.tar.*

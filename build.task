@@ -1,36 +1,35 @@
-variables [
-    "name" : "taskpod",
-    "version" : shell awk -F'"' '/^version *=/ {print $2; exit}' Cargo.toml
-];
+let name = "taskpod"
+let version = $(awk -F'"' '/^version *=/ {print $2; exit}' Cargo.toml)
 
-invoked task lint {
-    description "Lint {{ name }}";
-    run [
-        cargo fmt,
-        cargo clippy --fix --allow-dirty
-    ];
+task lint {
+    desc "Lint {{ name }}"
+    manual
+    run cargo fmt
+    run cargo clippy --all-targets --fix --allow-dirty
+}
+
+task test {
+    desc "Test {{ name }}"
+    manual
+    run cargo test
 }
 
 task release {
-    description "Build the release version of {{ name }} {{ version }}";
-    run [
-        cargo build --release,
-        cp "target/release/{{ name }}" "./{{ name }}"
-    ];
+    desc "Build {{ name }} {{ version }}"
+    run cargo build --release
+    run cp target/release/{{ name }} ./{{ name }}
 }
 
 task windows-release {
-    variables "target" : "x86_64-pc-windows-gnu";
-    description "Build the windows release version of {{ name }} {{ version }}";
-    run [
-        cargo build --release --target "{{ target }}",
-        cp "target/{{ target }}/release/{{ name }}.exe" "./{{ name }}.exe"
-    ];
+    desc "Build {{ name }} {{ version }} for Windows"
+    let target = "x86_64-pc-windows-gnu"
+    run cargo build --release --target {{ target }}
+    run cp target/{{ target }}/release/{{ name }}.exe ./{{ name }}.exe
 }
 
 task install {
-    description "Install {{ name }}";
-    depends release;
-    condition ask "Do you want to install {{ name }}?";
-    run sudo cp "./{{ name }}" "/usr/bin/{{ name }}";
+    desc "Install {{ name }} {{ version }} to /usr/local/bin"
+    needs release
+    ask "Install {{ name }} to /usr/local/bin?"
+    run sudo install -Dm755 ./{{ name }} /usr/local/bin/{{ name }}
 }
