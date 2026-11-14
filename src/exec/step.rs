@@ -449,6 +449,8 @@ fn diff_lines(old: &[u8], new: &[u8], encoding: Encoding) -> Vec<String> {
         );
         return vec![style(message).dim().to_string()];
     };
+    // The old content of a file that holds secrets may hold old secrets too.
+    let secret = ui::redact(&new_text) != new_text;
     let diff = similar::TextDiff::from_lines(&old_text, &new_text);
     let mut lines = Vec::new();
     for hunk in diff.unified_diff().context_radius(2).iter_hunks() {
@@ -456,11 +458,16 @@ fn diff_lines(old: &[u8], new: &[u8], encoding: Encoding) -> Vec<String> {
         for change in hunk.iter_changes() {
             let text = change.value().trim_end_matches('\n');
             lines.push(match change.tag() {
+                similar::ChangeTag::Delete if secret => style("-••••").red().to_string(),
                 similar::ChangeTag::Delete => style(format!("-{text}")).red().to_string(),
                 similar::ChangeTag::Insert => style(format!("+{text}")).green().to_string(),
                 similar::ChangeTag::Equal => style(format!(" {text}")).dim().to_string(),
             });
         }
+    }
+    if secret && !lines.is_empty() {
+        let note = "removed lines are hidden, this file holds secrets";
+        lines.insert(0, style(note).dim().to_string());
     }
     if lines.is_empty() {
         lines.push(
@@ -522,14 +529,31 @@ fn write_file(path: &Path, content: &[u8], mode: u32) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, content)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // Set the mode before writing, so content like secrets is never
+        // readable with looser permissions, even for a moment.
+        let permissions = || std::fs::Permissions::from_mode(mode);
+        if path.exists() {
+            std::fs::set_permissions(path, permissions())?;
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(path)?
+            .write_all(content)?;
+        // The umask may have removed bits from a new file.
+        std::fs::set_permissions(path, permissions())?;
     }
     #[cfg(not(unix))]
-    let _ = mode;
+    {
+        let _ = mode;
+        std::fs::write(path, content)?;
+    }
     Ok(())
 }
 

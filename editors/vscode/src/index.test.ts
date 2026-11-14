@@ -109,3 +109,9 @@ task c {
   expect(index.refs.filter((r) => r.kind === "template").map((r) => r.name)).toEqual(["pkg"]);
   expect(index.tasks[0].needs).toEqual(["b", "c"]);
 });
+
+test("indexes secrets files and secret references", () => {
+  const index = parse('secrets "secrets.yaml"\ntask t {\n    file "/etc/x" "{{ secrets.wifi.password }}"\n}\n');
+  expect(index.paths.map((p) => `${p.kind}:${p.path}`)).toEqual(["secrets:secrets.yaml", "target:/etc/x"]);
+  expect(index.refs.map((r) => `${r.kind}:${r.name}`)).toContain("var:secrets.wifi.password");
+});

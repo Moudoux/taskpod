@@ -98,6 +98,11 @@ impl<'s> Parser<'s> {
                     let path = self.resolve(&path);
                     load_env_file(&path, file).map_err(|e| self.error_at(start, e))?;
                 }
+                "secrets" => {
+                    let path = self.string()?;
+                    self.end_of_line()?;
+                    file.ctx.secrets.add(self.resolve(&path));
+                }
                 "include" => {
                     let path = self.string()?;
                     let guard = self.optional_guard()?;

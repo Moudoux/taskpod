@@ -40,6 +40,10 @@ pub struct Args {
     #[arg(long)]
     pub check: bool,
 
+    /// sops-encrypted file of secrets, used as {{ secrets.name }}. Can be given more than once
+    #[arg(long, value_name = "FILE")]
+    pub secrets: Vec<PathBuf>,
+
     /// Tasks to skip
     #[arg(short, long, num_args = 1..)]
     pub skip: Vec<String>,
@@ -73,7 +77,12 @@ fn main() -> ExitCode {
         Ok(false) => ExitCode::FAILURE,
         Err(error) => {
             ui().end();
-            eprintln!("{} {error:#}", style("error:").red().bold());
+            let error = format!("{error:#}");
+            eprintln!(
+                "{} {}",
+                style("error:").red().bold(),
+                taskpod::ui::redact(&error)
+            );
             ExitCode::FAILURE
         }
     }
@@ -81,7 +90,10 @@ fn main() -> ExitCode {
 
 fn run(mut args: Args) -> Result<bool> {
     let start = Instant::now();
-    let file = taskpod::parser::parse_file(&args.file)?;
+    let mut file = taskpod::parser::parse_file(&args.file)?;
+    for path in &args.secrets {
+        file.ctx.secrets.add(std::path::absolute(path)?);
+    }
 
     if args.check {
         println!("{} {} is valid", style("✓").green(), args.file.display());
@@ -115,12 +127,13 @@ fn run(mut args: Args) -> Result<bool> {
                 format!("[{}] ", tags.join(", "))
             };
             let name = format!("{:width$}", task.name);
-            println!(
+            let line = format!(
                 "{}  {}{}",
                 style(name).bold(),
                 style(tags).cyan(),
                 style(desc).dim()
             );
+            println!("{}", taskpod::ui::redact(&line));
         }
         return Ok(true);
     }

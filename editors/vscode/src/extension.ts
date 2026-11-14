@@ -136,6 +136,7 @@ class Provider
       if (symbol.kind === "var") {
         const def = resolveVar(index, symbol.name, position.line) ?? files.slice(1).flatMap((f) => f.index.vars).find((v) => v.name === symbol.name && !v.owner);
         if (def) markdown = `**${symbol.name}** = \`${def.value}\`${def.owner ? `\n\n_in ${def.owner}_` : ""}`;
+        else if (symbol.name.startsWith("secrets.")) markdown = `**${symbol.name}**: secret \`${symbol.name.slice(8)}\`, from a \`secrets\` file or \`--secrets\``;
         else if (BUILTIN_VARS[symbol.name]) markdown = `**${symbol.name}** (built in): ${BUILTIN_VARS[symbol.name]}`;
         else if (/^\d+$/.test(symbol.name)) markdown = `**${symbol.name}**: word ${symbol.name} of the template call's arguments.`;
         else if (process.env[symbol.name] !== undefined) markdown = `**${symbol.name}**: environment variable`;
@@ -329,7 +330,7 @@ function snippet(label: string, body: string, detail: string): vscode.Completion
 
 // ---- Diagnostics -------------------------------------------------------------
 
-const KNOWN_VAR = (name: string) => BUILTIN_VARS[name] !== undefined || /^\d+$/.test(name) || process.env[name] !== undefined;
+const KNOWN_VAR = (name: string) => name.startsWith("secrets.") || BUILTIN_VARS[name] !== undefined || /^\d+$/.test(name) || process.env[name] !== undefined;
 
 function lint(document: vscode.TextDocument): vscode.Diagnostic[] {
   const files = project(document);

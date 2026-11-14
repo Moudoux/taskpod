@@ -47,6 +47,13 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
     syntax: 'env ".env"',
     snippet: 'env "${1:.env}"',
   },
+  secrets: {
+    places: ["top"],
+    summary:
+      "Reads secrets from a sops-encrypted file (YAML, JSON, .env or INI), used as `{{ secrets.name }}`; nested keys join with dots: `{{ secrets.wifi.password }}`. Decrypted with `sops` when a secret is first used, and hidden from output. `taskpod --secrets FILE` adds files too.",
+    syntax: 'secrets "secrets.yaml"',
+    snippet: 'secrets "${1:secrets.yaml}"',
+  },
   include: {
     places: ["top"],
     summary:

@@ -42,8 +42,8 @@ export interface Ref extends Span {
 
 export interface PathRef extends Span {
   path: string;
-  /** include/env/from point at files next to the task file; target is where a file step writes. */
-  kind: "include" | "env" | "from" | "target";
+  /** include/env/secrets/from point at files next to the task file; target is where a file step writes. */
+  kind: "include" | "env" | "secrets" | "from" | "target";
 }
 
 export type Context = "top" | "body" | "shell" | "string";
@@ -228,7 +228,8 @@ export function parse(text: string): Index {
     const frame = top();
     switch (keyword) {
       case "include":
-      case "env": {
+      case "env":
+      case "secrets": {
         const path = strings(line)[0];
         if (path) index.paths.push({ path: path.value, kind: keyword, line: number, start: path.start, end: path.end });
         return;

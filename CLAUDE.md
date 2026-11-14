@@ -14,6 +14,8 @@ idempotent. Its main use is setting up an Arch system from
 - `src/ast.rs`: the parsed file, `link()` checks references and hoists template `needs` into tasks.
   File encodings live here too.
 - `src/vars.rs`: `{{ name }}` templating, scopes, lazy `$( )` and prompt variables, how commands are spawned.
+- `src/secrets.rs`: `{{ secrets.name }}` from sops files, decrypted on first use; `ui::redact`
+  hides the values from everything printed (lines, spinners, diffs, errors).
 - `src/exec/mod.rs`: task selection, the parallel scheduler (job slots, named locks,
   an RwLock so `interactive` tasks run alone), summaries. Modes: run, dry run (`-d`), diff (`-D`).
 - `src/exec/step.rs`: running steps: shell, files (content/mode/owner, diffs), template calls and inline blocks.

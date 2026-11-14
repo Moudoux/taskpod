@@ -8,10 +8,11 @@ use crate::vars::Prompt;
 use anyhow::{Result, bail};
 use console::{Style, style};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::Duration;
 
 const PREFIX_COLORS: [u8; 6] = [6, 5, 4, 3, 2, 14];
@@ -31,6 +32,40 @@ pub struct Ui {
 }
 
 static UI: OnceLock<Ui> = OnceLock::new();
+
+/// Secret values, longest first, hidden from everything taskpod prints.
+static REDACTIONS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+/// Shorter values aren't hidden, they'd match too much unrelated text.
+const MIN_REDACTED: usize = 4;
+const REDACTED: &str = "••••";
+
+/// Hide these values from output from now on. Multi-line values are also
+/// hidden line by line, since output and diffs are shown a line at a time.
+pub fn add_redactions<'a>(values: impl IntoIterator<Item = &'a String>) {
+    let mut list = REDACTIONS.write().unwrap_or_else(|e| e.into_inner());
+    for value in values {
+        let parts = std::iter::once(value.trim()).chain(value.lines().map(str::trim));
+        for part in parts {
+            if part.chars().count() >= MIN_REDACTED && !list.iter().any(|v| v == part) {
+                list.push(part.to_string());
+            }
+        }
+    }
+    list.sort_by_key(|v| std::cmp::Reverse(v.len()));
+}
+
+/// `text` with every secret value replaced by `••••`.
+pub fn redact(text: &str) -> Cow<'_, str> {
+    let list = REDACTIONS.read().unwrap_or_else(|e| e.into_inner());
+    if !list.iter().any(|v| text.contains(v.as_str())) {
+        return Cow::Borrowed(text);
+    }
+    let mut text = text.to_string();
+    for value in list.iter() {
+        text = text.replace(value.as_str(), REDACTED);
+    }
+    Cow::Owned(text)
+}
 
 pub fn init(verbose: bool, plain: bool) {
     if std::env::var_os("NO_COLOR").is_some() {
@@ -72,6 +107,7 @@ impl Ui {
 
     /// A permanent line, printed above the live display.
     pub fn line(&self, text: impl AsRef<str>) {
+        let text = redact(text.as_ref());
         if self.fancy {
             // Lines wider than the terminal would be dropped by the live
             // display, so those are printed with it paused.
@@ -79,7 +115,7 @@ impl Ui {
             if console::measure_text_width(text.as_ref()) >= width {
                 self.multi.suspend(|| eprintln!("{}", text.as_ref()));
             } else {
-                let _ = self.multi.println(text);
+                let _ = self.multi.println(text.as_ref());
             }
         } else {
             println!("{}", text.as_ref());
@@ -253,7 +289,7 @@ impl TaskLine {
     /// What the task is doing now.
     pub fn status(&self, message: &str) {
         match &self.bar {
-            Some(bar) => bar.set_message(message.to_string()),
+            Some(bar) => bar.set_message(redact(message).into_owned()),
             None => ui().output(&self.name, message),
         }
     }
@@ -267,7 +303,7 @@ impl TaskLine {
         if let Some(bar) = &self.bar
             && !line.trim().is_empty()
         {
-            bar.set_message(line.to_string());
+            bar.set_message(redact(line).into_owned());
         }
         let mut tail = self.tail.lock().unwrap_or_else(|e| e.into_inner());
         if tail.len() == TAIL {

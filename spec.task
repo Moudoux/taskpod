@@ -22,6 +22,12 @@ let today = $(date +%A)        # shell output, run once when first used
 
 # Load KEY=value lines as variables, also exported to every command:
 #   env ".env"
+# Secrets from a sops-encrypted file (YAML, JSON, .env or INI), used as
+# {{ secrets.name }}; nested keys join with dots: {{ secrets.wifi.password }}.
+# Decrypted with `sops` the first time a secret is used, so runs that don't
+# use one need no key. Values are hidden from output (shown as ••••), and
+# `taskpod FILE --secrets other.yaml` adds files from the command line:
+#   secrets "secrets.yaml"
 # Merge another file, paths are relative to this one; `if`/`unless` optional:
 #   include "desktop.task" if pacman -Q plasma-workspace
 # Commands run with `sh -ec` by default, change it with:

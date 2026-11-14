@@ -37,6 +37,7 @@ taskpod FILE -r a b        # run tasks a and b, and what they need
 taskpod FILE -i a          # what task a would do
 taskpod FILE -l            # list tasks
 taskpod FILE --check       # check the file for errors
+taskpod FILE --secrets s.yaml  # secrets for {{ secrets.name }}, see below
 taskpod FILE -s a          # skip task a
 taskpod FILE -j 4          # at most 4 tasks at once (default: one per CPU)
 taskpod FILE -v            # stream every command and its output
@@ -52,6 +53,64 @@ an overall progress bar; a failed task prints its last output. Questions
 `sudo` make taskpod authenticate once, through sudo itself so security keys
 work, and keep the credentials fresh, so parallel tasks never prompt at the
 same time. Tasks marked `interactive` run alone with the terminal.
+
+## Secrets
+
+Secrets live in a [sops](https://github.com/getsops/sops)-encrypted file,
+which is safe to commit next to your task files, and are used as
+`{{ secrets.name }}`:
+
+```sh
+secrets "secrets.yaml"     # or: taskpod main.task --secrets secrets.yaml
+
+task wifi {
+    file "/etc/iwd/home.psk" mode 600 sudo """
+        [Security]
+        Passphrase={{ secrets.wifi.password }}
+        """
+}
+```
+
+Nested keys join with dots. Taskpod runs `sops` the first time a secret is
+used, so tasks that don't use secrets, `--check` and `--list` need no key, and
+a task that installs sops can run first. Decrypted values stay in memory and
+are shown as `••••` in everything taskpod prints, including diffs. Output of
+`interactive` tasks goes straight to the terminal and isn't hidden.
+
+To set it up with an [age](https://github.com/FiloSottile/age) key:
+
+```sh
+sudo pacman -S sops age
+mkdir -p ~/.config/sops/age
+age-keygen -o ~/.config/sops/age/keys.txt   # back this file up somewhere safe
+# Tell sops which key encrypts files here, using the public key age-keygen printed:
+printf 'creation_rules:\n  - age: age1...\n' > .sops.yaml
+sops secrets.yaml                           # opens your editor, saves encrypted
+```
+
+Or keep the key on a security key, so decrypting needs the key, its PIN and
+a touch (asked once per run). Which age plugin depends on the key:
+`ykman info` shows whether it has PIV.
+
+- Any FIDO2 key, such as a YubiKey Security Key:
+  [age-plugin-fido2-hmac](https://github.com/olastor/age-plugin-fido2-hmac)
+  (`yay -S age-plugin-fido2-hmac`). `age-plugin-fido2-hmac -g` prints an
+  `age1fido2-hmac1...` recipient; put the identity it prints, or
+  `age-plugin-fido2-hmac -m` if you chose no separate identity, in
+  `~/.config/sops/age/keys.txt`.
+- A YubiKey with PIV (YubiKey 5):
+  [age-plugin-yubikey](https://github.com/str4d/age-plugin-yubikey)
+  (`pacman -S age-plugin-yubikey`). `age-plugin-yubikey` creates the key and
+  prints an `age1yubikey1...` recipient, and
+  `age-plugin-yubikey --identity >> ~/.config/sops/age/keys.txt` sets up sops.
+
+Then use the recipient in `.sops.yaml`. Add a second
+recipient as a backup, a spare YubiKey or a plain age key kept offline,
+separated by commas: losing the only key means losing the secrets.
+
+A secret used inside a `run` command is part of that command line, which
+other users on the machine can see while it runs; writing it into a file
+with `file ... mode 600` avoids that.
 
 ## Install
 

@@ -72,6 +72,8 @@ pub struct Ctx {
     pub dir: PathBuf,
     /// Extra environment variables for commands (from `env` files).
     pub exports: Vec<(String, String)>,
+    /// `{{ secrets.name }}` values, decrypted when first used.
+    pub secrets: crate::secrets::Secrets,
 }
 
 impl Ctx {
@@ -80,6 +82,7 @@ impl Ctx {
             shell: default_shell(),
             dir,
             exports: Vec::new(),
+            secrets: Default::default(),
         }
     }
 
@@ -209,6 +212,9 @@ impl<'a> Scope<'a> {
     }
 
     fn lookup(&self, name: &str, depth: usize) -> Result<String> {
+        if let Some(secret) = name.strip_prefix(crate::secrets::PREFIX) {
+            return self.ctx.secrets.get(secret).map_err(|e| anyhow!(e));
+        }
         let mut scope = Some(self);
         while let Some(current) = scope {
             if let Some(var) = current.vars.get(name) {

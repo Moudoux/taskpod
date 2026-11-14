@@ -277,3 +277,56 @@ fn diff_mode_and_encodings() {
     .unwrap();
     assert_eq!(run(source, dir.path(), &diff, &[])["files"], Outcome::Ran);
 }
+
+#[cfg(unix)]
+#[test]
+fn secrets_fill_files_and_commands() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    // A fake sops that prints the "encrypted" file as is.
+    let fake = dir.path().join("fake-sops");
+    std::fs::write(&fake, "#!/bin/sh\ncat \"$4\"\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        dir.path().join("secrets.json"),
+        r#"{"wifi": {"password": "hunter2-wifi"}, "token": "tok-123456"}"#,
+    )
+    .unwrap();
+    let source = r#"
+        secrets "secrets.json"
+        task conf {
+            file "wifi.conf" mode 600 "psk={{ secrets.wifi.password }}\n"
+            run echo "{{ secrets.token }}" > token
+        }
+        task missing {
+            manual
+            run echo "{{ secrets.nope }}"
+        }
+    "#;
+    let mut file = parse_str(source, dir.path()).unwrap();
+    file.ctx.secrets.set_program(fake.display().to_string());
+    let opts = options(2);
+    let runner = Runner::new(&file, &opts);
+    let outcomes: HashMap<_, _> = runner
+        .run(&select(&file, &[]).unwrap())
+        .into_iter()
+        .collect();
+    assert_eq!(outcomes["conf"], Outcome::Ran);
+    assert_eq!(read(dir.path(), "wifi.conf"), "psk=hunter2-wifi\n");
+    assert_eq!(read(dir.path(), "token").trim(), "tok-123456");
+    // Loaded secrets are hidden from output.
+    assert_eq!(
+        crate::ui::redact("psk=hunter2-wifi and tok-123456"),
+        "psk=•••• and ••••"
+    );
+
+    let outcomes: HashMap<_, _> = runner
+        .run(&select(&file, &["missing".into()]).unwrap())
+        .into_iter()
+        .collect();
+    assert!(
+        matches!(&outcomes["missing"], Outcome::Failed(e) if e.contains("no secret 'nope'")),
+        "{:?}",
+        outcomes["missing"]
+    );
+}
