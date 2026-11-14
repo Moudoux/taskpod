@@ -1,7 +1,8 @@
 /target
-taskpod*
+/taskpod
+/taskpod.exe
 .env
-test*
+/test*
 
 # My system config, see README
 /arch.task
