@@ -51,6 +51,7 @@ idempotent. Its main use is setting up an Arch system from
 cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 cargo run -- spec.task -D          # try the example file
 cd editors/vscode && bun install && bun test && bun run check && bun run package
+just install                       # build and install the Arch package and the extension (justfile)
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, the extension tests and builds

@@ -243,6 +243,10 @@ Arch Linux, from [dist/arch/PKGBUILD](dist/arch/PKGBUILD):
 cd dist/arch && makepkg -si
 ```
 
+Or with [just](https://github.com/casey/just): `just install` builds and
+installs the Arch package and the VS Code extension, `just arch` or
+`just vscode` one of them (`just` lists every recipe).
+
 Anywhere else with Rust: `cargo install --path .`
 
 Prebuilt Linux and Windows (x86_64) binaries are attached to
@@ -270,6 +274,8 @@ builds it as a `.vsix`, attached to releases, and the
 cd editors/vscode && bun install && bun run package
 code --install-extension taskpod-*.vsix
 ```
+
+or `just vscode`, which installs the version just built.
 
 ## JetBrains syntax highlighting
 
