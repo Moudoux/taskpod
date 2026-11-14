@@ -3,6 +3,12 @@
 //! Files are decrypted with `sops` the first time a secret is used, so runs
 //! that don't need them don't need the key either. Plaintext only lives in
 //! memory, and every value is redacted from what taskpod prints.
+//!
+//! Each sops file needs its own decryption by the key, so with a security
+//! key, several files mean several PIN entries and touches. An `age-key`
+//! avoids that: an age identity, itself encrypted (to the security key), that
+//! the secrets files are also encrypted to. It's decrypted once per run and
+//! handed to every sops in `SOPS_AGE_KEY`.
 
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -21,6 +27,13 @@ pub struct Secrets {
     files: Vec<PathBuf>,
     /// The program that decrypts, `sops` unless a test swaps it.
     program: String,
+    /// An encrypted age identity that unlocks every file, see the module docs.
+    age_key: Option<PathBuf>,
+    /// The program that decrypts the age key, `age` unless a test swaps it.
+    age_program: String,
+    /// Where `age` finds the identity that decrypts the age key, for tests;
+    /// otherwise sops' own key file.
+    identity: Option<PathBuf>,
     values: Arc<OnceLock<Loaded>>,
 }
 
@@ -29,6 +42,9 @@ impl Default for Secrets {
         Secrets {
             files: Vec::new(),
             program: "sops".into(),
+            age_key: None,
+            age_program: "age".into(),
+            identity: None,
             values: Arc::default(),
         }
     }
@@ -40,6 +56,18 @@ impl Secrets {
         if !self.files.contains(&path) {
             self.files.push(path);
         }
+    }
+
+    /// Decrypt every file with this encrypted age identity.
+    pub fn set_age_key(&mut self, path: PathBuf) {
+        self.age_key = Some(path);
+    }
+
+    /// Use other programs and identity file for the age key, for tests.
+    #[doc(hidden)]
+    pub fn set_age_programs(&mut self, age: impl Into<String>, identity: PathBuf) {
+        self.age_program = age.into();
+        self.identity = Some(identity);
     }
 
     pub fn set_program(&mut self, program: impl Into<String>) {
@@ -62,10 +90,32 @@ impl Secrets {
     }
 
     fn load(&self) -> Loaded {
+        let ui = crate::ui::ui();
+        // sops and age may ask for a passphrase or a PIN, so they get the terminal.
+        let identity = match &self.age_key {
+            Some(key) => Some(ui.suspend(|| self.unwrap_age_key(key))?),
+            None => None,
+        };
         let mut values = BTreeMap::new();
         for file in &self.files {
-            // sops may ask for a passphrase or a PIN, so it gets the terminal.
-            let json = crate::ui::ui().suspend(|| decrypt(&self.program, file))?;
+            let json = match &identity {
+                Some(identity) => match decrypt(&self.program, file, Some(identity)) {
+                    Ok(json) => json,
+                    // Not encrypted to the age key (yet): the usual way, with the security key.
+                    Err(_) => {
+                        let json = ui.suspend(|| decrypt(&self.program, file, None))?;
+                        ui.line(format!(
+                            "{} {} isn't encrypted to the age key, so it needed its own unlock; \
+                             `sops updatekeys {}` fixes that",
+                            console::style("!").yellow(),
+                            file.display(),
+                            file.display()
+                        ));
+                        json
+                    }
+                },
+                None => ui.suspend(|| decrypt(&self.program, file, None))?,
+            };
             let parsed: Value = serde_json::from_str(&json)
                 .map_err(|e| format!("{}: sops didn't print JSON: {e}", file.display()))?;
             flatten("", &parsed, &mut values);
@@ -75,34 +125,109 @@ impl Secrets {
     }
 }
 
-fn decrypt(program: &str, file: &Path) -> std::result::Result<String, String> {
+impl Secrets {
+    /// Decrypt the age key with `age` and the identity sops would use.
+    fn unwrap_age_key(&self, key: &Path) -> std::result::Result<String, String> {
+        if !key.exists() {
+            return Err(format!("age key {} doesn't exist", key.display()));
+        }
+        let identity = match &self.identity {
+            Some(identity) => identity.clone(),
+            None => sops_key_file().ok_or("no home directory to find the sops age key file in")?,
+        };
+        if !identity.exists() {
+            return Err(format!(
+                "decrypting the age key {} needs the identity in {}, which doesn't exist \
+                 (set SOPS_AGE_KEY_FILE if it's elsewhere)",
+                key.display(),
+                identity.display()
+            ));
+        }
+        let mut command = Command::new(&self.age_program);
+        command.arg("-d").arg("-i").arg(&identity).arg(key);
+        let what = format!("the age key {}", key.display());
+        let output = run_prompting(command, &self.age_program, &what, true)?;
+        let text = String::from_utf8(output).map_err(|_| format!("{what} isn't UTF-8"))?;
+        if !text.lines().any(|l| l.trim().starts_with("AGE-")) {
+            return Err(format!("{what} doesn't hold an age identity"));
+        }
+        crate::ui::add_redactions(text.lines().map(str::to_string).collect::<Vec<_>>().iter());
+        Ok(text)
+    }
+}
+
+/// The age identity file sops uses, like sops finds it.
+fn sops_key_file() -> Option<PathBuf> {
+    if let Some(file) = std::env::var_os("SOPS_AGE_KEY_FILE") {
+        return Some(file.into());
+    }
+    let config = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(dir) => PathBuf::from(dir),
+        None if cfg!(target_os = "macos") => {
+            PathBuf::from(crate::vars::home_dir()?).join("Library/Application Support")
+        }
+        None => PathBuf::from(crate::vars::home_dir()?).join(".config"),
+    };
+    Some(config.join("sops/age/keys.txt"))
+}
+
+/// Decrypt a sops file. With `identity`, sops gets only that age identity:
+/// its usual key file is hidden, so the security key is never asked.
+fn decrypt(
+    program: &str,
+    file: &Path,
+    identity: Option<&str>,
+) -> std::result::Result<String, String> {
     if !file.exists() {
         return Err(format!("secrets file {} doesn't exist", file.display()));
     }
-    let mut child = Command::new(program)
-        .args(["-d", "--output-type", "json"])
-        .arg(file)
+    let mut command = Command::new(program);
+    command.args(["-d", "--output-type", "json"]).arg(file);
+    if let Some(identity) = identity {
+        let hidden = std::env::temp_dir().join(format!("taskpod-no-config-{}", std::process::id()));
+        command
+            .env("SOPS_AGE_KEY", identity)
+            .env_remove("SOPS_AGE_KEY_FILE")
+            .env_remove("SOPS_AGE_KEY_CMD")
+            .env("XDG_CONFIG_HOME", hidden);
+    }
+    let what = file.display().to_string();
+    // With the age key nothing prompts, and a failure is retried the usual way.
+    let output = run_prompting(command, program, &what, identity.is_none())?;
+    String::from_utf8(output).map_err(|_| format!("{}: sops printed invalid UTF-8", file.display()))
+}
+
+/// Run `command` with the terminal for prompts, returning its stdout. With
+/// `echo`, its stderr (where security key prompts appear) is shown as it comes.
+fn run_prompting(
+    mut command: Command,
+    program: &str,
+    what: &str,
+    echo: bool,
+) -> std::result::Result<Vec<u8>, String> {
+    let mut child = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => format!(
-                "decrypting {} needs `{program}`, which isn't installed (on Arch: pacman -S sops age)",
-                file.display()
+                "decrypting {what} needs `{program}`, which isn't installed (on Arch: pacman -S sops age)"
             ),
             _ => format!("failed to start {program}: {e}"),
         })?;
     // sops shows security key prompts ("enter PIN", "touch your key") on
     // stderr, so pass it through as it comes, and keep it for the error.
     let mut err = child.stderr.take().expect("stderr is piped");
-    let echo = std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         let mut kept = Vec::new();
         let mut buf = [0u8; 1024];
         while let Ok(n @ 1..) = err.read(&mut buf) {
-            let mut terminal = std::io::stderr();
-            let _ = terminal.write_all(&buf[..n]);
-            let _ = terminal.flush();
+            if echo {
+                let mut terminal = std::io::stderr();
+                let _ = terminal.write_all(&buf[..n]);
+                let _ = terminal.flush();
+            }
             kept.extend_from_slice(&buf[..n]);
         }
         kept
@@ -110,17 +235,12 @@ fn decrypt(program: &str, file: &Path) -> std::result::Result<String, String> {
     let output = child
         .wait_with_output()
         .map_err(|e| format!("failed to run {program}: {e}"))?;
-    let stderr = echo.join().unwrap_or_default();
+    let stderr = reader.join().unwrap_or_default();
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
-        return Err(format!(
-            "failed to decrypt {}: {}",
-            file.display(),
-            stderr.trim()
-        ));
+        return Err(format!("failed to decrypt {what}: {}", stderr.trim()));
     }
-    String::from_utf8(output.stdout)
-        .map_err(|_| format!("{}: sops printed invalid UTF-8", file.display()))
+    Ok(output.stdout)
 }
 
 /// Nested keys are joined with dots, list items are numbered from 0.
@@ -208,5 +328,58 @@ mod tests {
         assert!(secrets.get("z").unwrap_err().contains("no secret 'z'"));
         let runs = std::fs::read_to_string(dir.path().join("runs")).unwrap();
         assert_eq!(runs.lines().count(), 2, "each file is decrypted once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn age_key_is_unwrapped_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display();
+        // A fake age that "decrypts" by printing the file, counting its runs.
+        let age = dir.path().join("fake-age");
+        crate::test_util::write_script(
+            &age,
+            &format!(
+                "#!/bin/sh\necho x >> {d}/age-runs\n[ \"$2\" = -i ] && [ -e \"$3\" ] || exit 1\ncat \"$4\"\n"
+            ),
+        );
+        // A fake sops that needs the unwrapped key for files ending in .json,
+        // and the "security key" (no SOPS_AGE_KEY) for old.json.
+        let sops = dir.path().join("fake-sops");
+        crate::test_util::write_script(
+            &sops,
+            &format!(
+                "#!/bin/sh\necho \"$4 ${{SOPS_AGE_KEY:+key}}\" >> {d}/sops-runs\n\
+                 case \"$4\" in *old.json) [ -z \"$SOPS_AGE_KEY\" ] || exit 1 ;; \
+                 *) [ \"$(echo \"$SOPS_AGE_KEY\")\" = 'AGE-SECRET-KEY-1TEST' ] || exit 1 ;; esac\n\
+                 [ -z \"$SOPS_AGE_KEY_FILE\" ] || [ -z \"$SOPS_AGE_KEY\" ] || exit 2\n\
+                 cat \"$4\"\n"
+            ),
+        );
+        std::fs::write(dir.path().join("key.age"), "AGE-SECRET-KEY-1TEST\n").unwrap();
+        std::fs::write(dir.path().join("keys.txt"), "identity").unwrap();
+        for name in ["a", "b", "old"] {
+            std::fs::write(
+                dir.path().join(format!("{name}.json")),
+                format!(r#"{{"{name}": "v"}}"#),
+            )
+            .unwrap();
+        }
+        let mut secrets = Secrets::default();
+        secrets.set_program(sops.display().to_string());
+        secrets.set_age_programs(age.display().to_string(), dir.path().join("keys.txt"));
+        secrets.set_age_key(dir.path().join("key.age"));
+        for name in ["a", "b", "old"] {
+            secrets.add(dir.path().join(format!("{name}.json")));
+        }
+        assert_eq!(secrets.get("a").unwrap(), "v");
+        assert_eq!(secrets.get("old").unwrap(), "v");
+        let age_runs = std::fs::read_to_string(dir.path().join("age-runs")).unwrap();
+        assert_eq!(age_runs.lines().count(), 1, "the age key is decrypted once");
+        let sops_runs = std::fs::read_to_string(dir.path().join("sops-runs")).unwrap();
+        let with_key = sops_runs.lines().filter(|l| l.ends_with(" key")).count();
+        // a and b with the key; old tried with it, then the usual way.
+        assert_eq!((with_key, sops_runs.lines().count()), (3, 4), "{sops_runs}");
+        assert_eq!(crate::ui::redact("AGE-SECRET-KEY-1TEST"), "••••");
     }
 }

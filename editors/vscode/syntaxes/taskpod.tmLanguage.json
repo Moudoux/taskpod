@@ -127,7 +127,7 @@
       ]
     },
     "statement": {
-      "match": "^\\s*(include|env|secrets|shell)\\b",
+      "match": "^\\s*(include|env|secrets|age-key|shell)\\b",
       "captures": {
         "1": {
           "name": "keyword.control.import.taskpod"

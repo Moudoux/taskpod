@@ -31,6 +31,11 @@ let today = $(date +%A)        # shell output, run once when first used
 # use one need no key. Values are hidden from output (shown as ••••), and
 # `taskpod FILE --secrets other.yaml` adds files from the command line:
 #   secrets "secrets.yaml"
+# Each file is unlocked on its own, so with a security key, several files
+# mean several PINs and touches. An age identity encrypted to the key, that
+# the files are also encrypted to, is decrypted once and unlocks them all
+# (or `taskpod FILE --age-key taskpod.key.age`):
+#   age-key "taskpod.key.age"
 # Merge another file, paths are relative to this one; `if`/`unless` optional:
 #   include "desktop.task" if pacman -Q plasma-workspace
 # Commands run with `sh -ec` by default, change it with:

@@ -54,6 +54,13 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
     syntax: 'secrets "secrets.yaml"',
     snippet: 'secrets "${1:secrets.yaml}"',
   },
+  "age-key": {
+    places: ["top"],
+    summary:
+      "An age identity, itself encrypted (to a security key, say), that the `secrets` files are also encrypted to. It's decrypted once per run with `age`, and every sops file is decrypted with it, so several files need one PIN and touch. Files not encrypted to it still decrypt the usual way. `taskpod --age-key FILE` works too.",
+    syntax: 'age-key "taskpod.key.age"',
+    snippet: 'age-key "${1:taskpod.key.age}"',
+  },
   include: {
     places: ["top"],
     summary:

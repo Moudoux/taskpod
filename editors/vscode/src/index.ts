@@ -43,7 +43,7 @@ export interface Ref extends Span {
 export interface PathRef extends Span {
   path: string;
   /** include/env/secrets/from point at files next to the task file; target is where a file step writes. */
-  kind: "include" | "env" | "secrets" | "from" | "target";
+  kind: "include" | "env" | "secrets" | "age-key" | "from" | "target";
 }
 
 export type Context = "top" | "body" | "shell" | "string";
@@ -229,7 +229,8 @@ export function parse(text: string): Index {
     switch (keyword) {
       case "include":
       case "env":
-      case "secrets": {
+      case "secrets":
+      case "age-key": {
         const path = strings(line)[0];
         if (path) index.paths.push({ path: path.value, kind: keyword, line: number, start: path.start, end: path.end });
         return;

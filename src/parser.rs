@@ -113,6 +113,11 @@ impl<'s> Parser<'s> {
                     self.end_of_line()?;
                     file.ctx.secrets.add(self.resolve(&path));
                 }
+                "age-key" => {
+                    let path = self.string()?;
+                    self.end_of_line()?;
+                    file.ctx.secrets.set_age_key(self.resolve(&path));
+                }
                 "include" => {
                     let path = self.string()?;
                     let guard = self.optional_guard()?;

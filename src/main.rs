@@ -58,6 +58,11 @@ pub struct Args {
     #[arg(short = 'H', long, value_name = "HOST")]
     pub host: Option<String>,
 
+    /// An age identity, encrypted (to a security key, say), that the secrets files are also
+    /// encrypted to: decrypted once, so several files need one unlock
+    #[arg(long, value_name = "FILE")]
+    pub age_key: Option<PathBuf>,
+
     /// Tasks to skip
     #[arg(short, long, num_args = 1..)]
     pub skip: Vec<String>,
@@ -114,6 +119,9 @@ fn run(mut args: Args) -> Result<bool> {
     let mut file = taskpod::parser::parse_file_on(&args.file, remote)?;
     for path in &args.secrets {
         file.ctx.secrets.add(std::path::absolute(path)?);
+    }
+    if let Some(key) = &args.age_key {
+        file.ctx.secrets.set_age_key(std::path::absolute(key)?);
     }
 
     if args.check {

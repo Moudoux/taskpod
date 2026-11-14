@@ -152,6 +152,31 @@ Then use the recipient in `.sops.yaml`. Add a second
 recipient as a backup, a spare YubiKey or a plain age key kept offline,
 separated by commas: losing the only key means losing the secrets.
 
+### Several files, one touch
+
+Each sops file is unlocked on its own, so with a security key, every
+secrets file costs a PIN and a touch. To unlock them all at once, make an age
+key that's itself encrypted to the security key (plus the backup), and
+encrypt the files to it too:
+
+```sh
+# Prints the new public key; the private key only ever goes to age, encrypted.
+age-keygen | age -r age1fido2-hmac1... -r age1backup... -o taskpod.key.age
+# Check: prints the same public key.
+age -d -i ~/.config/sops/age/keys.txt taskpod.key.age | age-keygen -y
+# Add the new public key to the recipients in .sops.yaml, then for each file:
+sops updatekeys -y secrets.yaml
+```
+
+Then add `age-key "taskpod.key.age"` to the task file (it's encrypted, so
+commit it). Taskpod decrypts it with `age` once, using the identity sops
+would use (`SOPS_AGE_KEY_FILE` or `~/.config/sops/age/keys.txt`), keeps it in
+memory and gives it to each `sops` in `SOPS_AGE_KEY`, with sops' own key file
+hidden so the security key isn't asked again. A file that isn't encrypted to
+it yet is unlocked the usual way, with a hint to run `sops updatekeys`.
+Since the security key stays a recipient of every file, plain `sops` keeps
+working as before.
+
 A secret used inside a `run` command is part of that command line, which
 other users on the machine can see while it runs; writing it into a file
 with `file ... mode 600` avoids that.
