@@ -61,9 +61,16 @@ pub struct Args {
     #[arg(short, long)]
     pub pull: bool,
 
-    /// With --pull, pull every change without asking
-    #[arg(short, long, requires = "pull")]
+    /// With --pull, pull every change without asking; with --undo, undo files changed
+    /// since taskpod wrote them without asking
+    #[arg(short, long)]
     pub yes: bool,
+
+    /// Undo the tasks (with --run, those and their subtasks): runs each block's `undo`,
+    /// puts files back as they were before taskpod first wrote them, and deletes `new`
+    /// files. With -d or -D, only shows what it would do
+    #[arg(short, long, conflicts_with = "pull")]
+    pub undo: bool,
 
     /// Configure another machine over SSH (user@host or a Host from ~/.ssh/config).
     /// taskpod doesn't need to be installed there
@@ -154,6 +161,9 @@ fn mode(args: &Args) -> Mode {
 fn run(mut args: Args) -> Result<bool> {
     let start = Instant::now();
     let mode = mode(&args);
+    if args.yes && !args.pull && !args.undo {
+        anyhow::bail!("--yes only works with --pull or --undo");
+    }
     if mode == Mode::Run && !args.check && !args.list && args.graph.is_none() {
         if args.json {
             anyhow::bail!("--json only works with --dry-run or --diff");
@@ -246,8 +256,13 @@ fn run(mut args: Args) -> Result<bool> {
         skip: args.skip.into_iter().collect::<HashSet<_>>(),
         pull: args.pull,
         yes: args.yes,
+        undo: args.undo,
     };
-    let order = select(&file, &args.run)?;
+    let order = if args.undo {
+        taskpod::exec::select_undo(&file, &args.run)?
+    } else {
+        select(&file, &args.run)?
+    };
     let runner = Runner::new(&file, &opts);
 
     let scope = runner.root_scope();
@@ -270,7 +285,14 @@ fn run(mut args: Args) -> Result<bool> {
         );
         return Ok(outcomes.iter().all(|(_, o)| o.ok()));
     }
-    let ok = summarize(&outcomes, start, &opts, &args.file);
+    let cannot = runner
+        .reports
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .map(|r| r.cannot)
+        .sum();
+    let ok = summarize(&outcomes, start, &opts, &args.file, cannot);
     let edits = std::mem::take(&mut *runner.edits.lock().unwrap_or_else(|e| e.into_inner()));
     if edits.is_empty() {
         return Ok(ok);

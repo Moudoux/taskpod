@@ -8,8 +8,13 @@
 #                              the task files, -D or -d only show what would change
 #   taskpod spec.task -H host  run on another machine over SSH, nothing to install there
 #   taskpod spec.task -r hello run one task, and the tasks it needs
+#   taskpod spec.task -u       undo every task (see Undo below), -D or -d only show it
 #   taskpod spec.task -l       list tasks
+#   taskpod spec.task -g       the task graph: each task with what runs before it
+#                              (-g dot for Graphviz, -g mermaid)
 #   taskpod spec.task --check  check the file for errors
+#   taskpod spec.task -D --json --no-secrets
+#                              the diff as JSON for editors, without decrypting secrets
 
 # Variables. Use them anywhere with {{ name }}. Strings in "double quotes"
 # understand \n, \t, \" and \; 'single quotes' are taken as written.
@@ -94,11 +99,14 @@ task setup {
     manual                     # only runs with -r, or when another task needs it
     workdir "/tmp"             # where commands run, default: this file's directory
     let where = "{{ home }}"   # variables can be per task
-    # Files are written only when their content, mode or owner differs.
+    # Files are written only when their content, mode or owner differs (through
+    # symlinks); diffs say when only the encoding, line endings or final newline do.
     #   mode 600           permission bits, default 644, or 755 for content starting with #!
     #   owner user:group   checked and set, writes with sudo
     #   encoding utf-16le  utf-8 (default), utf-8-bom, utf-16le, utf-16be, latin1 or ascii
     #   sudo               write as root
+    #   new                taskpod created it: --undo deletes it (see Undo below)
+    #   keep               --undo leaves it as it is
     # Content is a string, a """ block, or `from "path"` (relative to this file,
     # copied byte for byte unless an encoding is given).
     file "/tmp/taskpod-example/hello.sh" """
@@ -108,6 +116,36 @@ task setup {
     file "/tmp/taskpod-example/copy.task" mode 600 from "spec.task"
     file "/tmp/taskpod-example/windows.txt" encoding utf-16le "for notepad\n"
     run /tmp/taskpod-example/hello.sh
+}
+
+# Undo. `taskpod FILE --undo` (or -u) undoes every task, `-u -r name` one task
+# and its subtasks, not what it needs; a task others still need isn't undone
+# unless they're in -r too. Dependents go first, subtasks before
+# their parent, and in a task the steps run last first:
+# - Files go back to what they were before taskpod first wrote them, from a
+#   journal on the machine (~/.local/state/taskpod, /var/lib/taskpod for root
+#   files). A file without a record is deleted if it says `new`, otherwise
+#   reported. One changed since taskpod wrote it is asked about (--yes: undone).
+# - Commands can't be undone by themselves: `undo` gives the command that
+#   does, like `run`, and runs where it stands. A block with commands but no
+#   `undo` is reported, unless it says `keep`: leave it as it is.
+# - In undo, `unless` says when there's something to undo (its check passes
+#   when the task is done) and `if` still says where the task applies.
+template service {
+    unless systemctl is-enabled -q {{ args }}
+    run sudo systemctl enable --now {{ args }}
+    undo sudo systemctl disable --now {{ args }}
+}
+
+task undo-example {
+    manual
+    file "/tmp/taskpod-example/app.conf" new "port=8080\n"
+    unless test -d /tmp/taskpod-example/data {
+        keep                   # data stays
+        run mkdir -p /tmp/taskpod-example/data
+    }
+    # At the end, so it runs first in an undo, before the file goes:
+    undo echo "stopping the app"
 }
 
 # More directives:

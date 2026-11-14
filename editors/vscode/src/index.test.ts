@@ -116,3 +116,17 @@ test("indexes secrets files and secret references", () => {
   expect(parse('age-key "k.age"\n').paths.map((p) => `${p.kind}:${p.path}`)).toEqual(["age-key:k.age"]);
   expect(index.refs.map((r) => `${r.kind}:${r.name}`)).toContain("var:secrets.wifi.password");
 });
+
+test("undo blocks are shell, keep and undo aren't template calls", () => {
+  const index = parse(`task app {
+    keep
+    undo {
+        pkg-like-word arg
+    }
+    undo rm -f x
+}
+`);
+  expect(index.refs.filter((r) => r.kind === "template")).toEqual([]);
+  expect(index.lines[3].context).toBe("shell");
+  expect(index.lines[5].context).not.toBe("shell");
+});

@@ -107,6 +107,7 @@ pub fn document(
         "file": absolute(file),
         "mode": mode(runner.opts.mode),
         "pull": runner.opts.pull,
+        "undo": runner.opts.undo,
         "skipped": skipped.map(clean),
         "error": null,
         "tasks": tasks,

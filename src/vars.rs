@@ -76,6 +76,8 @@ pub struct Ctx {
     pub secrets: crate::secrets::Secrets,
     /// Run on this machine over SSH instead of locally.
     pub remote: Option<Arc<crate::remote::Remote>>,
+    /// Where `--undo`'s journal lives instead of the usual places, for tests.
+    pub journal: Option<PathBuf>,
 }
 
 /// A command ready to start, with what to write to its stdin.
@@ -105,10 +107,12 @@ impl Ctx {
     pub fn new(dir: PathBuf) -> Self {
         Ctx {
             shell: default_shell(),
-            dir,
             exports: Vec::new(),
             secrets: Default::default(),
             remote: None,
+            // Tests never touch the real journal.
+            journal: cfg!(test).then(|| dir.join(".taskpod-journal")),
+            dir,
         }
     }
 

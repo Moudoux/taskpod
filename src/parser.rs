@@ -280,12 +280,20 @@ impl<'s> Parser<'s> {
                     body.vars.set(name, var);
                 }
                 "run" => {
-                    let script = self.run_script()?;
+                    let script = self.run_script("run")?;
                     body.block.steps.push(Step::Run(script));
+                }
+                "undo" => {
+                    let script = self.run_script("undo")?;
+                    body.block.steps.push(Step::Undo(script));
+                }
+                "keep" => {
+                    self.end_of_line()?;
+                    body.block.keep = true;
                 }
                 "file" => {
                     let file = self.file_step()?;
-                    body.block.steps.push(Step::File(file));
+                    body.block.steps.push(Step::File(Box::new(file)));
                 }
                 _ => {
                     let line = self.rest_of_line();
@@ -453,8 +461,9 @@ impl<'s> Parser<'s> {
         Err(self.error_at(start, "missing ')' for '$('"))
     }
 
-    /// `run <command>` or a `run {` block of shell script ending with `}`.
-    fn run_script(&mut self) -> Result<String> {
+    /// `run <command>` or a `run {` block of shell script ending with `}`
+    /// (`keyword` is `run` or `undo`).
+    fn run_script(&mut self, keyword: &str) -> Result<String> {
         self.skip_inline_ws();
         if self.peek() == Some('{') {
             let save = self.pos;
@@ -469,7 +478,7 @@ impl<'s> Parser<'s> {
         }
         let command = self.rest_of_line();
         if command.is_empty() {
-            return Err(self.error("'run' needs a command"));
+            return Err(self.error(format!("'{keyword}' needs a command")));
         }
         self.end_of_line()?;
         Ok(command)
@@ -487,6 +496,8 @@ impl<'s> Parser<'s> {
         let mut owner = None;
         let mut encoding = None;
         let mut sudo = false;
+        let mut new = false;
+        let mut keep = false;
         let source = loop {
             self.skip_inline_ws();
             if let Some('"' | '\'') = self.peek() {
@@ -497,7 +508,7 @@ impl<'s> Parser<'s> {
             }
             let start = self.pos;
             match self
-                .word("file content, 'from', 'mode', 'owner', 'encoding' or 'sudo'")?
+                .word("file content, 'from', 'mode', 'owner', 'encoding', 'sudo', 'new' or 'keep'")?
                 .as_str()
             {
                 "mode" => {
@@ -515,6 +526,7 @@ impl<'s> Parser<'s> {
                 }
                 "owner" => {
                     self.skip_inline_ws();
+                    let value_start = self.pos;
                     owner = Some(if let Some('"' | '\'') = self.peek() {
                         self.string()?
                     } else {
@@ -526,9 +538,13 @@ impl<'s> Parser<'s> {
                             user
                         }
                     });
+                    origin.owner = Some(self.span(value_start));
                 }
                 "encoding" => {
+                    self.skip_inline_ws();
+                    let value_start = self.pos;
                     let name = self.word("an encoding")?;
+                    origin.encoding = Some(self.span(value_start));
                     encoding = Some(Encoding::parse(&name).ok_or_else(|| {
                         self.error_at(
                             start,
@@ -540,6 +556,8 @@ impl<'s> Parser<'s> {
                     })?);
                 }
                 "sudo" => sudo = true,
+                "new" => new = true,
+                "keep" => keep = true,
                 "from" => {
                     let source = self.string()?;
                     let relative = !(source.contains("{{")
@@ -570,6 +588,8 @@ impl<'s> Parser<'s> {
             },
             raw,
             sudo,
+            new,
+            keep,
             origin,
         })
     }

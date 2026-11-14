@@ -148,6 +148,27 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
     syntax: "run cargo build --release\n\nrun {\n    cd build\n    make\n}",
     snippet: "run ${1:command}",
   },
+  undo: {
+    places: ["body"],
+    summary:
+      "How `taskpod --undo` undoes this task, template or block: a shell command, or an `undo {` block, like `run`. Normal runs skip it. Undo goes through the steps last first, running each `undo` where it stands, so one at the end runs before the files above it are removed. In undo, an `unless` check says when there's something to undo (it passes when the task is done), and an `if` still says where it applies.",
+    syntax: "template pkg {\n    unless pacman -Q {{ args }}\n    run yay -S {{ args }}\n    undo yay -Rns {{ args }}\n}",
+    snippet: "undo ${1:command}",
+  },
+  keep: {
+    places: ["body", "file"],
+    summary:
+      "`--undo` leaves what this task or block did in place, and doesn't count its commands as impossible to undo. On a `file`, undo leaves the file as it is.",
+    syntax: "keep",
+    snippet: "keep",
+  },
+  new: {
+    places: ["file"],
+    summary:
+      "The file didn't exist before taskpod, so `--undo` deletes it. Only needed for files written before taskpod kept an undo journal: since then, undo knows what was there.",
+    syntax: 'file "~/.config/app.conf" new from "files/app.conf"',
+    snippet: "new",
+  },
   file: {
     places: ["body"],
     summary:

@@ -46,14 +46,26 @@ pub struct Block {
     pub locks: Vec<String>,
     /// Ask for sudo credentials before running.
     pub sudo: bool,
+    /// `keep`: `--undo` leaves what this block did in place.
+    pub keep: bool,
     pub steps: Vec<Step>,
+}
+
+impl Block {
+    /// Whether `--undo` knows what to do about this block's commands: it has
+    /// an `undo`, or says `keep`.
+    pub fn undo_covers_commands(&self) -> bool {
+        self.keep || self.steps.iter().any(|s| matches!(s, Step::Undo(_)))
+    }
 }
 
 #[derive(Debug)]
 pub enum Step {
     /// A shell script.
     Run(String),
-    File(FileStep),
+    /// A shell script that undoes the block, only run by `--undo`.
+    Undo(String),
+    File(Box<FileStep>),
     /// A template call; the template's guards only apply to this step.
     Call {
         template: String,
@@ -75,6 +87,11 @@ pub struct FileStep {
     /// Copy the source's bytes unchanged (a `from` file with no encoding).
     pub raw: bool,
     pub sudo: bool,
+    /// `new`: the file didn't exist before taskpod, so `--undo` deletes it
+    /// when there's no record of what was there.
+    pub new: bool,
+    /// `keep`: `--undo` leaves the file as it is.
+    pub keep: bool,
     /// Where the step is written, so `--pull` can rewrite it.
     pub origin: FileOrigin,
 }
@@ -87,6 +104,10 @@ pub struct FileOrigin {
     pub after_path: usize,
     /// The mode's value, if given.
     pub mode: Option<Span>,
+    /// The owner's value, if given.
+    pub owner: Option<Span>,
+    /// The encoding's name, if given.
+    pub encoding: Option<Span>,
     /// The inline content's string literal, quotes included.
     pub content: Option<Span>,
 }
@@ -134,6 +155,34 @@ impl Encoding {
             "ascii" | "us-ascii" => Encoding::Ascii,
             _ => return None,
         })
+    }
+
+    /// The name used in task files.
+    pub fn name(self) -> &'static str {
+        match self {
+            Encoding::Utf8 => "utf-8",
+            Encoding::Utf8Bom => "utf-8-bom",
+            Encoding::Utf16Le => "utf-16le",
+            Encoding::Utf16Be => "utf-16be",
+            Encoding::Latin1 => "latin1",
+            Encoding::Ascii => "ascii",
+        }
+    }
+
+    /// The encoding of a file on the system: from its byte order mark, else
+    /// UTF-8 if it's valid UTF-8, else Latin-1, which decodes anything.
+    pub fn detect(bytes: &[u8]) -> Self {
+        if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            Encoding::Utf8Bom
+        } else if bytes.starts_with(&[0xFF, 0xFE]) {
+            Encoding::Utf16Le
+        } else if bytes.starts_with(&[0xFE, 0xFF]) {
+            Encoding::Utf16Be
+        } else if std::str::from_utf8(bytes).is_ok() {
+            Encoding::Utf8
+        } else {
+            Encoding::Latin1
+        }
     }
 
     pub fn encode(self, text: &str) -> Result<Vec<u8>> {
@@ -224,6 +273,7 @@ impl Step {
     pub fn describe(&self) -> String {
         match self {
             Step::Run(script) => script.clone(),
+            Step::Undo(script) => format!("undo {script}"),
             Step::File(file) => format!("file {}", file.path),
             Step::Call { template, args } => format!("{template} {args}").trim().to_string(),
             Step::Block(block) => block

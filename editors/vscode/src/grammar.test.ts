@@ -93,3 +93,22 @@ test("continued template calls stay arguments", async () => {
   expect(scopeOf(tokens, "        two")).not.toContain("entity.name.function.call");
   expect(scopeOf(tokens, "y")).toContain("entity.name.function");
 });
+
+test("highlights undo", async () => {
+  const tokenize = await tokenizer();
+  const tokens = tokenize(`task app {
+    keep
+    file "/etc/x" new from "files/x"
+    file "/etc/y" keep "y"
+    undo rm -f /tmp/marker
+    undo {
+        systemctl disable --now app
+    }
+}`);
+  expect(scopeOf(tokens, "keep")).toContain("keyword.other.directive");
+  expect(scopeOf(tokens, "new")).toContain("keyword.other.taskpod");
+  expect(scopeOf(tokens, "undo")).toContain("keyword.control.run");
+  expect(scopeOf(tokens, " rm -f /tmp/marker")).toContain("meta.embedded.line.shell");
+  expect(scopeOf(tokens, "        systemctl disable --now app")).toContain("meta.embedded.block.shell");
+  expect(tokens.some(([, s]) => s.includes("entity.name.function.call"))).toBe(false);
+});

@@ -1,6 +1,7 @@
 //! Running tasks: selection, parallel scheduling, dry runs and diffs.
 
 pub mod graph;
+pub mod journal;
 pub mod json;
 pub mod pull;
 mod step;
@@ -41,6 +42,9 @@ pub struct Options {
     pub pull: bool,
     /// Pull without asking about each file.
     pub yes: bool,
+    /// Undo the tasks instead, in reverse order; `mode` says whether to do it
+    /// (`Run`) or only show it.
+    pub undo: bool,
 }
 
 impl Options {
@@ -103,6 +107,8 @@ pub struct TaskReport {
     pub steps: Vec<StepRecord>,
     /// Steps not checked because they need secrets.
     pub unchecked: usize,
+    /// Steps `--undo` doesn't know how to undo.
+    pub cannot: usize,
 }
 
 /// Ask a yes/no question.
@@ -155,6 +161,67 @@ pub fn select(file: &TaskFile, targets: &[String]) -> Result<Vec<String>> {
         visit(file, name, &mut done, &mut path, &mut order)?;
     }
     Ok(order)
+}
+
+/// The tasks to undo: `targets` and their subtasks (not what they need, which
+/// other tasks may still use), or everything [`select`] picks. In the order
+/// they were run; [`Runner::run`] undoes them the other way around.
+pub fn select_undo(file: &TaskFile, targets: &[String]) -> Result<Vec<String>> {
+    if targets.is_empty() {
+        return select(file, &[]);
+    }
+    for target in targets {
+        if !file.tasks.contains_key(target) {
+            let names: Vec<&str> = file.tasks.keys().map(String::as_str).collect();
+            bail!("no task named '{target}' (tasks: {})", names.join(", "));
+        }
+    }
+    let mut chosen: HashSet<&str> = targets.iter().map(String::as_str).collect();
+    loop {
+        let more: Vec<&str> = file
+            .tasks
+            .values()
+            .filter(|t| !t.manual && !chosen.contains(t.name.as_str()))
+            .filter(|t| t.parent.as_deref().is_some_and(|p| chosen.contains(p)))
+            .map(|t| t.name.as_str())
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        chosen.extend(more);
+    }
+    // Undoing what another task still needs would break that task.
+    let mut needed_by: Vec<(&str, &str)> = file
+        .tasks
+        .values()
+        .filter(|t| !t.manual && !chosen.contains(t.name.as_str()))
+        .flat_map(|t| {
+            t.needs
+                .iter()
+                .filter(|n| chosen.contains(n.as_str()))
+                .map(move |n| (n.as_str(), t.name.as_str()))
+        })
+        .collect();
+    if !needed_by.is_empty() {
+        needed_by.sort();
+        let list: Vec<String> = needed_by
+            .iter()
+            .map(|(needed, by)| format!("{by} needs {needed}"))
+            .collect();
+        let mut with: Vec<&str> = targets.iter().map(String::as_str).collect();
+        with.extend(needed_by.iter().map(|(_, by)| *by));
+        with.dedup();
+        bail!(
+            "not undoing it, other tasks still need it: {}. To undo those too: -u -r {}",
+            list.join(", "),
+            with.join(" ")
+        );
+    }
+    let all: Vec<String> = file.tasks.keys().cloned().collect();
+    Ok(select(file, &all)?
+        .into_iter()
+        .filter(|n| chosen.contains(n.as_str()))
+        .collect())
 }
 
 fn deps(task: &Task) -> impl Iterator<Item = &str> {
@@ -297,21 +364,36 @@ impl<'a> Runner<'a> {
             .map(|(i, n)| (n.as_str(), i))
             .collect();
         let tasks: Vec<&Task> = order.iter().map(|n| &self.file.tasks[n]).collect();
-        let mut dependents = vec![Vec::new(); tasks.len()];
-        let mut waiting: Vec<usize> = vec![0; tasks.len()];
+        // What each task waits for: what it needs, or for an undo, what needs it.
+        let mut waits_for: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); tasks.len()];
         for (i, task) in tasks.iter().enumerate() {
-            let task_deps: BTreeSet<usize> = deps(task).map(|d| index[d]).collect();
-            waiting[i] = task_deps.len();
-            for dep in task_deps {
+            for dep in deps(task).filter_map(|d| index.get(d).copied()) {
+                if self.opts.undo {
+                    waits_for[dep].insert(i);
+                } else {
+                    waits_for[i].insert(dep);
+                }
+            }
+        }
+        let mut dependents = vec![Vec::new(); tasks.len()];
+        let waiting: Vec<usize> = waits_for.iter().map(BTreeSet::len).collect();
+        let mut waiting = waiting;
+        for (i, waits) in waits_for.iter().enumerate() {
+            for &dep in waits {
                 dependents[dep].push(i);
             }
         }
         let mut outcomes: Vec<Option<Outcome>> = vec![None; tasks.len()];
         let mut ready: VecDeque<usize> = (0..tasks.len()).filter(|&i| waiting[i] == 0).collect();
+        if self.opts.undo {
+            // Last run, first undone.
+            ready = ready.into_iter().rev().collect();
+        }
         let (sender, receiver) = mpsc::channel::<(usize, Outcome)>();
 
         let what = match self.opts.mode {
             _ if self.opts.pull => "pulled",
+            Mode::Run if self.opts.undo => "undone",
             Mode::Run => "tasks",
             Mode::DryRun | Mode::Diff => "checked",
         };
@@ -325,12 +407,14 @@ impl<'a> Runner<'a> {
                     let task = tasks[i];
                     let outcome = if self.opts.skip.contains(&task.name) {
                         Some(Outcome::Skipped("--skip".into()))
-                    } else if let Some(dep) =
-                        deps(task).find(|d| !outcomes[index[d]].as_ref().is_some_and(Outcome::ok))
+                    } else if let Some(&dep) = waits_for[i]
+                        .iter()
+                        .find(|&&d| !outcomes[d].as_ref().is_some_and(Outcome::ok))
                     {
-                        Some(Outcome::Blocked(dep.to_string()))
+                        Some(Outcome::Blocked(tasks[dep].name.clone()))
                     } else if let Some(parent) = &task.parent
                         && !self.opts.pull
+                        && !self.opts.undo
                         && outcomes[index[parent.as_str()]] != Some(Outcome::Ran)
                     {
                         let why = match outcomes[index[parent.as_str()]] {
@@ -436,18 +520,31 @@ impl<'a> Runner<'a> {
         let diff = self.opts.mode == Mode::Diff;
         let line = match outcome {
             Outcome::Ran if self.opts.pull => Some(ui::differs(name, detail)),
+            Outcome::Ran if self.opts.undo && self.opts.checking() => {
+                Some(ui::would_change(name, detail))
+            }
+            Outcome::Ran if self.opts.undo => Some(ui::undone(name, detail)),
+            // Shown in a diff too when something can't be undone.
+            Outcome::UpToDate if self.opts.undo && (!diff || ui.verbose || !lines.is_empty()) => {
+                Some(ui::nothing_to_undo(name))
+            }
             Outcome::Ran if self.opts.checking() => Some(ui::would_change(name, detail)),
             Outcome::Ran => Some(ui::done(name, detail)),
             Outcome::UpToDate if !diff || ui.verbose => Some(ui::up_to_date(name)),
             Outcome::Skipped(reason) if !diff || ui.verbose => Some(ui::skipped(name, reason)),
             Outcome::Unchecked(reason) => Some(ui::unchecked(name, reason)),
             Outcome::Failed(error) => Some(ui::failed(name, error)),
+            Outcome::Blocked(dep) if self.opts.undo => Some(ui::failed(
+                name,
+                &format!("not undone, undoing {dep} failed"),
+            )),
             Outcome::Blocked(dep) => Some(ui::failed(name, &format!("not run, {dep} failed"))),
             _ => None,
         };
         if let Some(line) = line {
             ui.line(line);
-            let quiet = *outcome == Outcome::UpToDate && !ui.verbose;
+            // Notes about what can't be undone show even when nothing else would.
+            let quiet = *outcome == Outcome::UpToDate && !ui.verbose && !self.opts.undo;
             for line in lines.iter().filter(|_| !quiet) {
                 ui.line(format!("    {line}"));
             }
@@ -461,6 +558,7 @@ pub fn summarize(
     start: Instant,
     opts: &Options,
     file: &Path,
+    cannot: usize,
 ) -> bool {
     let count = |f: fn(&Outcome) -> bool| outcomes.iter().filter(|(_, o)| f(o)).count();
     let ran = count(|o| *o == Outcome::Ran);
@@ -480,6 +578,32 @@ pub fn summarize(
     let elapsed = style(format!("in {:.1?}", start.elapsed())).dim();
     let ui = ui();
     ui.line("");
+    if opts.undo {
+        let verb = if opts.checking() {
+            "would be undone"
+        } else {
+            "undone"
+        };
+        let mut parts = vec![format!("{ran} {verb}")];
+        if cannot > 0 {
+            let steps = if cannot == 1 { "step" } else { "steps" };
+            parts.push(format!("{cannot} {steps} can't be undone"));
+        }
+        if unchecked > 0 {
+            parts.push(format!("{unchecked} not checked (secrets)"));
+        }
+        if !failed.is_empty() {
+            parts.push(format!("{} failed ({})", failed.len(), failed.join(", ")));
+        }
+        let summary = style(parts.join(", ")).bold();
+        let summary = if failed.is_empty() {
+            summary
+        } else {
+            summary.red()
+        };
+        ui.line(format!("{summary} {elapsed}"));
+        return failed.is_empty();
+    }
     if opts.pull && ran == 0 && failed.is_empty() {
         ui.line(format!(
             "{} {} {elapsed}",

@@ -135,7 +135,7 @@
       }
     },
     "run-block": {
-      "begin": "^(\\s*)(run)\\s*(\\{)\\s*(?=(#.*)?$)",
+      "begin": "^(\\s*)(run|undo)\\s*(\\{)\\s*(?=(#.*)?$)",
       "beginCaptures": {
         "2": {
           "name": "keyword.control.run.taskpod"
@@ -161,7 +161,7 @@
       ]
     },
     "run-line": {
-      "begin": "^\\s*(run)\\b",
+      "begin": "^\\s*(run|undo)\\b",
       "beginCaptures": {
         "1": {
           "name": "keyword.control.run.taskpod"
@@ -295,7 +295,7 @@
           }
         },
         {
-          "match": "\\b(sudo|from)\\b",
+          "match": "\\b(sudo|from|new|keep)\\b",
           "name": "keyword.other.taskpod"
         },
         {
@@ -304,7 +304,7 @@
       ]
     },
     "directive": {
-      "match": "^\\s*(desc|sudo|manual|interactive|workdir)\\b",
+      "match": "^\\s*(desc|sudo|manual|interactive|workdir|keep)\\b",
       "captures": {
         "1": {
           "name": "keyword.other.directive.taskpod"
@@ -312,7 +312,7 @@
       }
     },
     "call": {
-      "begin": "^\\s+(?!(?:desc|needs|lock|if|unless|ask|sudo|manual|interactive|workdir|let|run|file)\\b)([\\p{L}\\p{N}_.+-]+)(?=\\s|$)",
+      "begin": "^\\s+(?!(?:desc|needs|lock|if|unless|ask|sudo|manual|interactive|workdir|keep|let|run|undo|file)\\b)([\\p{L}\\p{N}_.+-]+)(?=\\s|$)",
       "beginCaptures": {
         "1": {
           "name": "entity.name.function.call.taskpod"

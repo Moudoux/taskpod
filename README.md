@@ -34,6 +34,7 @@ taskpod [FILE]             # run every task that isn't manual (FILE defaults to 
 taskpod FILE -D            # diff: compare with the system, show only what would change
 taskpod FILE -d            # dry run: every task and step, and what would change
 taskpod FILE --pull        # bring changes made on the system back into the task files
+taskpod FILE -u            # undo every task; -u -r a: task a and its subtasks; -u -D: only show it
 taskpod FILE -H pi@rpi     # configure another machine over SSH
 taskpod FILE -r a b        # run tasks a and b, and what they need
 taskpod FILE -i a          # what task a would do
@@ -51,7 +52,9 @@ taskpod FILE -D --no-secrets  # don't decrypt: steps that need secrets show as n
 ```
 
 Diffs and dry runs run the `if` and `unless` checks (which shouldn't change
-anything), compare files byte for byte, mode and owner, and show unified diffs.
+anything), compare files byte for byte, mode and owner (through symlinks, as
+writes go), and show unified diffs. When the text is the same, they say what
+differs instead: the encoding or byte order mark, line endings, or the final newline.
 `--json` prints the result of a diff or dry run (`-d`) as one JSON document
 on stdout, with plain text and secrets hidden, instead of the usual output;
 it never asks anything. `--no-secrets` keeps a check from decrypting secrets
@@ -80,11 +83,48 @@ takes everything without asking.
   changed plain lines are pulled and changed lines with a variable are shown
   for you to edit by hand, so values never end up in your task files. Lines
   holding a secret value are never pulled, wherever they are.
-- A different mode updates (or adds) the step's `mode`. Owners aren't pulled,
-  and files missing on the system are left alone.
+- A different mode updates (or adds) the step's `mode`, and a different owner
+  the step's `owner` (when it has one). A file in another encoding (a different
+  byte order mark, or text the step's encoding can't hold) updates or adds
+  `encoding`. Files missing on the system are left alone.
 
 A template's content is shared by every call, so a pulled change applies to
 all of them; two calls wanting different content is reported as a conflict.
+
+## Undo
+
+`taskpod main.task --undo` (`-u`) undoes every task, `-u -r name` one task and
+its subtasks (not what it needs, which other tasks may use). A task that other
+tasks still need isn't undone on its own: taskpod names them, and you add them
+to `-r` to undo them too. `-u -D` and `-u -d`
+show what it would do. Tasks that need another go first, subtasks before their
+parent, and inside a task the steps run last first.
+
+- **Files** go back to what they were before taskpod first wrote them. Before
+  each first write, taskpod records the old content, mode and owner (or that
+  there was no file) in a journal on the machine it configures:
+  `~/.local/state/taskpod/journal`, and `/var/lib/taskpod/journal`, readable by
+  root only, for files written as root. Files written before the journal
+  existed have no record: mark the ones taskpod created `new` and undo deletes
+  them, otherwise undo reports them. A file changed since taskpod wrote it is
+  asked about (`--yes` undoes it anyway).
+- **Commands** can't be undone by themselves. `undo` says how, like `run`:
+
+  ```
+  template pkg {
+      unless pacman -Q {{ args }}
+      run yay -S --noconfirm {{ args }}
+      undo yay -Rns --noconfirm {{ args }}
+  }
+  ```
+
+  Each `undo` runs where it stands as the steps are walked backwards, so one at
+  the end of a task runs before the task's files are removed (`docker compose
+  down` before deleting `compose.yml`). A block with commands and no `undo` is
+  reported as not undoable, unless it says `keep`: leave it as it is (a system
+  update, data directories). `keep` on a file step leaves the file.
+- **Checks**: an `if` still says where a task applies; an `unless` says when
+  there's something to undo, since its check passes when the task is done.
 
 ## Remote machines
 
@@ -202,14 +242,24 @@ Anywhere else with Rust: `cargo install --path .`
 
 Prebuilt Linux and Windows (x86_64) binaries are attached to
 [GitHub releases](https://github.com/Moudoux/taskpod/releases), built by CI
-for every `v*` tag. Builds of other commits are under the CI run's artifacts.
+for every `v*` tag.
+
+Latest CI builds of `master` (zip files, through [nightly.link](https://nightly.link),
+since GitHub only lets signed-in users download build artifacts):
+
+- [Linux x86_64 binary](https://nightly.link/Moudoux/taskpod/workflows/ci/master/taskpod-x86_64-unknown-linux-gnu.zip)
+- [Windows x86_64 binary](https://nightly.link/Moudoux/taskpod/workflows/ci/master/taskpod-x86_64-pc-windows-msvc.zip)
+- [VS Code extension (.vsix)](https://nightly.link/Moudoux/taskpod/workflows/ci/master/taskpod-vscode.zip)
+
+Or signed in, from the [latest CI runs](https://github.com/Moudoux/taskpod/actions/workflows/ci.yml?query=branch%3Amaster).
 
 ## VS Code
 
 [editors/vscode](editors/vscode) has an extension with highlighting,
 completion, hover docs, go to definition, diagnostics, run buttons and live
 checks, which show above each task whether this system matches it. CI
-builds it as a `.vsix`, attached to releases; to build it yourself:
+builds it as a `.vsix`, attached to releases, and the
+[latest build of master](https://nightly.link/Moudoux/taskpod/workflows/ci/master/taskpod-vscode.zip) is a download away; to build it yourself:
 
 ```sh
 cd editors/vscode && bun install && bun run package

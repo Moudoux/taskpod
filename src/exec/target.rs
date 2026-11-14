@@ -73,11 +73,11 @@ fn read_remote(remote: &Remote, path: &Path, sudo: bool) -> Result<Current> {
 }
 
 /// Prints the octal mode and `user:group` of `$1`, with GNU (Linux, busybox)
-/// or BSD (macOS) `stat`.
+/// or BSD (macOS) `stat`. Through symlinks, since writes go through them too.
 const STAT: &str = r#"if stat -c %a / >/dev/null 2>&1; then
-  stat -c '%a %U:%G' -- "$1"
+  stat -L -c '%a %U:%G' -- "$1"
 else
-  stat -f '%Mp%Lp %Su:%Sg' -- "$1"
+  stat -L -f '%Mp%Lp %Su:%Sg' -- "$1"
 fi"#;
 
 /// Run as root: writes stdin to `$1` with mode `$2`, passing the remaining
@@ -258,6 +258,41 @@ fn write_with_sudo(path: &Path, content: &[u8], mode: u32, owner: Option<&str>) 
             "sudo install exited with {}: {}",
             describe(output.status),
             stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+/// Delete a file if it's there, as root with `sudo`.
+pub fn remove(ctx: &Ctx, task: &str, path: &Path, sudo: bool) -> Result<()> {
+    if sudo {
+        sudo::ensure(task, ctx)?;
+    }
+    let output = match &ctx.remote {
+        Some(remote) => {
+            let sudo = if sudo { "sudo " } else { "" };
+            remote.output(&format!("{sudo}rm -f -- {}", quote(&arg(path))), &[])?
+        }
+        None if sudo => std::process::Command::new("sudo")
+            .args(["rm", "-f", "--"])
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .context("failed to run sudo")?,
+        None => {
+            return match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                _ => Ok(()),
+            };
+        }
+    };
+    if !output.status.success() {
+        bail!(
+            "rm exited with {}: {}",
+            describe(output.status),
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     Ok(())

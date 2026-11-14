@@ -255,6 +255,7 @@ export function parse(text: string): Index {
         return;
       }
       case "run":
+      case "undo":
         if (/^\s*\{\s*$/.test(rest)) shellDepth = 1;
         return;
       case "if":

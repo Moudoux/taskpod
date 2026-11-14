@@ -1,8 +1,10 @@
 //! Running the steps of one task.
 
+use super::journal::{self, Entry, Previous};
 use super::target::{self, Current, describe};
 use super::{Mode, Outcome, Runner, StepKind, StepRecord, TaskReport, pull, sudo};
 use crate::ast::{Block, Encoding, FileSource, FileStep, Guard, Step, Task};
+use crate::parser::guard_passes;
 use crate::ui::{self, TaskLine, ui};
 use crate::vars::{Scope, Vars, expand_tilde};
 use anyhow::{Context, Result, anyhow, bail};
@@ -100,6 +102,9 @@ impl<'r> TaskRun<'r> {
         let root = self.runner.root_scope();
         let scope = root.child(&self.task.vars);
         self.status("checking");
+        if self.runner.opts.undo {
+            return self.undo_task(&scope);
+        }
         if let Some(guard) = self
             .runner
             .failing_guard(&self.task.body.guards, &scope, &self.cwd)?
@@ -250,7 +255,8 @@ impl<'r> TaskRun<'r> {
                 && self.checking()
                 && crate::secrets::not_checked(e)
             {
-                self.unchecked(depth, &unexpanded_label(step));
+                // The label as written names secrets, never their values.
+                self.unchecked(depth, &first_line(&step.describe()));
                 continue;
             }
             result?;
@@ -261,6 +267,8 @@ impl<'r> TaskRun<'r> {
     fn step(&mut self, step: &'r Step, scope: &Scope, depth: usize) -> Result<()> {
         match step {
             Step::Run(script) => self.run_step(&scope.expand(script)?, depth),
+            // Only `--undo` runs these, see `undo_block`.
+            Step::Undo(_) => Ok(()),
             Step::File(file) => self.file(file, scope, depth),
             Step::Call { template, args } => {
                 let template = &self.runner.file.templates[template];
@@ -285,11 +293,19 @@ impl<'r> TaskRun<'r> {
     /// A template call or inline block: check its guards, then run it.
     fn nested(&mut self, block: &'r Block, scope: &Scope, depth: usize, label: &str) -> Result<()> {
         self.status(&format!("checking {label}"));
-        if self
-            .runner
-            .failing_guard(&block.guards, scope, &self.cwd)?
-            .is_some()
-        {
+        let undo = self.runner.opts.undo;
+        if undo && block.keep {
+            self.current(depth, &format!("{label} · kept"));
+            return Ok(());
+        }
+        let skip = if undo {
+            self.undo_guard(&block.guards, scope)?.is_some()
+        } else {
+            self.runner
+                .failing_guard(&block.guards, scope, &self.cwd)?
+                .is_some()
+        };
+        if skip {
             self.current(depth, label);
             return Ok(());
         }
@@ -299,7 +315,11 @@ impl<'r> TaskRun<'r> {
         let step_mark = self.report.steps.len();
         let unchecked_before = self.report.unchecked;
         self.status(label);
-        let result = self.block(block, scope, depth + 1);
+        let result = if undo {
+            self.undo_block(block, scope, depth + 1)
+        } else {
+            self.block(block, scope, depth + 1)
+        };
         let inner_changed = self.changed;
         self.changed = changed_before || inner_changed;
         let live = self.line.as_ref().is_some_and(TaskLine::shows_live_output);
@@ -429,6 +449,9 @@ impl<'r> TaskRun<'r> {
         if self.runner.opts.pull {
             return self.pull_file(file, scope, depth, &path, &content, mode, owner.as_deref());
         }
+        if self.runner.opts.undo {
+            return self.undo_file(file, depth, &path, &content, owner.as_deref());
+        }
 
         let existing = match target::read(ctx, &self.task.name, &path, false)? {
             Current::Content(bytes) => Some(bytes),
@@ -440,7 +463,8 @@ impl<'r> TaskRun<'r> {
             differences.push(match &existing {
                 None if stat.is_some() => "can't read the current file".to_string(),
                 None => "new file".to_string(),
-                Some(_) => "content".to_string(),
+                Some(old) if file.raw => content_difference(old, &content, None),
+                Some(old) => content_difference(old, &content, Some(file.encoding)),
             });
         }
         if let Some((current, _)) = &stat
@@ -473,17 +497,281 @@ impl<'r> TaskRun<'r> {
                 }
                 Ok(())
             }
-            Mode::Run => target::write(
+            Mode::Run => {
+                self.remember(file, &path, existing, stat, owner.is_some())?;
+                target::write(
+                    ctx,
+                    &self.task.name,
+                    &path,
+                    &content,
+                    mode,
+                    owner.as_deref(),
+                    file.sudo,
+                )
+                .with_context(|| format!("failed to write {shown}"))
+            }
+        }
+    }
+
+    /// Before the first write to a file, record what it was, for `--undo`.
+    fn remember(
+        &self,
+        file: &FileStep,
+        path: &Path,
+        existing: Option<Vec<u8>>,
+        stat: Option<(u32, String)>,
+        has_owner: bool,
+    ) -> Result<()> {
+        let ctx = &self.runner.file.ctx;
+        let task = &self.task.name;
+        let root = file.sudo || has_owner;
+        let previous = match (existing, stat) {
+            (Some(content), Some((mode, owner))) => Previous::File {
+                content,
+                mode,
+                owner,
+            },
+            (None, None) => Previous::Missing,
+            // Not readable as the user: as root, if the step writes as root.
+            (None, Some((mode, owner))) if root => match target::read(ctx, task, path, true)? {
+                Current::Content(content) => Previous::File {
+                    content,
+                    mode,
+                    owner,
+                },
+                _ => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        journal::record(ctx, task, path, root, &previous)
+    }
+
+    // ---- Undo ----------------------------------------------------------------
+
+    fn undo_task(&mut self, scope: &Scope) -> Result<Outcome> {
+        let task = self.task;
+        if task.body.keep {
+            return Ok(Outcome::Skipped("keep".into()));
+        }
+        if let Some(reason) = self.undo_guard(&task.body.guards, scope)? {
+            return Ok(Outcome::Skipped(reason));
+        }
+        self.undo_block(&task.body, scope, 0)?;
+        Ok(if self.changed {
+            Outcome::Ran
+        } else {
+            Outcome::UpToDate
+        })
+    }
+
+    /// Guards, read for an undo: an `if` still says where the block applies,
+    /// and an `unless` says when it's done, which is when there's something
+    /// to undo. Returns why there's nothing to undo, if there isn't.
+    fn undo_guard(&self, guards: &[Guard], scope: &Scope) -> Result<Option<String>> {
+        if self.runner.opts.ignore_guards {
+            return Ok(None);
+        }
+        for guard in guards {
+            let applies = match guard {
+                Guard::Ask(_) if self.checking() => true,
+                Guard::Unless(_) => !guard_passes(guard, scope, &self.cwd)?,
+                Guard::If(_) | Guard::Ask(_) => guard_passes(guard, scope, &self.cwd)?,
+            };
+            if !applies {
+                let reason = guard.describe();
+                let reason = scope.expand(&reason).unwrap_or(reason);
+                return Ok(Some(match guard {
+                    Guard::Unless(_) => format!("not done ({reason})"),
+                    _ => reason,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Undo a block's steps, last first. Its guards were already checked.
+    fn undo_block(&mut self, block: &'r Block, scope: &Scope, depth: usize) -> Result<()> {
+        let mut _locks: Vec<MutexGuard<'r, ()>> = Vec::new();
+        if !self.checking() {
+            for name in &block.locks {
+                self.status(&format!("waiting for lock {name}"));
+                _locks.push(self.lock(name));
+            }
+            if block.sudo {
+                sudo::ensure(&self.task.name, &self.runner.file.ctx)?;
+            }
+        }
+        let covered = block.undo_covers_commands();
+        for step in block.steps.iter().rev() {
+            let result = match step {
+                Step::Run(_) if covered => Ok(()),
+                Step::Run(script) => {
+                    let text = format!("can't undo `{}`, it has no `undo`", first_line(script));
+                    self.cannot(depth, &text);
+                    Ok(())
+                }
+                Step::Undo(script) => scope
+                    .expand(script)
+                    .and_then(|script| self.run_step(&script, depth)),
+                // Files and nested blocks know they're undoing.
+                other => self.step(other, scope, depth),
+            };
+            if let Err(e) = &result
+                && self.checking()
+                && crate::secrets::not_checked(e)
+            {
+                self.unchecked(depth, &first_line(&step.describe()));
+                continue;
+            }
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Something `--undo` doesn't know how to undo.
+    fn cannot(&mut self, depth: usize, text: &str) {
+        self.report.cannot += 1;
+        self.record(depth, StepKind::Note, text);
+        self.push(depth, ui::cannot(text));
+    }
+
+    /// Put a file back as it was before taskpod wrote it, from the journal, or
+    /// delete it if the step says taskpod created it.
+    fn undo_file(
+        &mut self,
+        file: &FileStep,
+        depth: usize,
+        path: &Path,
+        content: &[u8],
+        owner: Option<&str>,
+    ) -> Result<()> {
+        let ctx = &self.runner.file.ctx;
+        let task = self.task.name.clone();
+        let label = format!("file {}", path.display());
+        if file.keep {
+            self.current(depth, &format!("{label} · kept"));
+            return Ok(());
+        }
+        let root = file.sudo || owner.is_some();
+        let write = !self.checking();
+        let entry = journal::read(ctx, &task, path, root, write && root)?;
+        let recorded = entry != Entry::None;
+        let previous = match entry {
+            Entry::Some(previous) => Some(previous),
+            // A root-only entry, in a check: it's there, but not readable.
+            Entry::Unreadable => None,
+            Entry::None if file.new => Some(Previous::Missing),
+            Entry::None => {
+                if target::stat(ctx, path).is_none() {
+                    self.current(depth, &format!("{label} · not on the system"));
+                } else {
+                    let text = format!(
+                        "{label}: no record of what was there before taskpod wrote it; mark it `new` if taskpod created it, or `keep`"
+                    );
+                    self.cannot(depth, &text);
+                }
+                return Ok(());
+            }
+        };
+        let current = match target::read(ctx, &task, path, write && root)? {
+            Current::Content(bytes) => Some(bytes),
+            Current::Missing | Current::Unreadable => None,
+        };
+        let stat = target::stat(ctx, path);
+        let forget = |runner: &Runner| -> Result<()> {
+            if write && recorded {
+                journal::remove(&runner.file.ctx, &task, path, root)?;
+            }
+            Ok(())
+        };
+        match &previous {
+            Some(Previous::Missing) if stat.is_none() => {
+                self.current(depth, &format!("{label} · already gone"));
+                return forget(self.runner);
+            }
+            Some(Previous::File {
+                content: old,
+                mode,
+                owner: old_owner,
+            }) if current.as_ref() == Some(old)
+                && stat
+                    .as_ref()
+                    .is_some_and(|(m, o)| m == mode && (!root || o == old_owner)) =>
+            {
+                self.current(depth, &format!("{label} · already as it was"));
+                return forget(self.runner);
+            }
+            _ => {}
+        }
+        let edited = current.as_deref().is_some_and(|c| c != content);
+        let what = match &previous {
+            Some(Previous::Missing) => "delete it, taskpod created it".to_string(),
+            Some(Previous::File { mode, .. }) => {
+                format!("put back what was there before taskpod (mode {mode:o})")
+            }
+            None => "put back what was there before taskpod".to_string(),
+        };
+        let edited_note = if edited {
+            " · changed since taskpod wrote it"
+        } else {
+            ""
+        };
+        self.change(depth, &format!("{label} · {what}{edited_note}"));
+        match self.mode() {
+            Mode::DryRun => return Ok(()),
+            Mode::Diff => {
+                if let (Some(Previous::File { content: old, .. }), Some(now)) =
+                    (&previous, &current)
+                    && old != now
+                {
+                    // What was there before may hold anything: hide it for files with secrets.
+                    let text = String::from_utf8_lossy(content);
+                    if ui::redact(&text) != text {
+                        let note = "the old content is hidden, this file holds secrets";
+                        self.record(depth + 1, StepKind::Note, note);
+                        self.push(depth + 1, style(note).dim().to_string());
+                    } else {
+                        let lines = diff_lines(now, old, file.encoding);
+                        self.record_diff(depth + 1, &lines);
+                        for line in lines {
+                            self.push(depth + 1, line);
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            Mode::Run => {}
+        }
+        if edited
+            && !self.runner.opts.yes
+            && !ui().confirm(&format!(
+                "{} changed since taskpod wrote it. Undo it anyway?",
+                path.display()
+            ))?
+        {
+            self.push(depth + 1, style("not undone").dim().to_string());
+            return Ok(());
+        }
+        let previous = previous
+            .ok_or_else(|| anyhow!("can't read the undo journal's entry for {}", path.display()))?;
+        match previous {
+            Previous::Missing => target::remove(ctx, &task, path, root),
+            Previous::File {
+                content,
+                mode,
+                owner,
+            } => target::write(
                 ctx,
-                &self.task.name,
-                &path,
+                &task,
+                path,
                 &content,
                 mode,
-                owner.as_deref(),
+                root.then_some(owner.as_str()),
                 file.sudo,
-            )
-            .with_context(|| format!("failed to write {shown}")),
+            ),
         }
+        .with_context(|| format!("failed to undo {}", path.display()))?;
+        forget(self.runner)
     }
 
     /// `--pull` for one file step: what would change in the task files, and
@@ -527,8 +815,25 @@ impl<'r> TaskRun<'r> {
         let mut parts = Vec::new();
         let mut details = Vec::new();
         let mut notes = Vec::new();
+        // Options added after the path, as one edit: two at one place would conflict.
+        let mut inserted = String::new();
+        let encoding = match (!file.raw).then(|| pull_encoding(file.encoding, &system)) {
+            Some(Some(found)) => {
+                parts.push(format!(
+                    "encoding {} → {}",
+                    file.encoding.name(),
+                    found.name()
+                ));
+                match &file.origin.encoding {
+                    Some(span) => edits.push(replace(file, span, found.name())),
+                    None => inserted.push_str(&format!(" encoding {}", found.name())),
+                }
+                found
+            }
+            _ => file.encoding,
+        };
         if system != content {
-            match pull_content(file, scope, &ctx.dir, &system) {
+            match pull_content(file, encoding, scope, &ctx.dir, &system) {
                 Ok(pulled) => {
                     if let Some(edit) = pulled.edit {
                         edits.push(edit);
@@ -546,20 +851,49 @@ impl<'r> TaskRun<'r> {
         }
         if let Some((current, current_owner)) = target::stat(ctx, path) {
             if current != mode {
-                edits.push(mode_edit(file, current));
+                match &file.origin.mode {
+                    Some(span) => edits.push(replace(file, span, &format!("{current:o}"))),
+                    None => inserted.push_str(&format!(" mode {current:o}")),
+                }
                 parts.push(format!("mode {mode:o} → {current:o}"));
             }
             if let Some(wanted) = owner
                 && !owner_matches(&current_owner, wanted)
             {
-                notes.push(
-                    style(format!(
-                        "owner is {current_owner}, not {wanted}; owners aren't pulled"
-                    ))
-                    .yellow()
-                    .to_string(),
-                );
+                // Keep the step's form: `user`, or `user:group` if it gave a group.
+                let pulled = if wanted.contains(':') {
+                    current_owner.as_str()
+                } else {
+                    current_owner.split(':').next().unwrap_or_default()
+                };
+                match &file.origin.owner {
+                    Some(span) if span.text.contains("{{") => notes.push(
+                        style(format!(
+                            "owner is {current_owner}, not {wanted}; not pulled, the step's owner uses variables"
+                        ))
+                        .yellow()
+                        .to_string(),
+                    ),
+                    Some(span) => {
+                        let text = match span.text.chars().next() {
+                            Some(q @ ('"' | '\'')) => format!("{q}{pulled}{q}"),
+                            _ => pulled.to_string(),
+                        };
+                        edits.push(replace(file, span, &text));
+                        parts.push(format!("owner {wanted} → {pulled}"));
+                    }
+                    None => {}
+                }
             }
+        }
+        if !inserted.is_empty() {
+            edits.push(pull::Edit::Source {
+                file: file.origin.file.clone(),
+                start: file.origin.after_path,
+                end: file.origin.after_path,
+                original: String::new(),
+                text: inserted,
+            });
         }
         if edits.is_empty() {
             if notes.is_empty() {
@@ -619,20 +953,6 @@ impl<'r> TaskRun<'r> {
     }
 }
 
-/// A step's label from the task file as written, for a step that couldn't be
-/// expanded: it names secrets, never their values.
-fn unexpanded_label(step: &Step) -> String {
-    match step {
-        Step::Run(script) => first_line(script),
-        Step::File(file) => format!("file {}", file.path),
-        Step::Call { template, args } => format!("{template} {args}").trim().to_string(),
-        Step::Block(inner) => inner
-            .guards
-            .first()
-            .map_or_else(|| "block".into(), Guard::describe),
-    }
-}
-
 fn first_line(script: &str) -> String {
     let first = script.lines().next().unwrap_or_default();
     if script.lines().count() > 1 {
@@ -649,11 +969,17 @@ struct Pulled {
 }
 
 /// The change to a file step's content that makes it match `system`.
-fn pull_content(file: &FileStep, scope: &Scope, dir: &Path, system: &[u8]) -> Result<Pulled> {
+fn pull_content(
+    file: &FileStep,
+    encoding: Encoding,
+    scope: &Scope,
+    dir: &Path,
+    system: &[u8],
+) -> Result<Pulled> {
     let decode = |bytes: &[u8]| {
-        file.encoding
+        encoding
             .decode(bytes)
-            .ok_or_else(|| anyhow!("the system's file isn't valid {:?}", file.encoding))
+            .ok_or_else(|| anyhow!("the system's file isn't valid {}", encoding.name()))
     };
     match &file.source {
         FileSource::Copy(source) => {
@@ -705,24 +1031,68 @@ fn pull_content(file: &FileStep, scope: &Scope, dir: &Path, system: &[u8]) -> Re
     }
 }
 
-/// Set the step's mode to `mode`, adding `mode` if it isn't given.
-fn mode_edit(file: &FileStep, mode: u32) -> pull::Edit {
-    let origin = &file.origin;
-    match &origin.mode {
-        Some(span) => pull::Edit::Source {
-            file: origin.file.clone(),
-            start: span.start,
-            end: span.end,
-            original: span.text.clone(),
-            text: format!("{mode:o}"),
-        },
-        None => pull::Edit::Source {
-            file: origin.file.clone(),
-            start: origin.after_path,
-            end: origin.after_path,
-            original: String::new(),
-            text: format!(" mode {mode:o}"),
-        },
+/// Replace one of a file step's option values.
+fn replace(file: &FileStep, span: &crate::ast::Span, text: &str) -> pull::Edit {
+    pull::Edit::Source {
+        file: file.origin.file.clone(),
+        start: span.start,
+        end: span.end,
+        original: span.text.clone(),
+        text: text.to_string(),
+    }
+}
+
+/// The encoding to pull for a step whose system file is `system`, if it isn't
+/// the step's. Only clear cases: a byte order mark that differs, or text the
+/// step's encoding can't hold.
+fn pull_encoding(step: Encoding, system: &[u8]) -> Option<Encoding> {
+    let found = Encoding::detect(system);
+    let bom = |e: Encoding| matches!(e, Encoding::Utf8Bom | Encoding::Utf16Le | Encoding::Utf16Be);
+    if found == step || system.is_empty() {
+        return None;
+    }
+    if bom(found) || bom(step) {
+        return Some(found);
+    }
+    match (step, found) {
+        // Plain ASCII is valid in all three, so only non-ASCII text decides.
+        (Encoding::Ascii | Encoding::Latin1, Encoding::Utf8) if !system.is_ascii() => Some(found),
+        (Encoding::Utf8 | Encoding::Ascii, Encoding::Latin1) => Some(found),
+        _ => None,
+    }
+}
+
+/// What differs between the system's file and the step's content, named as
+/// precisely as possible. `encoding` is `None` for raw copies.
+fn content_difference(old: &[u8], new: &[u8], encoding: Option<Encoding>) -> String {
+    let Some(encoding) = encoding else {
+        return "content".into();
+    };
+    let found = Encoding::detect(old);
+    let (Some(old_text), Some(new_text)) = (found.decode(old), encoding.decode(new)) else {
+        return "content".into();
+    };
+    let lf = |t: &str| t.replace("\r\n", "\n");
+    if old_text == new_text {
+        if found == encoding {
+            "content".into()
+        } else {
+            format!("encoding {} → {}", found.name(), encoding.name())
+        }
+    } else if lf(&old_text) == lf(&new_text) {
+        if old_text.contains("\r\n") {
+            "line endings CRLF → LF".into()
+        } else {
+            "line endings LF → CRLF".into()
+        }
+    } else if old_text.trim_end_matches(['\r', '\n']) == new_text.trim_end_matches(['\r', '\n']) {
+        if new_text.len() > old_text.len() {
+            "adds a final newline".into()
+        } else {
+            "removes the final newline".into()
+        }
+    } else {
+        "content".into()
     }
 }
 
@@ -775,7 +1145,11 @@ fn pump(stream: impl Read, line: &TaskLine) {
 
 /// A unified diff between the current and the new content.
 fn diff_lines(old: &[u8], new: &[u8], encoding: Encoding) -> Vec<String> {
-    let (Some(old_text), Some(new_text)) = (encoding.decode(old), encoding.decode(new)) else {
+    // The system's file may be in another encoding than the step's.
+    let old_text = encoding
+        .decode(old)
+        .or_else(|| Encoding::detect(old).decode(old));
+    let (Some(old_text), Some(new_text)) = (old_text, encoding.decode(new)) else {
         let message = format!(
             "binary content differs ({} → {} bytes)",
             old.len(),

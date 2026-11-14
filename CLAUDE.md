@@ -21,6 +21,10 @@ idempotent. Its main use is setting up an Arch system from
 - `src/exec/step.rs`: running steps: shell, files (content/mode/owner, diffs), template calls and inline blocks.
   With `--pull` (`Options::pull`, combined with the Run/DryRun/Diff mode) file steps are compared the
   other way and queue edits on `Runner::edits`, which `main` applies at the end.
+- `src/exec/journal.rs`: `--undo`'s record of each file before taskpod first wrote it, on the target
+  machine (`~/.local/state/taskpod`, root files in `/var/lib/taskpod`); `Ctx::journal` overrides the
+  place, and test builds always use the task file's directory. Undo itself (`undo_task`, `undo_block`,
+  `undo_file`) is in `src/exec/step.rs`; `Runner::run` reverses dependencies when `Options::undo`.
 - `src/exec/graph.rs`: `--graph` (tree, dot, mermaid) of the tasks `select` picks, from the file alone.
 - `src/exec/json.rs`: `--json` documents. `TaskRun` records each step as a `StepRecord` next to the
   printed lines; `--no-secrets` errors (`secrets::NOT_CHECKED`, matched by text since lazy variables

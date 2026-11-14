@@ -1,4 +1,5 @@
 use super::*;
+use crate::ast::Encoding;
 use crate::parser::parse_str;
 
 fn options(jobs: usize) -> Options {
@@ -9,6 +10,7 @@ fn options(jobs: usize) -> Options {
         skip: HashSet::new(),
         pull: false,
         yes: false,
+        undo: false,
     }
 }
 
@@ -820,4 +822,323 @@ fn json_redacts_secrets_and_colors() {
     assert_eq!(steps[0]["diff"][1], "-••••");
     assert_eq!(steps[0]["diff"][2], "+key=••••");
     assert_eq!(steps[1]["kind"], "note");
+}
+
+#[cfg(unix)]
+#[test]
+fn compares_and_pulls_attributes() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display().to_string();
+    let main = dir.path().join("main.task");
+    let source = format!(
+        r#"task t {{
+    file "{d}/enc" encoding utf-16le "hi\n"
+    file "{d}/crlf" "a\nb\n"
+    file "{d}/nl" "x"
+    file "{d}/link" "same\n"
+    file "{d}/owned" owner root "o\n"
+    file "{d}/both" "q\n"
+}}
+"#
+    );
+    std::fs::write(&main, &source).unwrap();
+    let set = |name: &str, bytes: &[u8], mode: u32| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set("enc", b"hi\n", 0o644);
+    set("crlf", b"a\r\nb\r\n", 0o644);
+    set("nl", b"x\n", 0o644);
+    set("target", b"same\n", 0o644);
+    std::os::unix::fs::symlink(dir.path().join("target"), dir.path().join("link")).unwrap();
+    set("owned", b"o\n", 0o644);
+    set("both", &Encoding::Utf16Le.encode("q\n").unwrap(), 0o640);
+
+    let file = crate::parser::parse_file(&main).unwrap();
+    let document = check_json("", dir.path(), Mode::Diff, |f| *f = file);
+    let labels: Vec<String> = task(&document, "t")["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["kind"] == "change")
+        .map(|s| s["label"].as_str().unwrap().replace(&d, ""))
+        .collect();
+    let me = std::process::Command::new("id")
+        .arg("-un")
+        .output()
+        .unwrap();
+    let me = String::from_utf8(me.stdout).unwrap().trim().to_string();
+    assert_eq!(labels.len(), 5, "{labels:?}");
+    assert_eq!(labels[0], "file /enc · encoding utf-8 → utf-16le");
+    assert_eq!(labels[1], "file /crlf · line endings CRLF → LF");
+    assert_eq!(labels[2], "file /nl · removes the final newline");
+    // The symlink's target matches, mode included: no change for /link.
+    assert!(
+        labels[3].starts_with(&format!("file /owned · owner {me}:")),
+        "{labels:?}"
+    );
+    assert!(labels[3].ends_with(" → root"), "{labels:?}");
+    assert_eq!(
+        labels[4],
+        "file /both · encoding utf-16le → utf-8, mode 640 → 644"
+    );
+
+    // Pull it all back into the task file.
+    let file = crate::parser::parse_file(&main).unwrap();
+    let mut opts = options(1);
+    opts.pull = true;
+    opts.yes = true;
+    let runner = Runner::new(&file, &opts);
+    runner.run(&select(&file, &[]).unwrap());
+    let edits = std::mem::take(&mut *runner.edits.lock().unwrap());
+    let applied = pull::apply(&edits);
+    assert!(applied.problems.is_empty(), "{:?}", applied.problems);
+    let pulled = std::fs::read_to_string(&main).unwrap();
+    assert!(
+        pulled.contains(&format!(r#"file "{d}/enc" encoding utf-8 "hi\n""#)),
+        "{pulled}"
+    );
+    assert!(
+        pulled.contains(&format!(r#"file "{d}/owned" owner {me} "o\n""#)),
+        "{pulled}"
+    );
+    assert!(
+        pulled.contains(&format!(
+            r#"file "{d}/both" encoding utf-16le mode 640 "q\n""#
+        )),
+        "{pulled}"
+    );
+
+    // And now the task file matches the system for those steps.
+    let file = crate::parser::parse_file(&main).unwrap();
+    let document = check_json("", dir.path(), Mode::Diff, |f| *f = file);
+    let changed: Vec<String> = task(&document, "t")["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["kind"] == "change")
+        .map(|s| s["label"].as_str().unwrap().replace(&d, ""))
+        .collect();
+    assert!(
+        !changed
+            .iter()
+            .any(|l| l.contains("/enc") || l.contains("/owned") || l.contains("/both")),
+        "{changed:?}"
+    );
+}
+
+/// Undo (or preview undoing, with `mode`) `targets` of `source`.
+#[cfg(unix)]
+fn undo(source: &str, dir: &Path, mode: Mode, targets: &[&str]) -> HashMap<String, Outcome> {
+    let file = parse_str(source, dir).unwrap_or_else(|e| panic!("{e:#}"));
+    let targets: Vec<String> = targets.iter().map(|s| s.to_string()).collect();
+    let mut opts = options(2);
+    opts.mode = mode;
+    opts.undo = true;
+    opts.yes = true;
+    let order = select_undo(&file, &targets).unwrap();
+    Runner::new(&file, &opts).run(&order).into_iter().collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn undo_puts_files_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = |n: &str| dir.path().join(n);
+    std::fs::write(path("existing"), "before\n").unwrap();
+    std::fs::set_permissions(path("existing"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(path("unrecorded"), "theirs\n").unwrap();
+    std::fs::write(path("kept"), "mine\n").unwrap();
+    let source = r#"
+        task files {
+            file "existing" "managed\n"
+            file "unrecorded" "managed\n"
+            file "marked" new "x\n"
+            file "kept" keep "managed\n"
+        }
+    "#;
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["files"],
+        Outcome::Ran
+    );
+    assert_eq!(read(dir.path(), "existing"), "managed\n");
+    // As if these were written before the journal existed: `new` says
+    // taskpod created it, and nothing is known about the other one.
+    for entry in std::fs::read_dir(path(".taskpod-journal/user")).unwrap() {
+        let entry = entry.unwrap().path();
+        let name = entry.file_name().unwrap().to_string_lossy().to_string();
+        if name.ends_with("unrecorded") || name.ends_with("marked") {
+            std::fs::remove_file(entry).unwrap();
+        }
+    }
+    let source = source.to_string();
+
+    // A preview shows what would happen and changes nothing.
+    let file = parse_str(&source, dir.path()).unwrap();
+    let mut opts = options(1);
+    opts.mode = Mode::Diff;
+    opts.undo = true;
+    let runner = Runner::new(&file, &opts);
+    runner.run(&select_undo(&file, &[]).unwrap());
+    let reports = runner.reports.lock().unwrap();
+    let steps: Vec<(StepKind, String)> = reports["files"]
+        .steps
+        .iter()
+        .map(|s| {
+            (
+                s.kind,
+                s.label.replace(&dir.path().display().to_string(), ""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            (StepKind::Ok, "file /kept · kept".to_string()),
+            (StepKind::Change, "file /marked · delete it, taskpod created it".to_string()),
+            (StepKind::Note, "file /unrecorded: no record of what was there before taskpod wrote it; mark it `new` if taskpod created it, or `keep`".to_string()),
+            (StepKind::Change, "file /existing · put back what was there before taskpod (mode 600)".to_string()),
+        ]
+    );
+    assert_eq!(
+        reports["files"].steps[3].diff.as_deref().unwrap(),
+        ["@@ -1 +1 @@", "-managed", "+before"]
+    );
+    assert_eq!(reports["files"].cannot, 1);
+    drop(reports);
+    assert_eq!(read(dir.path(), "existing"), "managed\n");
+
+    assert_eq!(
+        undo(&source, dir.path(), Mode::Run, &[])["files"],
+        Outcome::Ran
+    );
+    assert_eq!(read(dir.path(), "existing"), "before\n");
+    let mode = std::fs::metadata(path("existing"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(!path("marked").exists());
+    assert_eq!(read(dir.path(), "unrecorded"), "managed\n");
+    assert_eq!(read(dir.path(), "kept"), "managed\n");
+    // Undone files leave the journal (`kept` was never written: it stays
+    // recorded); doing it again finds nothing to do.
+    let left: Vec<String> = std::fs::read_dir(path(".taskpod-journal/user"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(left.iter().all(|n| n.ends_with("kept")), "{left:?}");
+    assert_eq!(
+        undo(&source, dir.path(), Mode::Run, &[])["files"],
+        Outcome::UpToDate
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn undo_runs_undo_steps_in_reverse() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = r#"
+        template mk {
+            unless test -e {{ 1 }}
+            run touch {{ 1 }}
+            undo rm {{ 1 }}
+        }
+        task base {
+            run echo base >> forward
+            undo echo base >> log
+        }
+        task app {
+            needs base
+            undo test -e app.conf || echo "first undo, after the file" >> log
+            file "app.conf" "x\n"
+            mk made-a
+            mk made-b
+            undo test -e app.conf && echo "last undo, runs first" >> log
+        }
+        subtask app-up of app {
+            undo echo app-up >> log
+        }
+        task stuck {
+            run echo no undo here
+        }
+        task left {
+            keep
+            run echo left alone
+        }
+        task elsewhere {
+            if false
+            undo echo never >> log
+        }
+    "#;
+    let outcomes = run(source, dir.path(), &options(1), &[]);
+    assert_eq!(outcomes["app"], Outcome::Ran);
+    std::fs::remove_file(dir.path().join("made-b")).unwrap();
+
+    let outcomes = undo(source, dir.path(), Mode::Run, &[]);
+    assert_eq!(outcomes["app"], Outcome::Ran, "{outcomes:?}");
+    assert_eq!(outcomes["stuck"], Outcome::UpToDate);
+    assert_eq!(outcomes["left"], Outcome::Skipped("keep".into()));
+    assert_eq!(outcomes["elsewhere"], Outcome::Skipped("if false".into()));
+    // Dependents before what they need, subtasks before their parent, and
+    // in a task, the last step first.
+    assert_eq!(
+        read(dir.path(), "log"),
+        "app-up\nlast undo, runs first\nfirst undo, after the file\nbase\n"
+    );
+    assert!(!dir.path().join("made-a").exists());
+    assert!(!dir.path().join("app.conf").exists());
+
+    // With --run: the task and its subtasks, not what it needs.
+    std::fs::remove_file(dir.path().join("log")).unwrap();
+    let outcomes = undo(source, dir.path(), Mode::Run, &["app"]);
+    assert_eq!(outcomes.keys().len(), 2, "{outcomes:?}");
+    assert!(outcomes.contains_key("app-up"));
+}
+
+#[cfg(unix)]
+#[test]
+fn undo_notices_later_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = r#"
+        task t {
+            file "conf" "managed\n"
+        }
+    "#;
+    run(source, dir.path(), &options(1), &[]);
+    std::fs::write(dir.path().join("conf"), "edited by hand\n").unwrap();
+    let file = parse_str(source, dir.path()).unwrap();
+    let mut opts = options(1);
+    opts.mode = Mode::DryRun;
+    opts.undo = true;
+    let runner = Runner::new(&file, &opts);
+    runner.run(&select_undo(&file, &[]).unwrap());
+    let label = runner.reports.lock().unwrap()["t"].steps[0].label.clone();
+    assert!(
+        label.ends_with("delete it, taskpod created it · changed since taskpod wrote it"),
+        "{label}"
+    );
+    // --yes undoes it anyway.
+    assert_eq!(undo(source, dir.path(), Mode::Run, &[])["t"], Outcome::Ran);
+    assert!(!dir.path().join("conf").exists());
+}
+
+#[test]
+fn undo_keeps_what_others_need() {
+    let file = parse_str(
+        "task c {\n run true\n}\ntask a {\n needs c\n run true\n}\ntask b {\n needs c\n run true\n}\ntask m {\n manual\n needs c\n run true\n}\n",
+        Path::new("/tmp"),
+    )
+    .unwrap();
+    // Undoing a leaves c, which b still needs.
+    assert_eq!(select_undo(&file, &["a".into()]).unwrap(), ["a"]);
+    // c alone would break a and b (manual tasks don't count).
+    let err = select_undo(&file, &["c".into()]).unwrap_err().to_string();
+    assert!(err.contains("a needs c, b needs c"), "{err}");
+    assert!(err.contains("-u -r c a b"), "{err}");
+    let all = select_undo(&file, &["c".into(), "a".into(), "b".into()]).unwrap();
+    assert_eq!(all, ["c", "a", "b"]);
 }
