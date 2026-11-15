@@ -408,11 +408,12 @@ pub fn nothing_to_undo(name: &str) -> String {
         .to_string()
 }
 
-/// Something `--undo` can't do.
+/// A `notice` step's message.
 pub fn notice(text: &str) -> String {
     format!("{} {}", style("!").yellow().bold(), style(text).yellow())
 }
 
+/// Something `--undo` can't do.
 pub fn cannot(text: &str) -> String {
     format!("{} {}", style("!").yellow().bold(), style(text).yellow())
 }

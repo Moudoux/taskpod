@@ -326,10 +326,7 @@ impl<'s> Parser<'s> {
                 _ => {
                     let line = self.rest_of_line();
                     // Template arguments aren't shell, so strip trailing comments.
-                    let args = match line.find(" #") {
-                        Some(i) => line[..i].trim_end().to_string(),
-                        None => line,
-                    };
+                    let args = strip_comment(&line).trim_end().to_string();
                     body.block.steps.push(Step::Call {
                         template: keyword,
                         args,
@@ -363,10 +360,11 @@ impl<'s> Parser<'s> {
             return Ok((guard, opens_block));
         }
         let mut command = self.rest_of_line();
-        let opens_block = command == "{" || command.ends_with(" {") || command.ends_with("\t{");
+        // `unless check { # why` opens a block too, like `run { # why`.
+        let code = strip_comment(&command).trim_end();
+        let opens_block = code == "{" || code.ends_with(" {") || code.ends_with("\t{");
         if opens_block {
-            command.pop();
-            command = command.trim_end().to_string();
+            command = code[..code.len() - 1].trim_end().to_string();
         }
         if command.is_empty() {
             return Err(self.error(format!("'{keyword}' needs a command")));
@@ -1021,6 +1019,32 @@ fn is_keyword(word: &str) -> bool {
     )
 }
 
+/// `line` without a trailing `# comment`: a `#` at the start or after
+/// whitespace, outside quotes and not escaped, as the shell reads it.
+fn strip_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut after_space = true;
+    for (i, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            after_space = false;
+            continue;
+        }
+        match quote {
+            Some('"') if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\\' => escaped = true,
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == '#' && after_space => return &line[..i],
+            None => {}
+        }
+        after_space = c.is_whitespace();
+    }
+    line
+}
+
 /// Content of a `"""` string. A leading newline is dropped, and when the
 /// closing `"""` is on its own line, its indentation is removed from every line.
 fn triple_quoted(raw: &str) -> String {
@@ -1307,6 +1331,27 @@ mod tests {
         );
         assert!(parse_err("if true {\n}\n").contains("only allowed inside tasks"));
         assert!(parse_err("task t {\n  if true {\n    needs a\n  }\n}\n").contains("inline block"));
+    }
+
+    #[test]
+    fn comments_after_block_openers_and_calls() {
+        let file = parse(
+            "task t {\n    unless test -e x { # make x\n        pkg a \"b # c\"\t# why\n    }\n    if grep -q 'a { #b' f\n}\ntemplate pkg {\n    run echo {{ args }}\n}\n",
+        );
+        let steps = &file.tasks["t"].body.steps;
+        let Step::Block(block) = &steps[0] else {
+            panic!("{steps:?}")
+        };
+        assert!(matches!(&block.guards[0], Guard::Unless(c) if c == "test -e x"));
+        assert!(
+            matches!(&block.steps[0], Step::Call { args, .. } if args == "a \"b # c\""),
+            "{:?}",
+            block.steps
+        );
+        // A `{` inside quotes doesn't open a block.
+        let guards = &file.tasks["t"].body.guards;
+        assert!(matches!(&guards[..], [Guard::If(c)] if c == "grep -q 'a { #b' f"));
+        assert_eq!(strip_comment(r"echo a\ #b # c"), r"echo a\ #b ");
     }
 
     #[test]

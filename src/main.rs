@@ -296,7 +296,7 @@ fn run(mut args: Args) -> Result<bool> {
     let (cannot, notices) = {
         let reports = runner.reports.lock().unwrap_or_else(|e| e.into_inner());
         let cannot = reports.values().map(|r| r.cannot).sum();
-        // In the order the tasks finished, like the lines above the summary.
+        // In task order: a task's notices come after those of the tasks it needs.
         let notices: Vec<(String, String)> = outcomes
             .iter()
             .filter_map(|(name, _)| reports.get(name).map(|r| (name, &r.notices)))

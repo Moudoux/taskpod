@@ -79,10 +79,17 @@ pub fn mentions_sudo(script: &str) -> bool {
     let mut escaped = false;
     for c in script.chars() {
         match quote {
+            // Outside quotes the character stands for itself: `\sudo` runs sudo.
+            None if escaped => {
+                escaped = false;
+                unquoted.push(c);
+            }
             _ if escaped => escaped = false,
             Some(q) if c == q => quote = None,
             Some('"') if c == '\\' => escaped = true,
             Some(_) => {}
+            // `it\'s` has no quote in it.
+            None if c == '\\' => escaped = true,
             None if c == '\'' || c == '"' => {
                 quote = Some(c);
                 unquoted.push(' ');
@@ -104,5 +111,7 @@ mod tests {
         assert!(!super::mentions_sudo("pseudo-random sudoers"));
         assert!(!super::mentions_sudo("echo \"run 'sudo x'\" 'sudo'"));
         assert!(super::mentions_sudo("echo \"a\\\"\" && sudo b"));
+        assert!(super::mentions_sudo("echo it\\'s && sudo b"));
+        assert!(super::mentions_sudo("\\sudo b"));
     }
 }

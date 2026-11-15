@@ -454,15 +454,10 @@ impl<'r> TaskRun<'r> {
             return self.dir(file, scope, depth);
         }
         let ctx = &self.runner.file.ctx;
-        let path = PathBuf::from(ctx.target_path(&scope.expand(&file.path)?));
-        let path = if path.is_absolute() {
-            path
-        } else {
-            self.cwd.join(path)
-        };
+        let path = self.target(&scope.expand(&file.path)?);
         let shown = path.display().to_string();
-        let content = file_content(file, scope, &self.runner.file.ctx.dir)
-            .with_context(|| format!("file {shown}"))?;
+        let content =
+            file_content(file, scope, &ctx.dir).with_context(|| format!("file {shown}"))?;
         let mode = file.mode.unwrap_or(if content.starts_with(b"#!") {
             0o755
         } else {

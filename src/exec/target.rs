@@ -325,11 +325,13 @@ fn write_with_sudo(path: &Path, content: &[u8], mode: u32, owner: Option<&str>) 
         .stderr(Stdio::piped())
         .spawn()
         .context("failed to run sudo")?;
-    child
+    // If sudo or the script exits early, the write fails with a broken pipe;
+    // its exit status and stderr say why, so those are reported first.
+    let written = child
         .stdin
         .take()
         .ok_or_else(|| anyhow!("no stdin for sudo"))?
-        .write_all(content)?;
+        .write_all(content);
     let output = child.wait_with_output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -339,6 +341,7 @@ fn write_with_sudo(path: &Path, content: &[u8], mode: u32, owner: Option<&str>) 
             stderr.trim()
         );
     }
+    written.context("failed to send the content to sudo")?;
     Ok(())
 }
 
