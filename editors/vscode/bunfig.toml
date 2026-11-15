@@ -1,0 +1,4 @@
+[install]
+# Refuse npm versions younger than 20 days (in seconds), matching Renovate's
+# minimumReleaseAge, so transitive dependencies get the same delay.
+minimumReleaseAge = 1728000

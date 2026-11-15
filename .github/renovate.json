@@ -1,0 +1,38 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
+  "minimumReleaseAge": "20 days",
+  "internalChecksFilter": "strict",
+  "schedule": ["before 6am on monday"],
+  "timezone": "Europe/Stockholm",
+  "packageRules": [
+    {
+      "description": "Moves with engines.vscode, which sets the oldest VS Code the extension runs on; vsce refuses a newer @types/vscode",
+      "matchPackageNames": ["@types/vscode"],
+      "enabled": false
+    },
+    {
+      "description": "Match the Node major that VS Code's Electron ships, bump by hand",
+      "matchPackageNames": ["@types/node"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "One PR for the Rust crates' minor and patch updates",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "Rust crates"
+    },
+    {
+      "description": "One PR for the extension's minor and patch updates",
+      "matchManagers": ["bun"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "VS Code extension dependencies"
+    },
+    {
+      "description": "One PR for GitHub Actions updates",
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions"
+    }
+  ]
+}
