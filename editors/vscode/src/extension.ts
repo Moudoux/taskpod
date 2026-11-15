@@ -7,6 +7,7 @@ import { BUILTIN_VARS, ENCODINGS, KEYWORDS, keywordMarkdown, type Place } from "
 import { LiveChecks, REPORT_SCHEME } from "./checks";
 import { type Index, type RefKind, parse, resolveVar, symbolAt } from "./index";
 import { hoverMarkdown, title } from "./live";
+import { IncludeGraph } from "./project";
 import { type SecretKey, secretKeys } from "./secrets";
 
 const LANGUAGE = "taskpod";
@@ -32,34 +33,67 @@ function indexOf(document: vscode.TextDocument): Index {
   if (cached?.version === document.version) return cached.index;
   const index = parse(document.getText());
   cache.set(key, { version: document.version, index });
+  if (document.uri.scheme === "file") recordIncludes(document.uri, index);
   return index;
 }
 
+const diskCache = new Map<string, { mtime: number; index: Index }>();
+
 function readIndex(uri: vscode.Uri): Index | undefined {
   const open = vscode.workspace.textDocuments.find((d) => d.uri.toString() === uri.toString());
-  if (open) return indexOf(open);
+  return open ? indexOf(open) : readDiskIndex(uri);
+}
+
+function readDiskIndex(uri: vscode.Uri): Index | undefined {
   try {
-    return parse(fs.readFileSync(uri.fsPath, "utf8"));
+    const mtime = fs.statSync(uri.fsPath).mtimeMs;
+    const cached = diskCache.get(uri.fsPath);
+    const index = cached?.mtime === mtime ? cached.index : parse(fs.readFileSync(uri.fsPath, "utf8"));
+    diskCache.set(uri.fsPath, { mtime, index });
+    recordIncludes(uri, index);
+    return index;
   } catch {
+    diskCache.delete(uri.fsPath);
     return undefined;
   }
 }
 
-/** This file and everything it includes, recursively. */
+/** Which files include which, so an included file also sees the files above it. */
+const graph = new IncludeGraph();
+/** Called when a file's includes change, since other open files may now resolve differently. */
+let onIncludesChanged = () => {};
+
+function includePaths(uri: vscode.Uri, index: Index): string[] {
+  return index.paths.filter((p) => p.kind === "include" && !p.path.includes("{{")).map((p) => resolvePath(p.path, uri));
+}
+
+function recordIncludes(uri: vscode.Uri, index: Index | undefined): void {
+  const changed = index ? graph.set(uri.fsPath, includePaths(uri, index)) : graph.delete(uri.fsPath);
+  if (changed) onIncludesChanged();
+}
+
+/**
+ * This file first, then everything it includes, then the files that include it
+ * (up to the files taskpod runs on) and everything those include: all of it is
+ * one file to taskpod, so tasks, templates and variables resolve across it.
+ */
 function project(document: vscode.TextDocument): FileIndex[] {
   const files: FileIndex[] = [];
   const seen = new Set<string>();
   const visit = (uri: vscode.Uri, index: Index | undefined) => {
-    if (!index || seen.has(uri.fsPath) || seen.size > 32) return;
+    if (!index || seen.has(uri.fsPath) || seen.size > 128) return;
     seen.add(uri.fsPath);
     files.push({ uri, index });
-    for (const p of index.paths) {
-      if (p.kind !== "include" || p.path.includes("{{")) continue;
-      const target = vscode.Uri.file(resolvePath(p.path, uri));
-      visit(target, readIndex(target));
+    for (const target of includePaths(uri, index)) {
+      const targetUri = vscode.Uri.file(target);
+      visit(targetUri, readIndex(targetUri));
     }
   };
   visit(document.uri, indexOf(document));
+  for (const root of graph.roots(document.uri.fsPath)) {
+    const uri = vscode.Uri.file(root);
+    visit(uri, readIndex(uri));
+  }
   return files;
 }
 
@@ -477,11 +511,31 @@ function lint(document: vscode.TextDocument): vscode.Diagnostic[] {
   return diagnostics;
 }
 
-/** Errors from `taskpod --check`, which knows the full language. */
-function check(document: vscode.TextDocument): Promise<vscode.Diagnostic[]> {
+/** `taskpod --check` errors that only mean a name is defined in a file that includes this one. */
+const NEEDS_INCLUDER = /needs unknown task '|unknown directive or template '/;
+
+/**
+ * Errors from `taskpod --check`, which knows the full language. An included file is
+ * also checked from the files that include it, since on its own it may use tasks and
+ * templates they define: of its own check, only errors that don't depend on them count.
+ */
+async function check(document: vscode.TextDocument): Promise<vscode.Diagnostic[]> {
+  const roots = graph.roots(document.uri.fsPath);
+  const own = await checkFrom(document.uri.fsPath, document, true);
+  if (!roots.length) return own;
+  const fromRoots = (await Promise.all(roots.map((root) => checkFrom(root, document, false)))).flat();
+  const seen = new Set<string>();
+  return [...own.filter((d) => !NEEDS_INCLUDER.test(d.message)), ...fromRoots].filter((d) => {
+    const key = `${d.range.start.line}:${d.message}`;
+    return !seen.has(key) && seen.add(key);
+  });
+}
+
+/** Errors from checking `target`, placed in `document`; errors in other files at its top if `others`. */
+function checkFrom(target: string, document: vscode.TextDocument, others: boolean): Promise<vscode.Diagnostic[]> {
   const binary = vscode.workspace.getConfiguration("taskpod").get("path", "taskpod");
   return new Promise((resolve) => {
-    execFile(binary, [document.uri.fsPath, "--check"], { env: { ...process.env, NO_COLOR: "1" }, timeout: 10_000 }, (error, _stdout, stderr) => {
+    execFile(binary, [target, "--check"], { env: { ...process.env, NO_COLOR: "1" }, timeout: 10_000 }, (error, _stdout, stderr) => {
       if (!error) return resolve([]);
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return resolve([]);
       const diagnostics: vscode.Diagnostic[] = [];
@@ -490,6 +544,7 @@ function check(document: vscode.TextDocument): Promise<vscode.Diagnostic[]> {
         if (!m) continue;
         const [, file, row, col, message] = m;
         if (path.resolve(file) !== path.resolve(document.uri.fsPath)) {
+          if (!others) continue;
           const at = new vscode.Range(0, 0, 0, 0);
           diagnostics.push(Object.assign(new vscode.Diagnostic(at, `${file}:${row}: ${message}`), { source: "taskpod --check" }));
           continue;
@@ -539,6 +594,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const lintDiagnostics = vscode.languages.createDiagnosticCollection("taskpod");
   const checkDiagnostics = vscode.languages.createDiagnosticCollection("taskpod-check");
   const timers = new Map<string, NodeJS.Timeout>();
+  const watcher = vscode.workspace.createFileSystemWatcher("**/*.task");
 
   const relint = (document: vscode.TextDocument) => {
     if (document.languageId !== LANGUAGE) return;
@@ -605,6 +661,15 @@ export function activate(context: vscode.ExtensionContext): void {
       lintDiagnostics.delete(d.uri);
       checkDiagnostics.delete(d.uri);
       cache.delete(d.uri.toString());
+      // Unsaved include lines may have been recorded; go back to what's on disk.
+      if (d.languageId === LANGUAGE && d.uri.scheme === "file") recordIncludes(d.uri, readDiskIndex(d.uri));
+    }),
+    watcher,
+    watcher.onDidCreate((uri) => void readIndex(uri)),
+    watcher.onDidChange((uri) => void readIndex(uri)),
+    watcher.onDidDelete((uri) => {
+      diskCache.delete(uri.fsPath);
+      recordIncludes(uri, undefined);
     }),
     vscode.commands.registerCommand("taskpod.runFile", (uri?: vscode.Uri) => runTaskpod(uri, [])),
     vscode.commands.registerCommand("taskpod.dryRunFile", (uri?: vscode.Uri) => runTaskpod(uri, ["--dry-run"])),
@@ -619,6 +684,21 @@ export function activate(context: vscode.ExtensionContext): void {
     if (document.languageId === LANGUAGE) live.schedule(document.uri, 0);
   }
   live.updateStatus();
+
+  // Find which workspace files include which, so included files see the files above them.
+  let includesTimer: NodeJS.Timeout | undefined;
+  const relintAll = () => vscode.workspace.textDocuments.forEach(relint);
+  void Promise.resolve(vscode.workspace.findFiles("**/*.task", "**/node_modules/**")).then((uris) => {
+    for (const uri of uris) readIndex(uri);
+    onIncludesChanged = () => {
+      clearTimeout(includesTimer);
+      includesTimer = setTimeout(relintAll, 300);
+    };
+    // The first diagnostics came before the files above each open file were known.
+    relintAll();
+    for (const document of vscode.workspace.textDocuments) if (graph.roots(document.uri.fsPath).length) void recheck(document);
+  });
+  context.subscriptions.push({ dispose: () => clearTimeout(includesTimer) });
 }
 
 export function deactivate(): void {}

@@ -4,7 +4,7 @@
   "description": "Syntax highlighting, completion, hover docs, go to definition, diagnostics and live checks against the system for taskpod .task files",
   "version": "0.11.3",
   "publisher": "moudoux",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/Moudoux/taskpod"
@@ -21,7 +21,11 @@
         "id": "taskpod",
         "aliases": ["Taskpod", "taskpod"],
         "extensions": [".task"],
-        "configuration": "./language-configuration.json"
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/task-light.svg",
+          "dark": "./icons/task-dark.svg"
+        }
       }
     ],
     "grammars": [

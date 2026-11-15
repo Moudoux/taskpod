@@ -42,6 +42,8 @@ idempotent. Its main use is setting up an Arch system from
 - `editors/vscode/`: VS Code extension (TypeScript, built with bun). `src/index.ts` is its own
   line-based indexer of task files, separate from the Rust parser; update both when the syntax changes,
   along with the TextMate grammar, `src/docs.ts` and [Task.xml](Task.xml).
+  `src/project.ts` tracks which workspace files include which, so an included file is read
+  together with the files above it (lookups, diagnostics, and `--check` run from those files).
   Live checks: `src/live.ts` reads `--json` (no vscode imports, unit tested), `src/checks.ts` runs
   checks for files enabled in workspace state and shows results; bump `JSON_VERSION` in both with the shape.
 - `dist/arch/PKGBUILD`: Arch package, builds from the repo (`cd dist/arch && makepkg -si`).

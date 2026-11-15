@@ -10,7 +10,7 @@ pkgrel=1
 pkgdesc="Declarative task runner: tasks declare dependencies and run in parallel"
 arch=(x86_64 aarch64)
 url="https://github.com/Moudoux/taskpod"
-license=(unknown)
+license=(MIT)
 depends=(gcc-libs glibc)
 makedepends=(cargo)
 
@@ -41,4 +41,5 @@ package() {
   install -Dm644 "$_root/README.md" "$pkgdir/usr/share/doc/taskpod/README.md"
   install -Dm644 "$_root/spec.task" "$pkgdir/usr/share/doc/taskpod/spec.task"
   install -Dm644 "$_root/Task.xml" "$pkgdir/usr/share/taskpod/Task.xml"
+  install -Dm644 "$_root/LICENSE" "$pkgdir/usr/share/licenses/taskpod/LICENSE"
 }

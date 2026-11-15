@@ -13,6 +13,11 @@ Language support for [taskpod](https://github.com/Moudoux/taskpod) `.task` files
   `env` and `secrets` paths to open the file, and on a `file` destination to
   open the file on your system
 - **Find references**, **rename** and the **outline** for tasks, templates and variables
+- **Across includes**, both ways: a file sees what it includes, and an included file
+  also sees the files in the workspace that include it (and everything they include),
+  so `needs` on a task from `main.task` or a sibling include resolves, completes and
+  isn't flagged as unknown
+- A **file icon** for `.task` files in the explorer and tabs
 - **Diagnostics** while typing (unknown tasks, templates and variables, missing
   files, secrets missing from the `secrets` files) and from `taskpod --check` when saving
 - **Run, Dry run and Diff** above each task, and in the editor title bar for the file
