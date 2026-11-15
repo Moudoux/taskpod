@@ -1784,3 +1784,61 @@ fn makes_directories_over_ssh() {
     super::target::remove_dir(&file.ctx, "t", &made, false).unwrap();
     assert!(!made.exists());
 }
+
+#[test]
+fn notices_are_reported_without_counting_as_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = r#"
+        let what = "scratch"
+        task quiet {
+            unless false {
+                notice "{{ what }} isn't mounted"
+            }
+            unless true {
+                notice "never shown"
+            }
+        }
+        task busy {
+            run touch made
+            notice "made it"
+        }
+    "#;
+    let file = parse_str(source, dir.path()).unwrap();
+    for mode in [Mode::Run, Mode::DryRun, Mode::Diff] {
+        let mut opts = options(1);
+        opts.mode = mode;
+        let runner = Runner::new(&file, &opts);
+        let outcomes: HashMap<_, _> = runner
+            .run(&select(&file, &[]).unwrap())
+            .into_iter()
+            .collect();
+        assert_eq!(outcomes["quiet"], Outcome::UpToDate, "{mode:?}");
+        assert_eq!(outcomes["busy"], Outcome::Ran, "{mode:?}");
+        let reports = runner.reports.lock().unwrap();
+        assert_eq!(reports["quiet"].notices, ["scratch isn't mounted"]);
+        assert_eq!(reports["busy"].notices, ["made it"]);
+        assert!(
+            reports["quiet"]
+                .steps
+                .iter()
+                .any(|s| s.kind == StepKind::Note && s.label == "scratch isn't mounted")
+        );
+    }
+
+    // Undo skips them, and they aren't commands it can't undo.
+    let source = r#"
+        task quiet {
+            unless false {
+                notice "not in an undo"
+            }
+        }
+    "#;
+    let file = parse_str(source, dir.path()).unwrap();
+    let mut opts = options(1);
+    opts.undo = true;
+    let runner = Runner::new(&file, &opts);
+    runner.run(&select_undo(&file, &[]).unwrap());
+    let reports = runner.reports.lock().unwrap();
+    assert!(reports["quiet"].notices.is_empty());
+    assert_eq!(reports["quiet"].cannot, 0);
+}

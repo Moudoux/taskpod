@@ -75,6 +75,9 @@ pub enum Step {
     },
     /// A block with its own guards, e.g. `unless <check> {`.
     Block(Block),
+    /// `notice "text"`: a message for me, shown under the task and again
+    /// at the end of the run. Changes nothing.
+    Notice(String),
 }
 
 #[derive(Debug, Clone)]
@@ -319,6 +322,7 @@ impl Step {
         match self {
             Step::Run(script) => script.clone(),
             Step::Undo(script) => format!("undo {script}"),
+            Step::Notice(text) => format!("notice {text}"),
             Step::File(file) if file.dir => format!("directory {}", file.path),
             Step::File(file) => format!("file {}", file.path),
             Step::Line(line) => format!("line {}", line.path),

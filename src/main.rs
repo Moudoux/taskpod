@@ -293,14 +293,18 @@ fn run(mut args: Args) -> Result<bool> {
         );
         return Ok(outcomes.iter().all(|(_, o)| o.ok()));
     }
-    let cannot = runner
-        .reports
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-        .map(|r| r.cannot)
-        .sum();
-    let ok = summarize(&outcomes, start, &opts, &args.file, cannot);
+    let (cannot, notices) = {
+        let reports = runner.reports.lock().unwrap_or_else(|e| e.into_inner());
+        let cannot = reports.values().map(|r| r.cannot).sum();
+        // In the order the tasks finished, like the lines above the summary.
+        let notices: Vec<(String, String)> = outcomes
+            .iter()
+            .filter_map(|(name, _)| reports.get(name).map(|r| (name, &r.notices)))
+            .flat_map(|(name, texts)| texts.iter().map(|t| (name.clone(), t.clone())))
+            .collect();
+        (cannot, notices)
+    };
+    let ok = summarize(&outcomes, start, &opts, &args.file, cannot, &notices);
     let edits = std::mem::take(&mut *runner.edits.lock().unwrap_or_else(|e| e.into_inner()));
     if edits.is_empty() {
         return Ok(ok);

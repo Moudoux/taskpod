@@ -155,3 +155,8 @@ task app {
   expect(index.refs.filter((r) => r.kind === "template").map((r) => r.name)).toEqual(["up", "up"]);
   expect(index.tasks.map((t) => t.name)).toEqual(["app"]);
 });
+
+test("notice isn't a template call", () => {
+  const index = parse(`task t {\n    notice "hi"\n}\n`);
+  expect(index.refs.filter((r) => r.kind === "template")).toEqual([]);
+});

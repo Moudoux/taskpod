@@ -163,6 +163,13 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
     syntax: "template pkg {\n    unless pacman -Q {{ args }}\n    run yay -S {{ args }}\n    undo yay -Rns {{ args }}\n}",
     snippet: "undo ${1:command}",
   },
+  notice: {
+    places: ["body"],
+    summary:
+      "A message for whoever runs taskpod, shown under the task and again above the final summary, so it isn't lost like a command's output. It changes nothing: a task with only notices is still up to date, and `--undo` and `--pull` skip it. Put it in a guarded block to say why something can't be done yet.",
+    syntax: 'unless mountpoint -q /mnt/data {\n    notice "/mnt/data isn\'t mounted"\n}',
+    snippet: 'notice "${1:text}"',
+  },
   keep: {
     places: ["body", "file", "line"],
     summary:

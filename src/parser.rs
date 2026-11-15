@@ -310,6 +310,11 @@ impl<'s> Parser<'s> {
                     self.end_of_line()?;
                     body.block.keep = true;
                 }
+                "notice" => {
+                    let text = self.string()?;
+                    self.end_of_line()?;
+                    body.block.steps.push(Step::Notice(text));
+                }
                 "line" => {
                     let line = self.line_step()?;
                     body.block.steps.push(Step::Line(Box::new(line)));
@@ -1009,6 +1014,7 @@ fn is_keyword(word: &str) -> bool {
             | "run"
             | "undo"
             | "keep"
+            | "notice"
             | "file"
             | "directory"
             | "line"
@@ -1119,6 +1125,14 @@ mod tests {
             Ok(_) => panic!("expected an error"),
             Err(e) => format!("{e:#}"),
         }
+    }
+
+    #[test]
+    fn parses_notices() {
+        let file = parse("task t {\n    notice \"check {{ x }}\" # why\n}\n");
+        let steps = &file.tasks["t"].body.steps;
+        assert!(matches!(&steps[..], [Step::Notice(text)] if text == "check {{ x }}"));
+        assert!(parse_err("task t {\n    notice\n}\n").contains("2:11: expected a string"));
     }
 
     #[test]

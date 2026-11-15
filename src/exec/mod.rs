@@ -109,6 +109,8 @@ pub struct TaskReport {
     pub unchecked: usize,
     /// Steps `--undo` doesn't know how to undo.
     pub cannot: usize,
+    /// `notice` messages the task reached, repeated at the end of the run.
+    pub notices: Vec<String>,
 }
 
 /// Ask a yes/no question.
@@ -557,13 +559,15 @@ impl<'a> Runner<'a> {
     }
 }
 
-/// Print a summary and return whether everything succeeded.
+/// Print a summary and return whether everything succeeded. `notices` are
+/// the `notice` messages tasks reached, as (task, text), listed above it.
 pub fn summarize(
     outcomes: &[(String, Outcome)],
     start: Instant,
     opts: &Options,
     file: &Path,
     cannot: usize,
+    notices: &[(String, String)],
 ) -> bool {
     let count = |f: fn(&Outcome) -> bool| outcomes.iter().filter(|(_, o)| f(o)).count();
     let ran = count(|o| *o == Outcome::Ran);
@@ -583,6 +587,12 @@ pub fn summarize(
     let elapsed = style(format!("in {:.1?}", start.elapsed())).dim();
     let ui = ui();
     ui.line("");
+    for (task, text) in notices {
+        ui.line(ui::notice(&format!("{task}: {text}")));
+    }
+    if !notices.is_empty() {
+        ui.line("");
+    }
     if opts.undo {
         let verb = if opts.checking() {
             "would be undone"

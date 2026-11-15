@@ -274,6 +274,10 @@ impl<'r> TaskRun<'r> {
             Step::Run(script) => self.run_step(&scope.expand(script)?, depth),
             // Only `--undo` runs these, see `undo_block`.
             Step::Undo(_) => Ok(()),
+            Step::Notice(text) => {
+                self.notice(&scope.expand(text)?, depth);
+                Ok(())
+            }
             Step::File(file) => self.file(file, scope, depth),
             Step::Line(line) => self.line(line, scope, depth),
             Step::Call { template, args } => {
@@ -1302,6 +1306,8 @@ impl<'r> TaskRun<'r> {
                 Step::Undo(script) => scope
                     .expand(script)
                     .and_then(|script| self.run_step(&script, depth)),
+                // Notices are about doing the task, not undoing it.
+                Step::Notice(_) => Ok(()),
                 // Files and nested blocks know they're undoing.
                 other => self.step(other, scope, depth),
             };
@@ -1315,6 +1321,17 @@ impl<'r> TaskRun<'r> {
             result?;
         }
         Ok(())
+    }
+
+    /// A `notice`: shown under the task and again at the end, in runs and
+    /// checks alike. It doesn't count as a change.
+    fn notice(&mut self, text: &str, depth: usize) {
+        if self.runner.opts.pull {
+            return;
+        }
+        self.record(depth, StepKind::Note, text);
+        self.push(depth, ui::notice(text));
+        self.report.notices.push(text.to_string());
     }
 
     /// Something `--undo` doesn't know how to undo.

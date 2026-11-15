@@ -81,6 +81,13 @@ task hello {
     changed {
         run echo "the config changed"
     }
+    # `notice "text"` is a message for whoever runs taskpod: shown under the
+    # task, and again above the final summary so it isn't lost (a command's
+    # output only shows while it runs). It changes nothing, so a task with
+    # only notices is still up to date; --undo and --pull skip them.
+    unless test -d /tmp/taskpod-example {
+        notice "/tmp/taskpod-example doesn't exist yet, run -r setup"
+    }
 }
 
 # Subtasks run after their parent, and only if the parent changed something:

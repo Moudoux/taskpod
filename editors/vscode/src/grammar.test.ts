@@ -146,3 +146,13 @@ test("highlights a directory without from", async () => {
   expect(scopeOf(tokens, "keep")).toContain("keyword.other.taskpod");
   expect(tokens.some(([, s]) => s.includes("entity.name.function.call"))).toBe(false);
 });
+
+test("highlights notice as a keyword with a string", async () => {
+  const tokens = (await tokenizer())(`task t {
+    unless test -d /mnt {
+        notice "not mounted"
+    }
+}`);
+  expect(scopeOf(tokens, "notice")).toContain("keyword.other.directive");
+  expect(scopeOf(tokens, "notice")).not.toContain("entity.name.function.call");
+});

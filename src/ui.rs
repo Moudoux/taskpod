@@ -409,6 +409,10 @@ pub fn nothing_to_undo(name: &str) -> String {
 }
 
 /// Something `--undo` can't do.
+pub fn notice(text: &str) -> String {
+    format!("{} {}", style("!").yellow().bold(), style(text).yellow())
+}
+
 pub fn cannot(text: &str) -> String {
     format!("{} {}", style("!").yellow().bold(), style(text).yellow())
 }
