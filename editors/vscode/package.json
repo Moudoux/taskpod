@@ -23,8 +23,8 @@
         "extensions": [".task"],
         "configuration": "./language-configuration.json",
         "icon": {
-          "light": "./icons/task-light.svg",
-          "dark": "./icons/task-dark.svg"
+          "light": "./icons/taskpod.svg",
+          "dark": "./icons/taskpod.svg"
         }
       }
     ],
