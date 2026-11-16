@@ -25,7 +25,7 @@ pub fn parse_file_on(
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let mut ctx = Ctx::new(dir);
     ctx.remote = remote;
-    let mut file = TaskFile::new(ctx);
+    let mut file = TaskFile::new(ctx, path.clone());
     parse_into(&mut file, &path, 0)?;
     file.link()?;
     Ok(file)
@@ -33,8 +33,9 @@ pub fn parse_file_on(
 
 /// Parse task file source, used by tests and tools.
 pub fn parse_str(source: &str, dir: &Path) -> Result<TaskFile> {
-    let mut file = TaskFile::new(Ctx::new(dir.to_path_buf()));
-    Parser::new(source, dir.join("<string>")).parse(&mut file, 0)?;
+    let path = dir.join("<string>");
+    let mut file = TaskFile::new(Ctx::new(dir.to_path_buf()), path.clone());
+    Parser::new(source, path).parse(&mut file, 0)?;
     file.link()?;
     Ok(file)
 }
@@ -105,17 +106,22 @@ impl<'s> Parser<'s> {
                     let path = self.string()?;
                     self.end_of_line()?;
                     let path = self.resolve(&path);
+                    self.declare(file, start, DeclarationKind::Env, &path);
                     load_env_file(&path, file).map_err(|e| self.error_at(start, e))?;
                 }
                 "secrets" => {
                     let path = self.string()?;
                     self.end_of_line()?;
-                    file.ctx.secrets.add(self.resolve(&path));
+                    let path = self.resolve(&path);
+                    self.declare(file, start, DeclarationKind::Secrets, &path);
+                    file.ctx.secrets.add(path);
                 }
                 "age-key" => {
                     let path = self.string()?;
                     self.end_of_line()?;
-                    file.ctx.secrets.set_age_key(self.resolve(&path));
+                    let path = self.resolve(&path);
+                    self.declare(file, start, DeclarationKind::AgeKey, &path);
+                    file.ctx.secrets.set_age_key(path);
                 }
                 "include" => {
                     let path = self.string()?;
@@ -126,9 +132,13 @@ impl<'s> Parser<'s> {
                         let scope = Scope::root(&file.vars, &file.ctx);
                         let cwd = file.ctx.default_cwd(&self.dir());
                         if !guard_passes(&guard, &scope, &cwd)? {
+                            let skipped = Some(guard.describe());
+                            self.declare(file, start, DeclarationKind::Include { skipped }, &path);
                             continue;
                         }
                     }
+                    let kind = DeclarationKind::Include { skipped: None };
+                    self.declare(file, start, kind, &path);
                     parse_into(file, &path, depth + 1)
                         .map_err(|e| self.error_at(start, format!("in include: {e:#}")))?;
                 }
@@ -977,6 +987,15 @@ impl<'s> Parser<'s> {
         let line = before.matches('\n').count() + 1;
         let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
         (line, col)
+    }
+
+    fn declare(&self, file: &mut TaskFile, pos: usize, kind: DeclarationKind, path: &Path) {
+        file.declarations.push(Declaration {
+            file: self.path.clone(),
+            line: self.line_col(pos).0,
+            kind,
+            path: path.to_path_buf(),
+        });
     }
 
     fn origin(&self, pos: usize) -> String {

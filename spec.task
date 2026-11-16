@@ -12,6 +12,8 @@
 #   taskpod spec.task -l       list tasks
 #   taskpod spec.task -g       the task graph: each task with what runs before it
 #                              (-g dot for Graphviz, -g mermaid)
+#   taskpod spec.task --sources
+#                              every file it reads and the secrets each task uses
 #   taskpod spec.task --check  check the file for errors
 #   taskpod spec.task -D --json --no-secrets
 #                              the diff as JSON for editors, without decrypting secrets

@@ -4,6 +4,7 @@ pub mod graph;
 pub mod journal;
 pub mod json;
 pub mod pull;
+pub mod sources;
 mod step;
 pub mod sudo;
 mod target;

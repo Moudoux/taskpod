@@ -41,6 +41,7 @@ taskpod FILE -i a          # what task a would do
 taskpod FILE -l            # list tasks
 taskpod FILE -g            # task graph: each task with what runs before it (with -r: only those)
 taskpod FILE -g dot        # the graph for Graphviz (| dot -Tsvg > tasks.svg), or -g mermaid
+taskpod FILE --sources     # every file it reads (includes, env, secrets, `from` files) and secrets used, by file
 taskpod FILE --check       # check the file for errors
 taskpod FILE --secrets s.yaml  # secrets for {{ secrets.name }}, see below
 taskpod FILE -s a          # skip task a

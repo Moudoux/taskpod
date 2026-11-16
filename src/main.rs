@@ -48,6 +48,13 @@ pub struct Args {
     )]
     pub graph: Option<GraphFormat>,
 
+    /// Show every file the task file reads, as a tree by the file that names it: includes,
+    /// env, secrets and age-key files, each task's `file`/`directory` sources and the
+    /// secrets it uses, manual tasks included. Changes nothing. With --run, only those tasks
+    /// and their needs
+    #[arg(long, conflicts_with_all = ["list", "check", "json", "graph"])]
+    pub sources: bool,
+
     /// Check the file for errors without running anything
     #[arg(long)]
     pub check: bool,
@@ -164,7 +171,7 @@ fn run(mut args: Args) -> Result<bool> {
     if args.yes && !args.pull && !args.undo {
         anyhow::bail!("--yes only works with --pull or --undo");
     }
-    if mode == Mode::Run && !args.check && !args.list && args.graph.is_none() {
+    if mode == Mode::Run && !args.check && !args.list && args.graph.is_none() && !args.sources {
         if args.json {
             anyhow::bail!("--json only works with --dry-run or --diff");
         }
@@ -174,7 +181,7 @@ fn run(mut args: Args) -> Result<bool> {
     }
     // Checking and listing only read the file, they don't need the machine.
     let remote = match &args.host {
-        Some(host) if !args.check && !args.list && args.graph.is_none() => {
+        Some(host) if !args.check && !args.list && args.graph.is_none() && !args.sources => {
             Some(std::sync::Arc::new(taskpod::remote::Remote::connect(host)?))
         }
         _ => None,
@@ -241,6 +248,28 @@ fn run(mut args: Args) -> Result<bool> {
             GraphFormat::Mermaid => Format::Mermaid,
         };
         print!("{}", render(&file, &select(&file, &args.run)?, format));
+        return Ok(true);
+    }
+
+    if args.sources {
+        use taskpod::exec::sources::{Extra, render};
+        let secrets = args
+            .secrets
+            .iter()
+            .map(std::path::absolute)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let age_key = args.age_key.as_ref().map(std::path::absolute).transpose()?;
+        let extra = Extra {
+            secrets: &secrets,
+            age_key: age_key.as_deref(),
+        };
+        // Without --run, every task: manual ones read files too.
+        let order = if args.run.is_empty() {
+            file.tasks.keys().cloned().collect()
+        } else {
+            select(&file, &args.run)?
+        };
+        print!("{}", render(&file, &order, &extra));
         return Ok(true);
     }
 

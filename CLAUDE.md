@@ -26,6 +26,9 @@ idempotent. Its main use is setting up an Arch system from
   place, and test builds always use the task file's directory. Undo itself (`undo_task`, `undo_block`,
   `undo_file`) is in `src/exec/step.rs`; `Runner::run` reverses dependencies when `Options::undo`.
 - `src/exec/graph.rs`: `--graph` (tree, dot, mermaid) of the tasks `select` picks, from the file alone.
+- `src/exec/sources.rs`: `--sources`, a tree of the files a task file reads, by the file naming them:
+  `TaskFile::declarations` (include/env/secrets/age-key, recorded by the parser), `from` sources and
+  secret names used (through variables and template calls too). Like `--graph`, only reads the file.
 - `src/exec/json.rs`: `--json` documents. `TaskRun` records each step as a `StepRecord` next to the
   printed lines; `--no-secrets` errors (`secrets::NOT_CHECKED`, matched by text since lazy variables
   stringify errors) make a step `unchecked`, or the task `Outcome::Unchecked` if a guard or variable needs one.

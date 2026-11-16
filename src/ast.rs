@@ -3,14 +3,41 @@
 use crate::vars::{Ctx, Vars};
 use anyhow::{Result, bail};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
 
 pub struct TaskFile {
     pub ctx: Ctx,
+    /// The main task file.
+    pub path: PathBuf,
+    /// `include`, `env`, `secrets` and `age-key` statements, in the order read.
+    pub declarations: Vec<Declaration>,
     pub vars: Vars,
     /// Guards that apply to the whole file.
     pub guards: Vec<Guard>,
     pub tasks: BTreeMap<String, Task>,
     pub templates: HashMap<String, Template>,
+}
+
+/// A file-level statement that reads another file, for `--sources`.
+#[derive(Debug, Clone)]
+pub struct Declaration {
+    /// The task file it's in.
+    pub file: PathBuf,
+    pub line: usize,
+    pub kind: DeclarationKind,
+    /// The file it reads, resolved.
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeclarationKind {
+    /// `include`; `skipped` is the guard that kept it out.
+    Include {
+        skipped: Option<String>,
+    },
+    Env,
+    Secrets,
+    AgeKey,
 }
 
 #[derive(Debug)]
@@ -336,9 +363,11 @@ impl Step {
 }
 
 impl TaskFile {
-    pub fn new(ctx: Ctx) -> Self {
+    pub fn new(ctx: Ctx, path: PathBuf) -> Self {
         TaskFile {
             ctx,
+            path,
+            declarations: Vec::new(),
             vars: Vars::default(),
             guards: Vec::new(),
             tasks: BTreeMap::new(),

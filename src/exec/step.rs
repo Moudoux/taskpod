@@ -2057,7 +2057,7 @@ fn undo_line(
 }
 
 /// The files under `dir`, as paths relative to it joined with `/`, sorted.
-fn list_files(dir: &Path, prefix: &str, names: &mut Vec<String>) -> Result<()> {
+pub(crate) fn list_files(dir: &Path, prefix: &str, names: &mut Vec<String>) -> Result<()> {
     let mut entries = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
