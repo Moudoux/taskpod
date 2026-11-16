@@ -337,8 +337,7 @@ mod tests {
         let tree = render(&file, &select(&file, &[]).unwrap(), &extra);
         assert_eq!(
             tree,
-            format!(
-                "main.task\n\
+            "main.task\n\
                  ├── secrets more.yaml (missing) (--secrets)\n\
                  ├── env .env\n\
                  ├── secrets secrets.yaml\n\
@@ -353,9 +352,8 @@ mod tests {
                  │   └── secrets: api.token\n\
                  └── task wifi\n    \
                      └── template network home (desktop.task:1)\n        \
-                         ├── {{{{ 1 }}}}.conf → /etc/{{{{ 1 }}}}\n        \
+                         ├── {{ 1 }}.conf → /etc/{{ 1 }}\n        \
                          └── secrets: wifi.password\n"
-            )
         );
         // With --run, only those tasks.
         let tree = render(
