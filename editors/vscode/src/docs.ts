@@ -126,9 +126,16 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   sudo: {
     places: ["body", "file", "line"],
     summary:
-      "Ask for sudo once before running, so parallel tasks never prompt at the same time. Commands that call `sudo` do this automatically. On a `file` or `line`, reads and writes the file as root.",
+      "Ask for sudo once before running, so parallel tasks never prompt at the same time. Commands that call `sudo` do this automatically. Implies `terminal`. On a `file` or `line`, reads and writes the file as root.",
     syntax: "sudo",
     snippet: "sudo",
+  },
+  terminal: {
+    places: ["body"],
+    summary:
+      "A command that asks on the terminal anyway (a tool running `sudo -k`, doas, su, a security key touch, a question) gets the terminal when it asks: the live display pauses until it ends, and tasks that ask at once take turns. Without this (or `sudo`, or `interactive`), such a command is stopped and the step fails instead of waiting out of sight.",
+    syntax: "terminal",
+    snippet: "terminal",
   },
   manual: {
     places: ["body"],

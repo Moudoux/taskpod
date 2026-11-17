@@ -141,19 +141,19 @@ pub struct Spawn {
 }
 
 impl Spawn {
-    /// Start it, writing its input (if any) in the background. Without
-    /// input, stdin is closed.
-    pub fn spawn(mut self) -> std::io::Result<Child> {
+    /// Start it in a process group of its own (see `crate::tty`), writing
+    /// its input (if any) in the background. Without input, stdin is closed.
+    pub fn spawn(mut self) -> std::io::Result<(Child, crate::tty::Job)> {
         let stdin = if self.input.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
         };
-        let mut child = self.command.stdin(stdin).spawn()?;
+        let (mut child, job) = crate::tty::Job::spawn(self.command.stdin(stdin))?;
         if let (Some(input), Some(stdin)) = (self.input, child.stdin.take()) {
             std::thread::spawn(move || crate::remote::write_all(stdin, &input));
         }
-        Ok(child)
+        Ok((child, job))
     }
 }
 
@@ -286,10 +286,16 @@ impl Ctx {
     pub fn check(&self, script: &str, cwd: &Path) -> Result<bool> {
         let mut spawn = self.command(script, cwd);
         spawn.command.stdout(Stdio::null()).stderr(Stdio::null());
-        let status = spawn
+        let (mut child, job) = spawn
             .spawn()
-            .and_then(|mut child| child.wait())
             .map_err(|e| anyhow!("failed to start {:?}: {e}", self.program()))?;
+        let status = child.wait()?;
+        if let Some(process) = job.finish() {
+            bail!(
+                "`{script}`: {}, and checks can't ask",
+                crate::tty::wanted(&process)
+            );
+        }
         Ok(status.success())
     }
 
@@ -297,10 +303,18 @@ impl Ctx {
     pub fn capture(&self, script: &str, cwd: &Path) -> std::result::Result<String, String> {
         let mut spawn = self.command(script, cwd);
         spawn.command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let output = spawn
+        let (child, job) = spawn
             .spawn()
-            .and_then(Child::wait_with_output)
             .map_err(|e| format!("failed to start {:?}: {e}", self.program()))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("`{script}` failed: {e}"))?;
+        if let Some(process) = job.finish() {
+            return Err(format!(
+                "`{script}`: {}, and checks can't ask",
+                crate::tty::wanted(&process)
+            ));
+        }
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(

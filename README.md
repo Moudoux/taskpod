@@ -69,6 +69,13 @@ an overall progress bar; a failed task prints its last output. Questions
 work, and keep the credentials fresh, so parallel tasks never prompt at the
 same time. Tasks marked `interactive` run alone with the terminal.
 
+Commands run in the background of the terminal, so one that asks on it anyway
+(a tool that runs `sudo -k`, doas, su, a security key touch, a question) is
+stopped at once instead of waiting behind the display. In a task or block
+marked `terminal` (or `sudo`) it then gets the terminal, one task at a time,
+while other tasks keep running; anywhere else the step fails, saying it
+wanted the terminal.
+
 ## Pulling changes back
 
 Changed a config on the system and want to keep it? `--pull` goes the other

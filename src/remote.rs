@@ -103,7 +103,7 @@ impl Remote {
 
     fn base(&self) -> Command {
         let mut command = Command::new(&self.ssh);
-        command
+        crate::tty::clean(&mut command)
             .arg("-o")
             .arg(format!("ControlPath={}", self.socket().display()));
         command
@@ -313,16 +313,18 @@ PATH="$TASKPOD_D/bin:$PATH"; export PATH
 
 /// Spawn `command`, write `input` to its stdin while collecting its output.
 fn run_with_input(mut command: Command, input: Vec<u8>) -> Result<Output> {
-    let mut child = command
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to start ssh")?;
+        .stderr(Stdio::piped());
+    let (mut child, job) = crate::tty::Job::spawn(&mut command).context("failed to start ssh")?;
     let stdin = child.stdin.take().expect("stdin is piped");
     let writer = std::thread::spawn(move || write_all(stdin, &input));
     let output = child.wait_with_output()?;
     let _ = writer.join();
+    if let Some(process) = job.finish() {
+        bail!("{}", crate::tty::wanted(&process));
+    }
     Ok(output)
 }
 

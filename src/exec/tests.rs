@@ -1842,3 +1842,56 @@ fn notices_are_reported_without_counting_as_changes() {
     assert!(reports["quiet"].notices.is_empty());
     assert_eq!(reports["quiet"].cannot, 0);
 }
+
+#[cfg(unix)]
+#[test]
+fn steps_that_want_the_terminal_fail_fast() {
+    let dir = tempfile::tempdir().unwrap();
+    // `kill -TTIN $$` stops the shell the way reading the terminal from the
+    // background does. Tests have no terminal to hand over.
+    let source = r#"
+        task plain {
+            run kill -TTIN $$; touch resumed
+        }
+        task asks {
+            terminal
+            run kill -TTOU $$; touch resumed
+        }
+        task block {
+            if true {
+                terminal
+                run kill -TTIN $$
+            }
+        }
+        task check {
+            unless kill -TTIN $$
+            run true
+        }
+        task fine {
+            terminal
+            run echo ok > fine
+        }
+    "#;
+    let start = std::time::Instant::now();
+    let outcomes = run(source, dir.path(), &options(4), &[]);
+    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    let failed = |task: &str| match &outcomes[task] {
+        Outcome::Failed(e) => e.clone(),
+        other => panic!("{task}: {other:?}"),
+    };
+    let plain = failed("plain");
+    assert!(plain.contains("sh wanted the terminal"), "{plain}");
+    assert!(plain.contains("Add `terminal`"), "{plain}");
+    for task in ["asks", "block"] {
+        let error = failed(task);
+        assert!(
+            error.contains("taskpod has no terminal to give it"),
+            "{error}"
+        );
+    }
+    let check = failed("check");
+    assert!(check.contains("checks can't ask"), "{check}");
+    assert!(!dir.path().join("resumed").exists());
+    assert_eq!(outcomes["fine"], Outcome::Ran);
+    assert_eq!(read(dir.path(), "fine").trim(), "ok");
+}

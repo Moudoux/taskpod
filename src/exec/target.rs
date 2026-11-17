@@ -34,14 +34,13 @@ pub fn read(ctx: &Ctx, task: &str, path: &Path, sudo: bool) -> Result<Current> {
     match &ctx.remote {
         Some(remote) => read_remote(remote, path, true),
         None => {
-            let output = std::process::Command::new("sudo")
-                .arg("cat")
-                .arg("--")
-                .arg(path)
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .context("failed to run sudo")?;
+            let output = crate::tty::output(
+                std::process::Command::new("sudo")
+                    .arg("cat")
+                    .arg("--")
+                    .arg(path),
+            )
+            .context("failed to run sudo")?;
             Ok(if output.status.success() {
                 Current::Content(output.stdout)
             } else {
@@ -109,14 +108,8 @@ pub fn list(
                 } else {
                     std::process::Command::new("sh")
                 };
-                command
-                    .args(["-c", script, "sh"])
-                    .arg(dir)
-                    .args(&subdirs)
-                    .stdin(Stdio::null())
-                    .stderr(Stdio::null())
-                    .output()
-                    .context("failed to list files")
+                command.args(["-c", script, "sh"]).arg(dir).args(&subdirs);
+                crate::tty::output(&mut command).context("failed to list files")
             }
         }
     };
@@ -206,13 +199,12 @@ pub fn stat(ctx: &Ctx, path: &Path) -> Option<(u32, String)> {
             if !path.exists() {
                 return None;
             }
-            std::process::Command::new("sh")
-                .args(["-c", STAT, "sh"])
-                .arg(arg(path))
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .ok()?
+            crate::tty::output(
+                std::process::Command::new("sh")
+                    .args(["-c", STAT, "sh"])
+                    .arg(arg(path)),
+            )
+            .ok()?
         }
     };
     if !output.status.success() {
@@ -315,16 +307,17 @@ fn write_local(path: &Path, content: &[u8], mode: u32) -> Result<()> {
 /// Write a file as root with `install`, which also sets the owner.
 fn write_with_sudo(path: &Path, content: &[u8], mode: u32, owner: Option<&str>) -> Result<()> {
     // Local arguments aren't parsed by a shell, so they're passed unquoted.
-    let mut child = std::process::Command::new("sudo")
-        .args(["sh", "-c", INSTALL, "sh"])
-        .arg(arg(path))
-        .arg(format!("{mode:o}"))
-        .args(owner_args(owner))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to run sudo")?;
+    let (mut child, job) = crate::tty::Job::spawn(
+        std::process::Command::new("sudo")
+            .args(["sh", "-c", INSTALL, "sh"])
+            .arg(arg(path))
+            .arg(format!("{mode:o}"))
+            .args(owner_args(owner))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    )
+    .context("failed to run sudo")?;
     // If sudo or the script exits early, the write fails with a broken pipe;
     // its exit status and stderr say why, so those are reported first.
     let written = child
@@ -333,6 +326,9 @@ fn write_with_sudo(path: &Path, content: &[u8], mode: u32, owner: Option<&str>) 
         .ok_or_else(|| anyhow!("no stdin for sudo"))?
         .write_all(content);
     let output = child.wait_with_output()?;
+    if let Some(process) = job.finish() {
+        bail!("{}", crate::tty::wanted(&process));
+    }
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
@@ -355,14 +351,12 @@ pub fn remove(ctx: &Ctx, task: &str, path: &Path, sudo: bool) -> Result<()> {
             let sudo = if sudo { "sudo " } else { "" };
             remote.output(&format!("{sudo}rm -f -- {}", quote(&arg(path))), &[])?
         }
-        None if sudo => std::process::Command::new("sudo")
-            .args(["rm", "-f", "--"])
-            .arg(path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .context("failed to run sudo")?,
+        None if sudo => crate::tty::output(
+            std::process::Command::new("sudo")
+                .args(["rm", "-f", "--"])
+                .arg(path),
+        )
+        .context("failed to run sudo")?,
         None => {
             return match std::fs::remove_file(path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
@@ -432,14 +426,8 @@ fn script_output(
             } else {
                 std::process::Command::new("sh")
             };
-            command
-                .args(["-c", script, "sh"])
-                .args(args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .context("failed to run sh")
+            command.args(["-c", script, "sh"]).args(args);
+            crate::tty::output(&mut command).context("failed to run sh")
         }
     }
 }

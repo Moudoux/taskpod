@@ -43,6 +43,7 @@ test("highlights the language", async () => {
   const tokens = tokenize(`let name = "pod {{ x }}"   # comment
 task build {
     needs lint test
+    terminal
     unless test -e out {
         run make {{ name }}
     }
@@ -64,6 +65,7 @@ subtask notify of build {
   expect(scopeOf(tokens, "task")).toContain("storage.type.task");
   expect(scopeOf(tokens, "build")).toContain("entity.name.function");
   expect(scopeOf(tokens, "lint")).toContain("entity.name.function");
+  expect(scopeOf(tokens, "terminal")).toContain("keyword.other.directive");
   expect(scopeOf(tokens, " test -e out")).toContain("meta.embedded.line.shell");
   expect(scopeOf(tokens, "{")).toContain("punctuation.section.block");
   expect(scopeOf(tokens, '        if [ -n "${A}" ]; then echo "}"; fi')).toContain("meta.embedded.block.shell");

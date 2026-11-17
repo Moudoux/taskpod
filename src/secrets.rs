@@ -241,7 +241,7 @@ fn run_prompting(
     what: &str,
     echo: bool,
 ) -> std::result::Result<Vec<u8>, String> {
-    let mut child = command
+    let mut child = crate::tty::clean(&mut command)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

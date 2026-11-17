@@ -29,6 +29,8 @@ pub struct Ui {
     /// `--json`: print nothing, the caller prints the result.
     quiet: bool,
     prompt: Mutex<()>,
+    /// Plain lines wait while something has the terminal (`suspend`).
+    gate: RwLock<()>,
     total: Mutex<Option<ProgressBar>>,
     width: AtomicUsize,
 }
@@ -110,6 +112,7 @@ impl Ui {
             interactive: std::io::stdin().is_terminal(),
             quiet: false,
             prompt: Mutex::new(()),
+            gate: RwLock::new(()),
             total: Mutex::new(None),
             width: AtomicUsize::new(0),
         }
@@ -131,6 +134,7 @@ impl Ui {
                 let _ = self.multi.println(text.as_ref());
             }
         } else {
+            let _gate = self.gate.read().unwrap_or_else(|e| e.into_inner());
             println!("{}", text.as_ref());
         }
     }
@@ -209,8 +213,10 @@ impl Ui {
     }
 
     /// Run `f` with the live display paused and the terminal to itself.
+    /// Nothing in `f` may print through the `Ui`.
     pub fn suspend<R>(&self, f: impl FnOnce() -> R) -> R {
         let _held = self.hold();
+        let _gate = self.gate.write().unwrap_or_else(|e| e.into_inner());
         if self.fancy {
             self.multi.suspend(f)
         } else {

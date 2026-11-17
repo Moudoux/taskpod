@@ -3,6 +3,7 @@ pub mod exec;
 pub mod parser;
 pub mod remote;
 pub mod secrets;
+pub mod tty;
 pub mod ui;
 pub mod vars;
 

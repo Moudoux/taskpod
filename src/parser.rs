@@ -289,6 +289,10 @@ impl<'s> Parser<'s> {
                     self.end_of_line()?;
                     body.block.sudo = true;
                 }
+                "terminal" => {
+                    self.end_of_line()?;
+                    body.block.terminal = true;
+                }
                 "manual" => {
                     task_only(self)?;
                     self.end_of_line()?;
@@ -1036,6 +1040,7 @@ fn is_keyword(word: &str) -> bool {
             | "ask"
             | "changed"
             | "sudo"
+            | "terminal"
             | "manual"
             | "interactive"
             | "workdir"
@@ -1284,6 +1289,17 @@ mod tests {
             file.lock_names().into_iter().collect::<Vec<_>>(),
             ["pacman"]
         );
+    }
+
+    #[test]
+    fn parses_terminal() {
+        let file = parse("task t {\n terminal\n if true {\n  terminal\n  run x\n }\n run y\n}\n");
+        let body = &file.tasks["t"].body;
+        assert!(body.terminal && !body.sudo);
+        let Step::Block(inner) = &body.steps[0] else {
+            panic!()
+        };
+        assert!(inner.terminal);
     }
 
     #[test]

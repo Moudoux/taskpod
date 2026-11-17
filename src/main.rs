@@ -137,6 +137,8 @@ fn default_jobs() -> usize {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    // First, before any thread starts. Steps that ask get the terminal, except for --json.
+    let _terminal = taskpod::tty::init(!args.json);
     taskpod::ui::init(args.verbose, args.plain, args.json);
     let (json, file, mode, pull) = (args.json, args.file.clone(), mode(&args), args.pull);
     match run(args) {

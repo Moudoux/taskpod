@@ -42,8 +42,7 @@ pub fn ensure(task: &str, ctx: &crate::vars::Ctx) -> Result<()> {
                 style(format!("{task} needs sudo")).bold(),
                 style("· authenticate once for the whole run").dim()
             );
-            Command::new("sudo")
-                .arg("-v")
+            crate::tty::clean(Command::new("sudo").arg("-v"))
                 .status()
                 .is_ok_and(|s| s.success())
         });
@@ -63,8 +62,7 @@ pub fn ensure(task: &str, ctx: &crate::vars::Ctx) -> Result<()> {
 }
 
 fn sudo(args: &[&str]) -> bool {
-    Command::new("sudo")
-        .args(args)
+    crate::tty::clean(Command::new("sudo").args(args))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

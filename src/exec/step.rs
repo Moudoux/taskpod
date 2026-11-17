@@ -66,6 +66,9 @@ pub(crate) struct TaskRun<'r> {
     /// The same steps as data, for `--json`.
     report: TaskReport,
     failed: bool,
+    /// How many of the blocks running now say `terminal` or `sudo`: their
+    /// commands get the terminal when they ask for it.
+    terminal: usize,
 }
 
 impl<'r> TaskRun<'r> {
@@ -77,6 +80,7 @@ impl<'r> TaskRun<'r> {
             cwd: PathBuf::new(),
             changed: false,
             changed_before: false,
+            terminal: 0,
             line: None,
             lines: Vec::new(),
             report: TaskReport::default(),
@@ -253,6 +257,14 @@ impl<'r> TaskRun<'r> {
                 sudo::ensure(&self.task.name, &self.runner.file.ctx)?;
             }
         }
+        let terminal = block.sudo || block.terminal;
+        self.terminal += usize::from(terminal);
+        let result = self.block_steps(block, scope, depth);
+        self.terminal -= usize::from(terminal);
+        result
+    }
+
+    fn block_steps(&mut self, block: &'r Block, scope: &Scope, depth: usize) -> Result<()> {
         for step in &block.steps {
             let result = self.step(step, scope, depth);
             // Checks with `--no-secrets` go on past steps that need secrets.
@@ -406,11 +418,14 @@ impl<'r> TaskRun<'r> {
 
     fn exec(&mut self, script: &str) -> Result<()> {
         let ctx = &self.runner.file.ctx;
-        if sudo::mentions_sudo(script) {
+        let mentions_sudo = sudo::mentions_sudo(script);
+        if mentions_sudo {
             sudo::ensure(&self.task.name, ctx)?;
         }
+        let ask = self.terminal > 0 || mentions_sudo;
         let status = if self.task.interactive {
             let mut command = ctx.interactive_command(script, &self.cwd)?;
+            crate::tty::clean(&mut command);
             let name = &self.task.name;
             ui().suspend(|| {
                 eprintln!(
@@ -422,7 +437,21 @@ impl<'r> TaskRun<'r> {
                 command.status()
             })
         } else {
-            self.piped(ctx.command(script, &self.cwd))
+            let (status, wanted) = self
+                .piped(ctx.command(script, &self.cwd), script, ask)
+                .with_context(|| format!("failed to start {:?}", ctx.program()))?;
+            if let Some(process) = wanted {
+                let wanted = crate::tty::wanted(&process);
+                let first = first_line(script);
+                if ask {
+                    bail!("`{first}`: {wanted}, but taskpod has no terminal to give it");
+                }
+                bail!(
+                    "`{first}`: {wanted}, but this step can't ask. Add `terminal` to its task \
+                     or block to give it the terminal when it asks, or make the task `interactive`"
+                );
+            }
+            Ok(status)
         }
         .with_context(|| format!("failed to start {:?}", ctx.program()))?;
         if !status.success() {
@@ -431,22 +460,79 @@ impl<'r> TaskRun<'r> {
         Ok(())
     }
 
-    /// Run with output going to the task's line.
-    fn piped(&self, mut spawn: crate::vars::Spawn) -> std::io::Result<ExitStatus> {
+    /// Run with output going to the task's line. If it stops to use the
+    /// terminal and `ask`, it's given the terminal once nothing else has it,
+    /// until it exits; otherwise it's ended, and the process that wanted
+    /// the terminal is returned with its exit status.
+    fn piped(
+        &mut self,
+        mut spawn: crate::vars::Spawn,
+        script: &str,
+        ask: bool,
+    ) -> std::io::Result<(ExitStatus, Option<String>)> {
         spawn.command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = spawn.spawn()?;
+        let (mut child, job) = spawn.spawn()?;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let line = self.line.as_ref();
-        std::thread::scope(|s| {
+        let (sender, events) = std::sync::mpsc::channel();
+        if ask {
+            job.on_stop(sender.clone());
+        }
+        let output = std::sync::Mutex::new(Output::Line);
+        let (line, slot, output) = (self.line.as_ref(), &mut self.slot, &output);
+        let (name, first) = (self.task.name.as_str(), first_line(script));
+        let status = std::thread::scope(|s| {
             if let (Some(out), Some(line)) = (stdout, line) {
-                s.spawn(move || pump(out, line));
+                s.spawn(move || pump(out, line, output));
             }
             if let (Some(err), Some(line)) = (stderr, line) {
-                s.spawn(move || pump(err, line));
+                s.spawn(move || pump(err, line, output));
             }
-        });
-        child.wait()
+            s.spawn(move || sender.send(crate::tty::Event::Exited(child.wait())));
+            let wait = || loop {
+                match events.recv() {
+                    Ok(crate::tty::Event::Exited(status)) => return status,
+                    Ok(crate::tty::Event::Stopped) => job.resume(),
+                    Err(_) => unreachable!("the waiter sends before it ends"),
+                }
+            };
+            loop {
+                match events.recv() {
+                    Ok(crate::tty::Event::Exited(status)) => return status,
+                    Ok(crate::tty::Event::Stopped) if crate::tty::can_hand_over() => {
+                        // Waiting for the terminal can take a while: let other tasks run.
+                        slot.release();
+                        Output::set(output, Output::Held(Vec::new()));
+                        let status = ui().suspend(|| {
+                            let process = job.wanted().unwrap_or_default();
+                            let what = format!("· {first} · {process} asks on the terminal");
+                            eprintln!(
+                                "{} {} {}",
+                                style("▶").cyan(),
+                                style(name).bold(),
+                                style(ui::redact(&what)).dim()
+                            );
+                            if let Output::Held(lines) = Output::set(output, Output::Direct) {
+                                for text in lines {
+                                    eprintln!("{text}");
+                                }
+                            }
+                            let Some(_terminal) = job.foreground() else {
+                                job.kill();
+                                return wait();
+                            };
+                            wait()
+                        });
+                        Output::set(output, Output::Line);
+                        slot.reacquire();
+                        return status;
+                    }
+                    Ok(crate::tty::Event::Stopped) => job.kill(),
+                    Err(_) => unreachable!("the waiter sends before it ends"),
+                }
+            }
+        })?;
+        Ok((status, job.finish()))
     }
 
     fn file(&mut self, file: &FileStep, scope: &Scope, depth: usize) -> Result<()> {
@@ -1297,6 +1383,14 @@ impl<'r> TaskRun<'r> {
                 sudo::ensure(&self.task.name, &self.runner.file.ctx)?;
             }
         }
+        let terminal = block.sudo || block.terminal;
+        self.terminal += usize::from(terminal);
+        let result = self.undo_steps(block, scope, depth);
+        self.terminal -= usize::from(terminal);
+        result
+    }
+
+    fn undo_steps(&mut self, block: &'r Block, scope: &Scope, depth: usize) -> Result<()> {
         let covered = block.undo_covers_commands();
         for step in block.steps.iter().rev() {
             let result = match step {
@@ -2132,7 +2226,23 @@ fn file_content(file: &FileStep, scope: &Scope, dir: &Path) -> Result<Vec<u8>> {
 }
 
 /// Feed a stream to the task's line. For `\r` progress updates, the last one wins.
-fn pump(stream: impl Read, line: &TaskLine) {
+/// Where a command's output goes.
+enum Output {
+    /// The task's live line.
+    Line,
+    /// Kept until the command has the terminal, while the live display stops.
+    Held(Vec<String>),
+    /// Straight to the terminal, which the command has.
+    Direct,
+}
+
+impl Output {
+    fn set(output: &std::sync::Mutex<Output>, new: Output) -> Output {
+        std::mem::replace(&mut output.lock().unwrap_or_else(|e| e.into_inner()), new)
+    }
+}
+
+fn pump(stream: impl Read, line: &TaskLine, output: &std::sync::Mutex<Output>) {
     let mut reader = BufReader::new(stream);
     let mut buffer = Vec::new();
     while let Ok(n) = reader.read_until(b'\n', &mut buffer) {
@@ -2141,7 +2251,13 @@ fn pump(stream: impl Read, line: &TaskLine) {
         }
         let text = String::from_utf8_lossy(&buffer);
         let text = text.trim_end_matches(['\n', '\r']);
-        line.output(text.rsplit('\r').next().unwrap_or_default());
+        // Locked while writing, so the output never goes to the live line
+        // once that's stopped (it would wait for it, and the command for us).
+        match &mut *output.lock().unwrap_or_else(|e| e.into_inner()) {
+            Output::Line => line.output(text.rsplit('\r').next().unwrap_or_default()),
+            Output::Held(lines) => lines.push(ui::redact(text).into_owned()),
+            Output::Direct => eprintln!("{}", ui::redact(text)),
+        }
         buffer.clear();
     }
 }

@@ -161,3 +161,8 @@ test("notice isn't a template call", () => {
   const index = parse(`task t {\n    notice "hi"\n}\n`);
   expect(index.refs.filter((r) => r.kind === "template")).toEqual([]);
 });
+
+test("terminal isn't a template call", () => {
+  const index = parse(`task t {\n    terminal\n    if true {\n        terminal\n        run x\n    }\n}\n`);
+  expect(index.refs.filter((r) => r.kind === "template")).toEqual([]);
+});

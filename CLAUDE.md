@@ -41,6 +41,13 @@ idempotent. Its main use is setting up an Arch system from
   stdin to a fixed bootstrap. Remote sudo passwords go through an askpass helper. `Ctx::remote` is set
   before parsing, since `include ... if` checks run on the target.
 - `src/exec/sudo.rs`: authenticates once through `sudo -v` and keeps credentials fresh.
+- `src/tty.rs`: job control. Commands run in their own process group (`Job::spawn`), in the
+  background of taskpod's terminal session (so sudo's tty-bound cache still applies), with
+  `tostop` set; a watcher thread finds groups stopped by SIGTTIN/SIGTTOU (`/proc`, or `ps`
+  off Linux) and kills them, or tells `Step::piped` so a `terminal`/`sudo` step gets the
+  terminal (`Job::foreground`). taskpod blocks SIGTTIN/SIGTTOU in every thread, so every
+  command it starts must go through `Job::spawn` or `tty::clean`, which unblock them.
+  `tty::init` in `main` also passes INT/TERM/HUP/QUIT on to the jobs' groups.
 - `src/ui.rs`: indicatif live display and inquire prompts; plain prefixed lines without a terminal.
 - `editors/vscode/`: VS Code extension (TypeScript, built with bun). `src/index.ts` is its own
   line-based indexer of task files, separate from the Rust parser; update both when the syntax changes,

@@ -205,13 +205,35 @@ task undo-example {
     undo echo "stopping the app"
 }
 
+task install-tool {
+    manual
+    terminal                   # its installer asks for root itself, with `sudo -k`
+    unless command -v example-tool
+    run ./install.sh --prefix /usr/local
+}
+
 # More directives:
 #   lock name     tasks holding the same lock never run at the same time,
 #                 e.g. `lock pacman` for package installs
 #   sudo          ask for sudo before running; commands mentioning sudo do this
-#                 automatically, so parallel tasks never prompt at once
+#                 automatically, so parallel tasks never prompt at once.
+#                 Implies `terminal`
+#   terminal      a command that asks on the terminal anyway (a tool that runs
+#                 `sudo -k`, doas, su, a key touch, a question) gets it when it
+#                 asks: the live display pauses until the command ends, and
+#                 tasks that ask at once take turns. Other tasks keep running
 #   interactive   this task gets the terminal: nothing else runs alongside it,
 #                 the live display pauses, and its commands can ask questions
+#
+# Commands run in the background of the terminal, like a shell's `cmd &`, so
+# one that reads the terminal (or writes to it: taskpod sets `stty tostop`
+# while it runs) is stopped right away instead of waiting out of sight.
+# Without `terminal`, `sudo` or `interactive` it's ended, and the step fails
+# saying it wanted the terminal; so does any `if`/`unless` check or `$( )`
+# variable, and every command in dry runs, diffs, --json, without a terminal,
+# and over --host (remote commands have no terminal; remote sudo uses the
+# password taskpod asked for). Commands still share taskpod's terminal
+# session, so sudo's cached credentials apply to them.
 #
 # While running, each task gets a live spinner with its latest output, above
 # an overall progress bar. Failed tasks show their last output; -v streams

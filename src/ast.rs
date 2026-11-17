@@ -71,8 +71,11 @@ pub struct Template {
 pub struct Block {
     pub guards: Vec<Guard>,
     pub locks: Vec<String>,
-    /// Ask for sudo credentials before running.
+    /// Ask for sudo credentials before running. Implies `terminal`.
     pub sudo: bool,
+    /// `terminal`: a command that wants the terminal (a password, a key
+    /// touch, a question) is given it, one at a time, instead of failing.
+    pub terminal: bool,
     /// `keep`: `--undo` leaves what this block did in place.
     pub keep: bool,
     pub steps: Vec<Step>,
