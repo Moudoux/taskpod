@@ -118,10 +118,11 @@ impl<'s> Parser<'s> {
                 }
                 "age-key" => {
                     let path = self.string()?;
+                    let plugin = self.optional_plugin()?;
                     self.end_of_line()?;
                     let path = self.resolve(&path);
                     self.declare(file, start, DeclarationKind::AgeKey, &path);
-                    file.ctx.secrets.set_age_key(path);
+                    file.ctx.secrets.set_age_key(path, plugin);
                 }
                 "include" => {
                     let path = self.string()?;
@@ -409,6 +410,17 @@ impl<'s> Parser<'s> {
                 Ok(None)
             }
         }
+    }
+
+    /// An optional `plugin NAME` after an `age-key` path.
+    fn optional_plugin(&mut self) -> Result<Option<String>> {
+        self.skip_inline_ws();
+        let save = self.pos;
+        if self.word("").ok().as_deref() == Some("plugin") {
+            return Ok(Some(self.word("an age plugin name")?));
+        }
+        self.pos = save;
+        Ok(None)
     }
 
     /// `let name = "string" | $(command) | word`
@@ -1168,6 +1180,16 @@ mod tests {
             Ok(_) => panic!("expected an error"),
             Err(e) => format!("{e:#}"),
         }
+    }
+
+    #[test]
+    fn parses_age_key_plugin() {
+        let file = parse("age-key \"k.age\" plugin fido2-hmac # comment\n");
+        assert!(format!("{:?}", file.ctx.secrets).contains("age_plugin: Some(\"fido2-hmac\")"));
+        let file = parse("age-key \"k.age\"\n");
+        assert!(format!("{:?}", file.ctx.secrets).contains("age_plugin: None"));
+        assert!(parse_err("age-key \"k.age\" plugin\n").contains("expected an age plugin name"));
+        assert!(parse_err("age-key \"k.age\" yubikey\n").contains("expected the end of the line"));
     }
 
     #[test]

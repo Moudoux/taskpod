@@ -122,6 +122,7 @@ test("indexes secrets files and secret references", () => {
   const index = parse('secrets "secrets.yaml"\ntask t {\n    file "/etc/x" "{{ secrets.wifi.password }}"\n}\n');
   expect(index.paths.map((p) => `${p.kind}:${p.path}`)).toEqual(["secrets:secrets.yaml", "target:/etc/x"]);
   expect(parse('age-key "k.age"\n').paths.map((p) => `${p.kind}:${p.path}`)).toEqual(["age-key:k.age"]);
+  expect(parse('age-key "k.age" plugin fido2-hmac\n').paths.map((p) => `${p.kind}:${p.path}`)).toEqual(["age-key:k.age"]);
   expect(index.refs.map((r) => `${r.kind}:${r.name}`)).toContain("var:secrets.wifi.password");
 });
 

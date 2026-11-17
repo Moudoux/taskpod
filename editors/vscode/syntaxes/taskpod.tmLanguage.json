@@ -127,12 +127,33 @@
       ]
     },
     "statement": {
-      "match": "^\\s*(include|env|secrets|age-key|shell)\\b",
-      "captures": {
-        "1": {
-          "name": "keyword.control.import.taskpod"
+      "patterns": [
+        {
+          "match": "^\\s*(age-key)\\s+(\"[^\"]*\"|'[^']*')\\s+(plugin)\\s+([\\p{L}\\p{N}_.+-]+)",
+          "captures": {
+            "1": {
+              "name": "keyword.control.import.taskpod"
+            },
+            "2": {
+              "name": "string.quoted.taskpod"
+            },
+            "3": {
+              "name": "keyword.other.taskpod"
+            },
+            "4": {
+              "name": "variable.other.constant.plugin.taskpod"
+            }
+          }
+        },
+        {
+          "match": "^\\s*(include|env|secrets|age-key|shell)\\b",
+          "captures": {
+            "1": {
+              "name": "keyword.control.import.taskpod"
+            }
+          }
         }
-      }
+      ]
     },
     "run-block": {
       "begin": "^(\\s*)(run|undo)\\s*(\\{)\\s*(?=(#.*)?$)",

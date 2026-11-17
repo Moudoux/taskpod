@@ -89,6 +89,10 @@ pub struct Args {
     #[arg(long, value_name = "FILE")]
     pub age_key: Option<PathBuf>,
 
+    /// Decrypt --age-key with only this age plugin (`age -j NAME`), no identity file
+    #[arg(long, value_name = "NAME", requires = "age_key")]
+    pub age_plugin: Option<String>,
+
     /// Print the result of a dry run or diff as JSON on stdout, for editors, instead of
     /// the usual output. Never asks anything
     #[arg(long, conflicts_with_all = ["check", "list"])]
@@ -191,7 +195,9 @@ fn run(mut args: Args) -> Result<bool> {
         file.ctx.secrets.add(std::path::absolute(path)?);
     }
     if let Some(key) = &args.age_key {
-        file.ctx.secrets.set_age_key(std::path::absolute(key)?);
+        file.ctx
+            .secrets
+            .set_age_key(std::path::absolute(key)?, args.age_plugin.clone());
     }
     if args.no_secrets {
         file.ctx.secrets.disable();

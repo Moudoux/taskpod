@@ -43,6 +43,11 @@ let today = $(date +%A)        # shell output, run once when first used
 # the files are also encrypted to, is decrypted once and unlocks them all
 # (or `taskpod FILE --age-key taskpod.key.age`):
 #   age-key "taskpod.key.age"
+# It's decrypted with sops' identity file (~/.config/sops/age/keys.txt). If
+# it's encrypted to a plugin recipient that holds everything needed, like
+# age-plugin-fido2-hmac without a separate identity, name the plugin instead
+# and no identity file is needed (`age -d -j fido2-hmac`, or `--age-plugin`):
+#   age-key "taskpod.key.age" plugin fido2-hmac
 # Merge another file, paths are relative to this one; `if`/`unless` optional:
 #   include "desktop.task" if pacman -Q plasma-workspace
 # Commands run with `sh -ec` by default, change it with:

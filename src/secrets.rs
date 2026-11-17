@@ -8,7 +8,9 @@
 //! key, several files mean several PIN entries and touches. An `age-key`
 //! avoids that: an age identity, itself encrypted (to the security key), that
 //! the secrets files are also encrypted to. It's decrypted once per run and
-//! handed to every sops in `SOPS_AGE_KEY`.
+//! handed to every sops in `SOPS_AGE_KEY`. It's decrypted with sops' own
+//! identity file, or with `plugin NAME`, by that age plugin alone (`age -j`),
+//! when the key file carries everything the plugin needs.
 
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -38,6 +40,8 @@ pub struct Secrets {
     program: String,
     /// An encrypted age identity that unlocks every file, see the module docs.
     age_key: Option<PathBuf>,
+    /// The age plugin that decrypts the age key without an identity file.
+    age_plugin: Option<String>,
     /// The program that decrypts the age key, `age` unless a test swaps it.
     age_program: String,
     /// Where `age` finds the identity that decrypts the age key, for tests;
@@ -54,6 +58,7 @@ impl Default for Secrets {
             files: Vec::new(),
             program: "sops".into(),
             age_key: None,
+            age_plugin: None,
             age_program: "age".into(),
             identity: None,
             values: Arc::default(),
@@ -70,9 +75,11 @@ impl Secrets {
         }
     }
 
-    /// Decrypt every file with this encrypted age identity.
-    pub fn set_age_key(&mut self, path: PathBuf) {
+    /// Decrypt every file with this encrypted age identity, itself decrypted
+    /// with sops' identity file, or with only this age plugin.
+    pub fn set_age_key(&mut self, path: PathBuf, plugin: Option<String>) {
         self.age_key = Some(path);
+        self.age_plugin = plugin;
     }
 
     /// Use other programs and identity file for the age key, for tests.
@@ -146,25 +153,34 @@ impl Secrets {
 }
 
 impl Secrets {
-    /// Decrypt the age key with `age` and the identity sops would use.
+    /// Decrypt the age key with `age` and its plugin, or the identity sops would use.
     fn unwrap_age_key(&self, key: &Path) -> std::result::Result<String, String> {
         if !key.exists() {
             return Err(format!("age key {} doesn't exist", key.display()));
         }
-        let identity = match &self.identity {
-            Some(identity) => identity.clone(),
-            None => sops_key_file().ok_or("no home directory to find the sops age key file in")?,
-        };
-        if !identity.exists() {
-            return Err(format!(
-                "decrypting the age key {} needs the identity in {}, which doesn't exist \
-                 (set SOPS_AGE_KEY_FILE if it's elsewhere)",
-                key.display(),
-                identity.display()
-            ));
-        }
         let mut command = Command::new(&self.age_program);
-        command.arg("-d").arg("-i").arg(&identity).arg(key);
+        command.arg("-d");
+        if let Some(plugin) = &self.age_plugin {
+            command.arg("-j").arg(plugin);
+        } else {
+            let identity = match &self.identity {
+                Some(identity) => identity.clone(),
+                None => {
+                    sops_key_file().ok_or("no home directory to find the sops age key file in")?
+                }
+            };
+            if !identity.exists() {
+                return Err(format!(
+                    "decrypting the age key {} needs the identity in {}, which doesn't exist \
+                     (set SOPS_AGE_KEY_FILE if it's elsewhere, or use `plugin NAME` \
+                     if the key needs only an age plugin)",
+                    key.display(),
+                    identity.display()
+                ));
+            }
+            command.arg("-i").arg(identity);
+        }
+        command.arg(key);
         let what = format!("the age key {}", key.display());
         let output = run_prompting(command, &self.age_program, &what, true)?;
         let text = String::from_utf8(output).map_err(|_| format!("{what} isn't UTF-8"))?;
@@ -388,7 +404,7 @@ mod tests {
         let mut secrets = Secrets::default();
         secrets.set_program(sops.display().to_string());
         secrets.set_age_programs(age.display().to_string(), dir.path().join("keys.txt"));
-        secrets.set_age_key(dir.path().join("key.age"));
+        secrets.set_age_key(dir.path().join("key.age"), None);
         for name in ["a", "b", "old"] {
             secrets.add(dir.path().join(format!("{name}.json")));
         }
@@ -401,5 +417,48 @@ mod tests {
         // a and b with the key; old tried with it, then the usual way.
         assert_eq!((with_key, sops_runs.lines().count()), (3, 4), "{sops_runs}");
         assert_eq!(crate::ui::redact("AGE-SECRET-KEY-1TEST"), "••••");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn age_key_with_a_plugin_needs_no_identity_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A fake age that only decrypts with `-d -j fido2-hmac FILE`.
+        let age = dir.path().join("fake-age");
+        crate::test_util::write_script(
+            &age,
+            "#!/bin/sh\n[ \"$1 $2 $3\" = '-d -j fido2-hmac' ] || exit 1\ncat \"$4\"\n",
+        );
+        let sops = dir.path().join("fake-sops");
+        crate::test_util::write_script(
+            &sops,
+            "#!/bin/sh\n[ \"$(echo \"$SOPS_AGE_KEY\")\" = 'AGE-SECRET-KEY-1PLUGIN' ] || exit 1\ncat \"$4\"\n",
+        );
+        std::fs::write(dir.path().join("key.age"), "AGE-SECRET-KEY-1PLUGIN\n").unwrap();
+        std::fs::write(dir.path().join("a.json"), r#"{"a": "v"}"#).unwrap();
+        let mut secrets = Secrets::default();
+        secrets.set_program(sops.display().to_string());
+        // The identity file doesn't exist: the plugin doesn't need it.
+        secrets.set_age_programs(age.display().to_string(), dir.path().join("missing.txt"));
+        secrets.set_age_key(dir.path().join("key.age"), Some("fido2-hmac".into()));
+        secrets.add(dir.path().join("a.json"));
+        assert_eq!(secrets.get("a").unwrap(), "v");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn age_key_without_identity_file_suggests_a_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("key.age"), "x").unwrap();
+        let mut secrets = Secrets::default();
+        secrets.set_age_programs("false", dir.path().join("missing.txt"));
+        secrets.set_age_key(dir.path().join("key.age"), None);
+        secrets.add(dir.path().join("a.json"));
+        let error = secrets.get("a").unwrap_err();
+        assert!(
+            error.contains("missing.txt, which doesn't exist"),
+            "{error}"
+        );
+        assert!(error.contains("plugin NAME"), "{error}");
     }
 }

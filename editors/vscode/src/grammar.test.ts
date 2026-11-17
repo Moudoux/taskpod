@@ -76,6 +76,16 @@ subtask notify of build {
   expect(scopeOf(tokens, "notify")).toContain("entity.name.function");
 });
 
+test("highlights an age-key plugin", async () => {
+  const tokenize = await tokenizer();
+  const tokens = tokenize(`age-key "k.age" plugin fido2-hmac # comment`);
+  expect(scopeOf(tokens, "age-key")).toContain("keyword.control.import");
+  expect(scopeOf(tokens, '"k.age"')).toContain("string.quoted");
+  expect(scopeOf(tokens, "plugin")).toContain("keyword.other");
+  expect(scopeOf(tokens, "fido2-hmac")).toContain("variable.other.constant.plugin");
+  expect(scopeOf(tokens, " comment")).toContain("comment.line");
+});
+
 test("tokenizes the example files without leaking state", async () => {
   const tokenize = await tokenizer();
   for (const file of ["../../spec.task", "../../build.task"]) {

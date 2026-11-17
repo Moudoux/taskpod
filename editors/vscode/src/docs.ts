@@ -58,8 +58,8 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   "age-key": {
     places: ["top"],
     summary:
-      "An age identity, itself encrypted (to a security key, say), that the `secrets` files are also encrypted to. It's decrypted once per run with `age`, and every sops file is decrypted with it, so several files need one PIN and touch. Files not encrypted to it still decrypt the usual way. `taskpod --age-key FILE` works too.",
-    syntax: 'age-key "taskpod.key.age"',
+      "An age identity, itself encrypted (to a security key, say), that the `secrets` files are also encrypted to. It's decrypted once per run with `age`, and every sops file is decrypted with it, so several files need one PIN and touch. Files not encrypted to it still decrypt the usual way. It's decrypted with sops' identity file, or with `plugin NAME`, by that age plugin alone (`age -d -j NAME`), with no identity file. `taskpod --age-key FILE [--age-plugin NAME]` works too.",
+    syntax: 'age-key "taskpod.key.age" [plugin fido2-hmac]',
     snippet: 'age-key "${1:taskpod.key.age}"',
   },
   include: {
