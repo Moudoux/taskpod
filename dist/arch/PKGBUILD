@@ -6,12 +6,18 @@
 
 pkgname=taskpod
 pkgver=0.14.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Declarative task runner: tasks declare dependencies and run in parallel"
 arch=(x86_64 aarch64)
 url="https://github.com/Moudoux/taskpod"
 license=(MIT)
 depends=(gcc-libs glibc)
+optdepends=(
+  'sudo: root files and sudo steps'
+  'openssh: configuring another machine with --host'
+  'sops: secrets files ({{ secrets.name }})'
+  'age: age-key, with the age plugin it names if any'
+)
 makedepends=(cargo)
 
 _root="$startdir/../.."
