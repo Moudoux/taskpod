@@ -158,7 +158,11 @@ task setup {
     # the first other line starting with `before`, after the last starting
     # with `after`, or at the end; on the wrong side of it, it's moved. With
     # `match "start"`, a line starting with that is this step's line, and is
-    # replaced rather than added again. The file must exist, or with `base
+    # replaced rather than added again. One on the right side of `before` or
+    # `after` counts first, so the same line can be elsewhere too (an
+    # `Include` in each of pacman.conf's sections); when several are on the
+    # wrong side and none on the right, they stay and it's added. The file
+    # must exist, or with `base
     # "path"` (on the machine being configured) it starts as a copy of that,
     # for overrides of vendor files. `sudo` reads and writes as root, keeping
     # the owner and mode. The journal records what taskpod added or replaced,

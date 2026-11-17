@@ -1113,7 +1113,14 @@ impl<'r> TaskRun<'r> {
                 replaced: None,
             },
             None => {
-                if find_line(&split_lines(&old).0, &line.text, line.matcher.as_deref()).is_some() {
+                if find_line(
+                    &split_lines(&old).0,
+                    &line.text,
+                    line.matcher.as_deref(),
+                    line.place.as_ref(),
+                )
+                .is_some()
+                {
                     let text = format!(
                         "{label}: no record that taskpod added the line; mark the step `new` if it did, or `keep`"
                     );
@@ -1141,6 +1148,7 @@ impl<'r> TaskRun<'r> {
             &old,
             &record.text,
             line.matcher.as_deref(),
+            line.place.as_ref(),
             record.replaced.as_deref(),
         ) else {
             self.current(depth, &format!("{label} · already gone"));
@@ -1945,19 +1953,44 @@ fn ending_of(line: &str) -> &'static str {
 }
 
 /// The index of the step's line: one that's `text`, or else one starting with
-/// `matcher`, with whether it's exactly the text.
-fn find_line(lines: &[String], text: &str, matcher: Option<&str>) -> Option<(usize, bool)> {
-    lines
-        .iter()
-        .position(|l| same_line(l, text))
+/// `matcher`, with whether it's exactly the text. One on the right side of
+/// `place` comes first, so the same line can be elsewhere in the file too
+/// (pacman.conf's `Include` line in each repository's section). Only when
+/// none is, a single one on the wrong side is the step's (to be moved); with
+/// several, they belong where they are.
+fn find_line(
+    lines: &[String],
+    text: &str,
+    matcher: Option<&str>,
+    place: Option<&LinePlace>,
+) -> Option<(usize, bool)> {
+    let exact = |l: &String| same_line(l, text);
+    let matched = |l: &String| matcher.is_some_and(|m| starts_with(l, m));
+    let placed = |is: &dyn Fn(&String) -> bool| {
+        (0..lines.len()).find(|&i| is(&lines[i]) && !misplaced(lines, place, i))
+    };
+    let anywhere = |is: &dyn Fn(&String) -> bool| {
+        let mut found = (0..lines.len()).filter(|&i| is(&lines[i]));
+        let first = found.next()?;
+        (place.is_none() || found.next().is_none()).then_some(first)
+    };
+    placed(&exact)
         .map(|i| (i, true))
-        .or_else(|| {
-            let m = matcher?;
-            lines
-                .iter()
-                .position(|l| starts_with(l, m))
-                .map(|i| (i, false))
-        })
+        .or_else(|| placed(&matched).map(|i| (i, false)))
+        .or_else(|| anywhere(&exact).map(|i| (i, true)))
+        .or_else(|| anywhere(&matched).map(|i| (i, false)))
+}
+
+/// Whether the line at `i` is on the wrong side of its anchor. With no
+/// anchor (besides itself), it's fine where it is.
+fn misplaced(lines: &[String], place: Option<&LinePlace>, i: usize) -> bool {
+    match line_anchor(lines, place, Some(i)) {
+        Some(Ok(at)) => match place {
+            Some(LinePlace::Before(_)) => i > at,
+            _ => i < at,
+        },
+        _ => false,
+    }
 }
 
 /// Where a line goes by `place`, not counting the line at `skip`: `None`
@@ -1998,23 +2031,15 @@ fn ensure_line(
 ) -> Result<Option<(String, LineChange)>> {
     let (mut lines, ending) = split_lines(old);
     let mut change = None;
-    match find_line(&lines, text, matcher) {
+    match find_line(&lines, text, matcher, place) {
         Some((i, exact)) => {
             if !exact {
                 let was = lines[i].trim_end_matches(['\r', '\n']).to_string();
                 lines[i] = format!("{text}{}", ending_of(&lines[i]));
                 change = Some(LineChange::Replaced(was));
             }
-            // On the wrong side of its anchor, it moves. With no anchor
-            // (besides itself), it's fine where it is.
-            let wrong = match line_anchor(&lines, place, Some(i)) {
-                Some(Ok(at)) => match place {
-                    Some(LinePlace::Before(_)) => i > at,
-                    _ => i < at,
-                },
-                _ => false,
-            };
-            if wrong {
+            // On the wrong side of its anchor, it moves.
+            if misplaced(&lines, place, i) {
                 let mut line = lines.remove(i);
                 if ending_of(&line).is_empty() {
                     line.push_str(ending);
@@ -2043,10 +2068,11 @@ fn undo_line(
     old: &str,
     written: &str,
     matcher: Option<&str>,
+    place: Option<&LinePlace>,
     replaced: Option<&str>,
 ) -> Option<(String, bool)> {
     let (mut lines, _) = split_lines(old);
-    let (i, exact) = find_line(&lines, written, matcher)?;
+    let (i, exact) = find_line(&lines, written, matcher, place)?;
     match replaced {
         Some(was) => lines[i] = format!("{was}{}", ending_of(&lines[i])),
         None => {
@@ -2253,6 +2279,41 @@ mod tests {
             change,
             LineChange::Replaced("auth\t\tsufficient\tpam_u2f.so cue".into())
         );
+    }
+
+    #[test]
+    fn a_placed_line_can_be_elsewhere_too() {
+        let include = "Include = /etc/pacman.d/mirrorlist";
+        let place = LinePlace::After("[multilib]".into());
+        let repos = format!("[core]\n{include}\n\n[extra]\n{include}\n\n[multilib]\n");
+        let old = format!("{repos}#{include}\n");
+        let (text, change) = ensure_line(&old, include, Some("#Include"), Some(&place))
+            .unwrap()
+            .unwrap();
+        let new = format!("{repos}{include}\n");
+        assert_eq!(text, new);
+        assert_eq!(change, LineChange::Replaced(format!("#{include}")));
+        // Found under [multilib] from then on, and put back from there.
+        assert!(
+            ensure_line(&new, include, Some("#Include"), Some(&place))
+                .unwrap()
+                .is_none()
+        );
+        let undone = undo_line(
+            &new,
+            include,
+            Some("#Include"),
+            Some(&place),
+            Some(&format!("#{include}")),
+        );
+        assert_eq!(undone, Some((old, false)));
+        // Missing, it's added: the ones in [core] and [extra] stay put.
+        let (text, change) = ensure_line(&repos, include, None, Some(&place))
+            .unwrap()
+            .unwrap();
+        assert_eq!(text, new);
+        assert_eq!(change, LineChange::Added);
+        assert_eq!(undo_line(&repos, include, None, Some(&place), None), None);
     }
 
     #[test]

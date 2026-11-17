@@ -70,6 +70,10 @@ Linux and Windows binaries; `v*` tags create a GitHub release.
   first on `PATH`. Remote tests use a fake `ssh` that runs commands locally (`fake_remote` in
   `src/exec/tests.rs`). Write fake executables with `test_util::write_script`, which avoids
   "text file busy" races with parallel tests. Dry runs and diffs only run `if`/`unless` checks, so keep checks read-only.
+- Every change to the code bumps the version, or `makepkg -si` won't install it: `version` in
+  `Cargo.toml` (and `Cargo.lock`, a build updates it), `pkgver` in `dist/arch/PKGBUILD` with
+  `pkgrel=1`, and `version` in `editors/vscode/package.json`. Patch for fixes, minor for new
+  syntax or features. Do it before asking me to reinstall.
 - `.gitignore` patterns are anchored to the root (`/test*`), so source files aren't ignored by accident.
 - Pushing straight to master is fine. Commits use the GitHub noreply address set in this
   repo's git config. Commits are signed with a YubiKey, which needs a touch, so a commit

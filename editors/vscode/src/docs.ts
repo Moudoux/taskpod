@@ -202,7 +202,7 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   line: {
     places: ["body"],
     summary:
-      "Makes sure a file has this line, leaving the rest of it, its mode and owner as they are: for files a package or you own, like PAM configs or `~/.bashrc`. Missing, the line goes before the first other line starting with `before`, after the last starting with `after` (both ignoring indentation), or at the end, and on the wrong side it's moved. Lines are compared ignoring spacing; with `match`, a line starting with that is replaced. The file must exist, unless a `base` says what to start from. The journal records what taskpod added or replaced, so `--undo` puts back only that; a line with no record is left, unless the step says `new`.",
+      "Makes sure a file has this line, leaving the rest of it, its mode and owner as they are: for files a package or you own, like PAM configs or `~/.bashrc`. Missing, the line goes before the first other line starting with `before`, after the last starting with `after` (both ignoring indentation), or at the end, and on the wrong side it's moved. One on the right side counts first, so the same line can be elsewhere too (an `Include` in each of pacman.conf's sections); several on the wrong side stay, and it's added. Lines are compared ignoring spacing; with `match`, a line starting with that is replaced. The file must exist, unless a `base` says what to start from. The journal records what taskpod added or replaced, so `--undo` puts back only that; a line with no record is left, unless the step says `new`.",
     syntax: 'line "/etc/pam.d/sudo" sudo before "auth" "auth sufficient pam_u2f.so cue"\nline "~/.bashrc" ". ~/.scripts/functions.sh"',
     snippet: 'line "${1:path}" "${2:text}"',
   },
