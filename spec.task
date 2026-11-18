@@ -29,6 +29,9 @@ let today = $(date +%A)        # shell output, run once when first used
 # Without a terminal: confirm is false, choose takes the first option, input the default.
 # Built in: {{ home }}, {{ user }}, {{ pwd }} and {{ dir }} (this file's
 # directory). Unknown names fall back to environment variables: {{ HOME }}.
+# In a `run`, `undo` or `set` command, {{ tmp }} is a new empty directory on
+# the machine being configured, deleted once the command ends (a dry run
+# shows $TMPDIR/taskpod.XXXXXX).
 
 # Load KEY=value lines as variables, also exported to every command:
 #   env ".env"
@@ -67,7 +70,7 @@ task main {
 
 task hello {
     # Run after these tasks. They run either way (unless skipped by a guard),
-    # but if one fails, this task doesn't run.
+    # but if one fails, this task doesn't run. Also `task hello needs main {`.
     needs main
     # Guards, all must pass for the task to run:
     #   if <command>       run only if the command succeeds
@@ -80,14 +83,29 @@ task hello {
     unless test -e /tmp/taskpod-hello {
         run touch /tmp/taskpod-hello
     }
+    # An `if` block can have an `else`, which runs when the check fails (it
+    # runs once, so the first block can't change which one runs). For
+    # `unless X { A } else { B }`, write `if X { B } else { A }`.
+    if test -d /tmp {
+        run echo "/tmp is there"
+    } else {
+        notice "no /tmp"
+    }
     # `changed {` only runs if an earlier step in this task changed something,
-    # like restarting a service after its config file. In undo, its `undo`
-    # runs where it stands either way. In a template, a `changed` line makes
-    # the whole call wait for a change before it in the calling task.
+    # like restarting a service after its config file. In a template, a
+    # `changed` line makes the whole call wait for a change before it in the
+    # calling task. `changed run <command>` is a block with one command.
+    # In undo: a `changed` block (or template) with only `run` commands, and
+    # no `undo` or `keep`, runs again once the files, lines and settings right
+    # before it (back to the command or template call before them) are undone,
+    # if that changed something: the restart picks up the old config, before
+    # the package is removed. One with an `undo` runs that where it stands;
+    # `keep` leaves it.
     file "/tmp/taskpod-hello.conf" "greeting=hello\n"
     changed {
         run echo "the config changed"
     }
+    changed run echo "also after the change"
     # `notice "text"` is a message for whoever runs taskpod: shown under the
     # task, and again above the final summary so it isn't lost (a command's
     # output only shows while it runs). It changes nothing, so a task with
@@ -106,6 +124,9 @@ subtask world of hello {
 
 # Templates are reusable steps. Call one with words after its name: inside
 # the template, {{ args }} is all of them and {{ 1 }}, {{ 2 }}, ... each one.
+# Name them after the template's name, `name="default"` for optional ones
+# (last): calls with too few or too many words are an error. A default can
+# use variables. Without names, a template takes any number of words.
 # A template's guards only apply to that call, so a task can mix calls that
 # are already done with ones that still need to run. A template's own
 # `let $( )` or question that uses {{ }} is worked out again for each call.
@@ -117,6 +138,15 @@ template note {
 task notes {
     note first one
     note second
+}
+
+template greet who greeting="hello" {
+    run echo "{{ greeting }}, {{ who }}"
+}
+
+task greetings {
+    greet world        # hello, world
+    greet you hi       # hi, you
 }
 
 task setup {
@@ -132,8 +162,13 @@ task setup {
     #                      programs watching the directory never see it go missing
     #   new                taskpod created it: --undo deletes it (see Undo below)
     #   keep               --undo leaves it as it is
-    # Content is a string, a """ block, or `from "path"` (relative to this file,
-    # copied byte for byte unless an encoding is given).
+    # Content is a string, a """ block, `from "path"` (relative to this file,
+    # copied byte for byte unless an encoding is given), or `url "..." sha256
+    # "..."`: downloaded with curl on this machine and checked against the
+    # sha256, which is required. When the file there already has that sha256,
+    # nothing is downloaded. --pull leaves it alone.
+    #   file "/etc/apt/keyrings/docker.asc" sudo new \
+    #       url "https://download.docker.com/linux/debian/gpg" sha256 "<its sha256>"
     file "/tmp/taskpod-example/hello.sh" """
         #!/bin/sh
         echo "hello from {{ where }}"
@@ -173,6 +208,17 @@ task setup {
     #   line "/etc/pam.d/kde" sudo base "/usr/lib/pam.d/kde" match "auth sufficient pam_u2f.so" \
     #       before "auth" "auth sufficient pam_u2f.so cue"
     run /tmp/taskpod-example/hello.sh
+    # A `setting` is a value that commands read and write. `get` prints it
+    # (compared trimmed); when that's not the value, `set` runs with it as
+    # {{ value }}, and then `get` must print it. Diffs show the old and new
+    # value. The journal keeps what `get` printed before taskpod first set
+    # it, so --undo sets that again (`keep`: undo leaves it). `default "x"` is
+    # what undo sets without a record, like for a value set before taskpod
+    # kept one. `get` and `set` can be `{` blocks like `run`.
+    setting "org.kde.dolphin.desktop" {
+        get xdg-mime query default inode/directory
+        set xdg-mime default {{ value }} inode/directory
+    }
 }
 
 # Undo. `taskpod FILE --undo` (or -u) undoes every task, `-u -r name` one task
@@ -185,7 +231,9 @@ task setup {
 #   reported. One changed since taskpod wrote it is asked about (--yes: undone).
 # - Commands can't be undone by themselves: `undo` gives the command that
 #   does, like `run`, and runs where it stands. A block with commands but no
-#   `undo` is reported, unless it says `keep`: leave it as it is.
+#   `undo` is reported, unless it says `keep`: leave it as it is, or it's a
+#   `changed` block, which runs again after the files before it are undone.
+# - Settings are set back to their value from the journal.
 # - In undo, `unless` says when there's something to undo (its check passes
 #   when the task is done) and `if` still says where the task applies.
 template service {
@@ -205,14 +253,20 @@ task undo-example {
     undo echo "stopping the app"
 }
 
-task install-tool {
-    manual
-    terminal                   # its installer asks for root itself, with `sudo -k`
+# The flags `sudo`, `terminal`, `keep`, `manual` and `interactive` can also
+# go before `task`, `subtask` or `template`, and `needs` and `lock` after its
+# name (after a template's parameters), so the body is only what it does.
+# Both places work, and add up: `needs` in the header and the body are all needed.
+# Continue a long header with \ like any line.
+#   sudo template pkg needs yay lock pacman { ... }
+#   sudo interactive task update-aur needs yay lock pacman { ... }
+#   subtask notify of build needs mail { ... }
+manual terminal task install-tool {   # its installer asks for root itself, with `sudo -k`
     unless command -v example-tool
     run ./install.sh --prefix /usr/local
 }
 
-# More directives:
+# More directives (in the body, or in the header as above):
 #   lock name     tasks holding the same lock never run at the same time,
 #                 e.g. `lock pacman` for package installs
 #   sudo          ask for sudo before running; commands mentioning sudo do this

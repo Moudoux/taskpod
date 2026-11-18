@@ -282,6 +282,51 @@ impl Ctx {
         }
     }
 
+    /// Make a new empty directory on the machine being configured, for `{{ tmp }}`.
+    pub fn make_temp_dir(&self) -> Result<String> {
+        if self.remote.is_some() {
+            let dir = self
+                .capture("mktemp -d", &self.default_cwd(&self.dir))
+                .map_err(|e| anyhow!("failed to make a directory for {{{{ tmp }}}}: {e}"))?;
+            return Ok(dir);
+        }
+        static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let base = std::env::temp_dir();
+        for _ in 0..100 {
+            let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos());
+            let dir = base.join(format!("taskpod.{}.{n}.{nanos:x}", std::process::id()));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            match builder.create(&dir) {
+                Ok(()) => return Ok(dir.display().to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => bail!(
+                    "failed to make a directory for {{{{ tmp }}}} in {}: {e}",
+                    base.display()
+                ),
+            }
+        }
+        bail!(
+            "failed to make a directory for {{{{ tmp }}}} in {}",
+            base.display()
+        )
+    }
+
+    /// Remove a directory made by [`Ctx::make_temp_dir`], with everything in it.
+    pub fn remove_temp_dir(&self, dir: &str) -> Result<()> {
+        if self.remote.is_some() {
+            let script = format!("rm -rf -- {}", crate::remote::quote(dir));
+            self.capture(&script, &self.default_cwd(&self.dir))
+                .map_err(|e| anyhow!(e))?;
+            return Ok(());
+        }
+        std::fs::remove_dir_all(dir).map_err(|e| anyhow!("failed to remove {dir}: {e}"))
+    }
+
     /// Run a check and report whether it succeeded. Output is discarded.
     pub fn check(&self, script: &str, cwd: &Path) -> Result<bool> {
         let mut spawn = self.command(script, cwd);
@@ -373,6 +418,19 @@ impl<'a> Scope<'a> {
             parent: Some(self),
             ctx: self.ctx,
         }
+    }
+
+    /// Whether a variable of this name is defined in the task file (not a
+    /// built-in or an environment variable).
+    pub fn defines(&self, name: &str) -> bool {
+        let mut scope = Some(self);
+        while let Some(current) = scope {
+            if current.vars.contains(name) {
+                return true;
+            }
+            scope = current.parent;
+        }
+        false
     }
 
     /// Replace every `{{ name }}` in `text`. `\{{` produces a literal `{{`.
@@ -479,6 +537,23 @@ impl<'a> Scope<'a> {
             ),
         })
     }
+}
+
+/// Whether `text` uses `{{ name }}` (not escaped as `\{{`).
+pub fn mentions(text: &str, name: &str) -> bool {
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        let escaped = rest[..start].ends_with('\\');
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            return false;
+        };
+        if !escaped && after[..end].trim() == name {
+            return true;
+        }
+        rest = &after[end + 2..];
+    }
+    false
 }
 
 pub fn is_var_char(c: char) -> bool {

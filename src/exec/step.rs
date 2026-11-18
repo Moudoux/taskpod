@@ -3,7 +3,9 @@
 use super::journal::{self, Entry, Previous};
 use super::target::{self, Current, DirState, describe};
 use super::{Mode, Outcome, Runner, StepKind, StepRecord, TaskReport, pull, sudo};
-use crate::ast::{Block, Encoding, FileSource, FileStep, Guard, LinePlace, LineStep, Step, Task};
+use crate::ast::{
+    Block, Encoding, FileSource, FileStep, Guard, LinePlace, LineStep, SettingStep, Step, Task,
+};
 use crate::parser::guard_passes;
 use crate::ui::{self, TaskLine, ui};
 use crate::vars::{Ctx, Scope, Vars, expand_tilde};
@@ -283,7 +285,10 @@ impl<'r> TaskRun<'r> {
 
     fn step(&mut self, step: &'r Step, scope: &Scope, depth: usize) -> Result<()> {
         match step {
-            Step::Run(script) => self.run_step(&scope.expand(script)?, depth),
+            Step::Run(script) => self.with_tmp(&[script], scope, |this, scope| {
+                this.run_step(&scope.expand(script)?, depth)
+            }),
+            Step::Setting(setting) => self.setting(setting, scope, depth),
             // Only `--undo` runs these, see `undo_block`.
             Step::Undo(_) => Ok(()),
             Step::Notice(text) => {
@@ -296,7 +301,10 @@ impl<'r> TaskRun<'r> {
                 let template = &self.runner.file.templates[template];
                 let args = scope.expand(args)?;
                 let label = format!("{} {args}", template.name).trim().to_string();
-                let arg_vars = Vars::for_args(&args);
+                template
+                    .check_arity(args.split_whitespace().count())
+                    .map_err(|e| anyhow!("`{label}`: {e}"))?;
+                let arg_vars = template.arg_vars(&args);
                 let call_scope = scope.child(&arg_vars);
                 let template_vars = template.vars.for_call();
                 let inner = call_scope.child(&template_vars);
@@ -317,7 +325,7 @@ impl<'r> TaskRun<'r> {
     fn nested(&mut self, block: &'r Block, scope: &Scope, depth: usize, label: &str) -> Result<()> {
         self.status(&format!("checking {label}"));
         let undo = self.runner.opts.undo;
-        if undo && block.keep {
+        if undo && block.keep && block.otherwise.is_none() {
             self.current(depth, &format!("{label} · kept"));
             return Ok(());
         }
@@ -335,7 +343,15 @@ impl<'r> TaskRun<'r> {
                     .is_some()
         };
         if skip {
+            // `} else {`: only after an `if`, whose check ran once, here.
+            if let Some(other) = &block.otherwise {
+                return self.nested(other, scope, depth, &format!("{label} · else"));
+            }
             self.current(depth, label);
+            return Ok(());
+        }
+        if undo && block.keep {
+            self.current(depth, &format!("{label} · kept"));
             return Ok(());
         }
         // The block only counts as a change if a step inside it changes something.
@@ -402,6 +418,36 @@ impl<'r> TaskRun<'r> {
             }
         }
         self.exec(script)
+    }
+
+    /// Run `f` with `{{ tmp }}` set to a new empty directory on the machine
+    /// being configured, removed afterwards, if one of `scripts` uses it (and
+    /// the task file has no variable of that name). Checks only show a name.
+    fn with_tmp<T>(
+        &mut self,
+        scripts: &[&str],
+        scope: &Scope,
+        f: impl FnOnce(&mut Self, &Scope) -> Result<T>,
+    ) -> Result<T> {
+        if !scripts.iter().any(|s| crate::vars::mentions(s, "tmp")) || scope.defines("tmp") {
+            return f(self, scope);
+        }
+        let mut vars = Vars::default();
+        if self.checking() {
+            vars.literal("tmp", "$TMPDIR/taskpod.XXXXXX");
+            return f(self, &scope.child(&vars));
+        }
+        let ctx = &self.runner.file.ctx;
+        let dir = ctx.make_temp_dir()?;
+        vars.literal("tmp", dir.clone());
+        let result = f(self, &scope.child(&vars));
+        if let Err(e) = self.runner.file.ctx.remove_temp_dir(&dir) {
+            // The step's own result matters more; say so, but don't fail for it.
+            if result.is_ok() {
+                self.push(0, style(format!("{e:#}")).dim().to_string());
+            }
+        }
+        result
     }
 
     /// Take a named lock, giving the job slot back while waiting for it.
@@ -542,14 +588,29 @@ impl<'r> TaskRun<'r> {
         let ctx = &self.runner.file.ctx;
         let path = self.target(&scope.expand(&file.path)?);
         let shown = path.display().to_string();
-        let content =
-            file_content(file, scope, &ctx.dir).with_context(|| format!("file {shown}"))?;
+        let owner = file.owner.as_deref().map(|o| scope.expand(o)).transpose()?;
+        let content = match &file.source {
+            // Nothing to pull: the content is the download's.
+            FileSource::Url { .. } if self.runner.opts.pull => {
+                self.current(depth, &format!("file {shown} · downloaded"));
+                return Ok(());
+            }
+            FileSource::Url { url, sha256 } => {
+                // Already the right file: no need to download it again.
+                let as_root = self.mode() == Mode::Run && (file.sudo || owner.is_some());
+                match target::read(ctx, &self.task.name, &path, as_root)? {
+                    Current::Content(bytes) if sha256_hex(&bytes) == *sha256 => bytes,
+                    _ => download(&scope.expand(url)?, sha256)
+                        .with_context(|| format!("file {shown}"))?,
+                }
+            }
+            _ => file_content(file, scope, &ctx.dir).with_context(|| format!("file {shown}"))?,
+        };
         let mode = file.mode.unwrap_or(if content.starts_with(b"#!") {
             0o755
         } else {
             0o644
         });
-        let owner = file.owner.as_deref().map(|o| scope.expand(o)).transpose()?;
         if self.runner.opts.pull {
             return self.pull_file(file, scope, depth, &path, &content, mode, owner.as_deref());
         }
@@ -871,13 +932,18 @@ impl<'r> TaskRun<'r> {
                         out.insert(self.target(&path));
                     }
                 }
-                Step::Block(inner) => self.written_paths(inner, scope, out),
+                Step::Block(inner) => {
+                    self.written_paths(inner, scope, out);
+                    if let Some(other) = &inner.otherwise {
+                        self.written_paths(other, scope, out);
+                    }
+                }
                 Step::Call { template, args } => {
                     let template = &self.runner.file.templates[template];
                     let Ok(args) = scope.expand(args) else {
                         continue;
                     };
-                    let arg_vars = Vars::for_args(&args);
+                    let arg_vars = template.arg_vars(&args);
                     let call_scope = scope.child(&arg_vars);
                     let template_vars = template.vars.for_call();
                     self.written_paths(&template.body, &call_scope.child(&template_vars), out);
@@ -1392,7 +1458,23 @@ impl<'r> TaskRun<'r> {
 
     fn undo_steps(&mut self, block: &'r Block, scope: &Scope, depth: usize) -> Result<()> {
         let covered = block.undo_covers_commands();
+        // `changed` reactions follow the files, lines and settings right
+        // before them: they run again once those are undone, if that changed
+        // something, before the commands and calls before them (a package
+        // removal) are undone.
+        let mut reactions: Vec<(&'r Step, bool)> = Vec::new();
         for step in block.steps.iter().rev() {
+            let reaction = self.is_reaction(step);
+            if reaction || !is_config(step) {
+                for (step, changed) in std::mem::take(&mut reactions).into_iter().rev() {
+                    self.react(step, scope, depth, changed)?;
+                }
+            }
+            if reaction {
+                reactions.push((step, false));
+                continue;
+            }
+            let changed_before = std::mem::replace(&mut self.changed, false);
             let result = match step {
                 Step::Run(_) if covered => Ok(()),
                 Step::Run(script) => {
@@ -1400,14 +1482,20 @@ impl<'r> TaskRun<'r> {
                     self.cannot(depth, &text);
                     Ok(())
                 }
-                Step::Undo(script) => scope
-                    .expand(script)
-                    .and_then(|script| self.run_step(&script, depth)),
+                Step::Undo(script) => self.with_tmp(&[script], scope, |this, scope| {
+                    this.run_step(&scope.expand(script)?, depth)
+                }),
                 // Notices are about doing the task, not undoing it.
                 Step::Notice(_) => Ok(()),
                 // Files and nested blocks know they're undoing.
                 other => self.step(other, scope, depth),
             };
+            if self.changed {
+                for reaction in &mut reactions {
+                    reaction.1 = true;
+                }
+            }
+            self.changed |= changed_before;
             if let Err(e) = &result
                 && self.checking()
                 && crate::secrets::not_checked(e)
@@ -1416,6 +1504,209 @@ impl<'r> TaskRun<'r> {
                 continue;
             }
             result?;
+        }
+        for (step, changed) in reactions.into_iter().rev() {
+            self.react(step, scope, depth, changed)?;
+        }
+        Ok(())
+    }
+
+    /// A `changed` block (or a call of a template that is one) that only
+    /// runs commands, with no `undo` or `keep`: see [`Block::is_reaction`].
+    fn is_reaction(&self, step: &Step) -> bool {
+        match step {
+            Step::Block(block) => block.otherwise.is_none() && block.is_reaction(),
+            Step::Call { template, .. } => self.runner.file.templates[template].body.is_reaction(),
+            _ => false,
+        }
+    }
+
+    /// In an undo, run a reaction again, as it runs after a change: once the
+    /// steps before it are undone, if that changed something.
+    fn react(&mut self, step: &'r Step, scope: &Scope, depth: usize, changed: bool) -> Result<()> {
+        let (block, label, arg_vars, template_vars) = match step {
+            Step::Block(block) => (
+                block,
+                "changed".to_string(),
+                Vars::default(),
+                Vars::default(),
+            ),
+            Step::Call { template, args } => {
+                let template = &self.runner.file.templates[template];
+                let args = scope.expand(args)?;
+                let label = format!("{} {args}", template.name).trim().to_string();
+                (
+                    &template.body,
+                    label,
+                    template.arg_vars(&args),
+                    template.vars.for_call(),
+                )
+            }
+            _ => unreachable!("only blocks and calls are reactions"),
+        };
+        let call_scope = scope.child(&arg_vars);
+        let inner = call_scope.child(&template_vars);
+        if !changed && !self.runner.opts.ignore_guards {
+            self.current(depth, &format!("{label} · nothing undone before it"));
+            return Ok(());
+        }
+        if self
+            .runner
+            .failing_guard(&block.guards, &inner, &self.cwd)?
+            .is_some()
+        {
+            self.current(depth, &label);
+            return Ok(());
+        }
+        self.change(depth, &format!("{label} · again, after the undo"));
+        self.block(block, &inner, depth + 1)
+    }
+
+    /// `setting "value" { get ...; set ... }`: run `set` when `get` prints
+    /// something else, recording what it printed first, for `--undo`.
+    fn setting(&mut self, setting: &'r SettingStep, scope: &Scope, depth: usize) -> Result<()> {
+        // A value isn't in a file to pull.
+        if self.runner.opts.pull {
+            return Ok(());
+        }
+        let wanted = scope.expand(&setting.value)?;
+        let get = scope.expand(&setting.get)?;
+        let label = format!("setting {}", first_line(&get));
+        if self.runner.opts.undo {
+            return self.undo_setting(setting, scope, depth, &label, &get, &wanted);
+        }
+        let current = self.runner.file.ctx.capture(&get, &self.cwd);
+        if current.as_deref() == Ok(wanted.as_str()) {
+            self.current(depth, &format!("{label} · {}", shown_value(&wanted)));
+            return Ok(());
+        }
+        let from = match &current {
+            Ok(value) => shown_value(value),
+            Err(_) => "(get failed)".to_string(),
+        };
+        self.change(
+            depth,
+            &format!("{label} · {from} → {}", shown_value(&wanted)),
+        );
+        if self.checking() {
+            return Ok(());
+        }
+        let ctx = &self.runner.file.ctx;
+        if let Ok(old) = &current {
+            journal::record_setting(ctx, &self.task.name, &get, old)?;
+        }
+        self.set_value(setting, scope, &wanted, depth)?;
+        let now = self
+            .runner
+            .file
+            .ctx
+            .capture(&get, &self.cwd)
+            .map_err(|e| anyhow!("after `set`: {e}"))?;
+        if now != wanted {
+            bail!(
+                "`set` ran, but `{}` prints {} instead of {}",
+                first_line(&get),
+                shown_value(&now),
+                shown_value(&wanted)
+            );
+        }
+        Ok(())
+    }
+
+    /// Run a setting's `set` with `{{ value }}`.
+    fn set_value(
+        &mut self,
+        setting: &SettingStep,
+        scope: &Scope,
+        value: &str,
+        depth: usize,
+    ) -> Result<()> {
+        let mut vars = Vars::default();
+        vars.literal("value", value);
+        let inner = scope.child(&vars);
+        self.with_tmp(&[&setting.set], &inner, |this, scope| {
+            this.run_step(&scope.expand(&setting.set)?, depth + 1)
+        })
+    }
+
+    /// Set a setting back to its value from before taskpod, from the journal.
+    fn undo_setting(
+        &mut self,
+        setting: &SettingStep,
+        scope: &Scope,
+        depth: usize,
+        label: &str,
+        get: &str,
+        wanted: &str,
+    ) -> Result<()> {
+        if setting.keep {
+            self.current(depth, &format!("{label} · kept"));
+            return Ok(());
+        }
+        let ctx = &self.runner.file.ctx;
+        let task = self.task.name.clone();
+        let current = ctx.capture(get, &self.cwd);
+        let recorded = journal::read_setting(ctx, &task, get)?;
+        let recorded_value = recorded.is_some();
+        let default = setting
+            .default
+            .as_deref()
+            .map(|d| scope.expand(d))
+            .transpose()?;
+        let Some(old) = recorded.or(default) else {
+            if current.as_deref() == Ok(wanted) {
+                let text = format!(
+                    "{label}: no record of its value before taskpod set it; add `keep` to leave it"
+                );
+                self.cannot(depth, &text);
+            } else {
+                self.current(depth, &format!("{label} · not set by taskpod"));
+            }
+            return Ok(());
+        };
+        let write = !self.checking();
+        if current.as_deref() == Ok(old.as_str()) {
+            self.current(depth, &format!("{label} · already as it was"));
+            if write && recorded_value {
+                journal::remove_setting(ctx, &task, get)?;
+            }
+            return Ok(());
+        }
+        // With no record, only undo what taskpod would have set.
+        if !recorded_value && current.as_deref() != Ok(wanted) {
+            self.current(depth, &format!("{label} · not set by taskpod"));
+            return Ok(());
+        }
+        let edited = current.as_deref() != Ok(wanted);
+        let from = match &current {
+            Ok(value) => shown_value(value),
+            Err(_) => "(get failed)".to_string(),
+        };
+        let note = if edited {
+            " · changed since taskpod set it"
+        } else {
+            ""
+        };
+        self.change(
+            depth,
+            &format!("{label} · {from} → {}{note}", shown_value(&old)),
+        );
+        if !write {
+            return Ok(());
+        }
+        if edited
+            && !self.runner.opts.yes
+            && !ui().confirm(&format!(
+                "`{}` changed since taskpod set it. Undo it anyway?",
+                first_line(get)
+            ))?
+        {
+            self.push(depth + 1, style("not undone").dim().to_string());
+            return Ok(());
+        }
+        self.set_value(setting, scope, &old, depth)?;
+        if recorded_value {
+            journal::remove_setting(&self.runner.file.ctx, &task, get)?;
         }
         Ok(())
     }
@@ -1810,6 +2101,31 @@ impl ResolvedLine {
     }
 }
 
+/// A step that only puts files, lines and settings in place (or says
+/// something): what a `changed` reaction follows in an undo.
+fn is_config(step: &Step) -> bool {
+    match step {
+        Step::File(_) | Step::Line(_) | Step::Setting(_) | Step::Notice(_) => true,
+        Step::Block(block) => {
+            block.steps.iter().all(is_config)
+                && block
+                    .otherwise
+                    .as_ref()
+                    .is_none_or(|b| b.steps.iter().all(is_config))
+        }
+        _ => false,
+    }
+}
+
+/// A setting's value in a label: quoted when empty or spaced.
+fn shown_value(value: &str) -> String {
+    if value.is_empty() || value.contains(char::is_whitespace) {
+        format!("{value:?}")
+    } else {
+        value.to_string()
+    }
+}
+
 fn first_line(script: &str) -> String {
     let first = script.lines().next().unwrap_or_default();
     if script.lines().count() > 1 {
@@ -1840,6 +2156,7 @@ fn pull_content(
     };
     match &file.source {
         FileSource::Empty => bail!("a directory without `from` has nothing to pull"),
+        FileSource::Url { .. } => bail!("a downloaded file has nothing to pull"),
         FileSource::Copy(source) => {
             let source = copy_source(source, scope, dir)?;
             let bytes = if file.raw {
@@ -2200,6 +2517,7 @@ pub(crate) fn list_files(dir: &Path, prefix: &str, names: &mut Vec<String>) -> R
 fn file_content(file: &FileStep, scope: &Scope, dir: &Path) -> Result<Vec<u8>> {
     match &file.source {
         FileSource::Empty => bail!("a directory without `from` has no content"),
+        FileSource::Url { url, sha256 } => download(&scope.expand(url)?, sha256),
         FileSource::Inline(text) => file.encoding.encode(&scope.expand(text)?),
         FileSource::Copy(source) => {
             let source = copy_source(source, scope, dir)?;
@@ -2223,6 +2541,56 @@ fn file_content(file: &FileStep, scope: &Scope, dir: &Path) -> Result<Vec<u8>> {
             file.encoding.encode(&text)
         }
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Download `url` with curl, on this machine, and check it against
+/// `sha256`. Each download is kept for the rest of the run.
+fn download(url: &str, sha256: &str) -> Result<Vec<u8>> {
+    type Cache = std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = format!("{sha256} {url}");
+    if let Some(bytes) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Ok(bytes.clone());
+    }
+    let mut command = std::process::Command::new("curl");
+    command
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--url",
+            url,
+        ])
+        .stdin(Stdio::null());
+    let output = crate::tty::clean(&mut command)
+        .output()
+        .context("failed to start curl, which downloads `url` files")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("downloading {url} failed: {}", stderr.trim());
+    }
+    let got = sha256_hex(&output.stdout);
+    if got != sha256 {
+        bail!(
+            "{url} has sha256 {got}, not {sha256}: if it changed on purpose, check the new file \
+             and put its sha256 in the task file"
+        );
+    }
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, output.stdout.clone());
+    Ok(output.stdout)
 }
 
 /// Feed a stream to the task's line. For `\r` progress updates, the last one wins.

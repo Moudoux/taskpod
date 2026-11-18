@@ -65,6 +65,8 @@ struct Body {
     workdir: Option<String>,
     vars: Vars,
     block: Block,
+    /// An inline block closed with `} else {`.
+    else_follows: bool,
 }
 
 #[derive(PartialEq)]
@@ -156,55 +158,34 @@ impl<'s> Parser<'s> {
                     let guard = self.guard(&keyword)?;
                     file.guards.push(guard);
                 }
-                "task" | "subtask" => {
-                    let name = self.word("a task name")?;
-                    let parent = if keyword == "subtask" {
-                        self.keyword("of")?;
-                        Some(self.word("the parent task name")?)
-                    } else {
-                        None
-                    };
-                    let origin = self.origin(start);
-                    self.open_brace()?;
-                    let body = self.body(BodyKind::Task, start)?;
-                    if file.tasks.contains_key(&name) {
-                        return Err(self.error_at(start, format!("task '{name}' is defined twice")));
-                    }
-                    let task = Task {
-                        name: name.clone(),
-                        desc: body.desc,
-                        needs: body.needs,
-                        parent,
-                        manual: body.manual,
-                        interactive: body.interactive,
-                        workdir: body.workdir,
-                        vars: body.vars,
-                        body: body.block,
-                        origin,
-                    };
-                    file.tasks.insert(name, task);
+                "task" | "subtask" | "template" => {
+                    self.definition(file, &keyword, Vec::new(), start)?;
                 }
-                "template" => {
-                    let name = self.word("a template name")?;
-                    if is_keyword(&name) {
-                        return Err(self.error_at(start, format!("'{name}' is a keyword")));
-                    }
-                    let origin = self.origin(start);
-                    self.open_brace()?;
-                    let body = self.body(BodyKind::Template, start)?;
-                    if file.templates.contains_key(&name) {
-                        return Err(
-                            self.error_at(start, format!("template '{name}' is defined twice"))
-                        );
-                    }
-                    let template = Template {
-                        name: name.clone(),
-                        needs: body.needs,
-                        vars: body.vars,
-                        body: body.block,
-                        origin,
+                // `sudo interactive task name {`: flags before a definition.
+                flag if is_header_flag(flag) => {
+                    let mut flags = vec![(keyword.clone(), start)];
+                    let kind = loop {
+                        let at = self.pos;
+                        let word = self.word("'task', 'subtask', 'template' or another flag")?;
+                        match word.as_str() {
+                            "task" | "subtask" | "template" => break word,
+                            flag if is_header_flag(flag) => {
+                                if flags.iter().any(|(f, _)| f == flag) {
+                                    return Err(
+                                        self.error_at(at, format!("'{flag}' is given twice"))
+                                    );
+                                }
+                                flags.push((word, at));
+                            }
+                            other => {
+                                return Err(self.error_at(
+                                    at,
+                                    format!("expected 'task', 'subtask' or 'template' after '{keyword}', found '{other}'"),
+                                ));
+                            }
+                        }
                     };
-                    file.templates.insert(name, template);
+                    self.definition(file, &kind, flags, start)?;
                 }
                 other => {
                     return Err(self.error_at(start, format!("unknown statement '{other}'")));
@@ -222,6 +203,17 @@ impl<'s> Parser<'s> {
             }
             if self.peek() == Some('}') {
                 self.bump();
+                if kind == BodyKind::Block {
+                    self.skip_inline_ws();
+                    if self.rest().starts_with("else")
+                        && !self.rest()[4..].starts_with(|c: char| is_word_char(c))
+                    {
+                        self.pos += 4;
+                        self.open_brace()?;
+                        body.else_follows = true;
+                        return Ok(body);
+                    }
+                }
                 self.end_of_line()?;
                 return Ok(body);
             }
@@ -259,6 +251,24 @@ impl<'s> Parser<'s> {
                     if opens_block {
                         let inner = self.body(BodyKind::Block, start)?;
                         let mut block = inner.block;
+                        if inner.else_follows {
+                            if !matches!(guard, Guard::If(_)) {
+                                let message = match &guard {
+                                    Guard::Unless(_) => {
+                                        "`else` only follows an `if` block: \
+                                        write `unless X { A } else { B }` as `if X { B } else { A }`"
+                                    }
+                                    _ => "`else` only follows an `if` block",
+                                };
+                                return Err(self.error_at(start, message));
+                            }
+                            let open = self.pos;
+                            let other = self.body(BodyKind::Block, open)?;
+                            if other.else_follows {
+                                return Err(self.error_at(open, "an `else` block has no `else`"));
+                            }
+                            block.otherwise = Some(Box::new(other.block));
+                        }
                         block.guards.insert(0, guard);
                         body.block.steps.push(Step::Block(block));
                     } else {
@@ -267,6 +277,19 @@ impl<'s> Parser<'s> {
                 }
                 "changed" => {
                     self.skip_inline_ws();
+                    // `changed run <command>`: a block with one command.
+                    if self.rest().starts_with("run")
+                        && !self.rest()[3..].starts_with(|c: char| is_word_char(c))
+                    {
+                        self.pos += 3;
+                        let script = self.run_script("run")?;
+                        body.block.steps.push(Step::Block(Block {
+                            guards: vec![Guard::Changed],
+                            steps: vec![Step::Run(script)],
+                            ..Block::default()
+                        }));
+                        continue;
+                    }
                     let opens_block = self.peek() == Some('{');
                     if opens_block {
                         self.bump();
@@ -329,6 +352,10 @@ impl<'s> Parser<'s> {
                     let text = self.string()?;
                     self.end_of_line()?;
                     body.block.steps.push(Step::Notice(text));
+                }
+                "setting" => {
+                    let setting = self.setting(start)?;
+                    body.block.steps.push(Step::Setting(Box::new(setting)));
                 }
                 "line" => {
                     let line = self.line_step()?;
@@ -425,6 +452,244 @@ impl<'s> Parser<'s> {
         }
         self.pos = save;
         Ok(None)
+    }
+
+    /// A task, subtask or template, after any flags before it:
+    /// `[flags] task name [needs a b] [lock l] {`, `subtask name of parent ...`,
+    /// `[flags] template name [params] [needs ...] [lock ...] {`.
+    fn definition(
+        &mut self,
+        file: &mut TaskFile,
+        keyword: &str,
+        flags: Vec<(String, usize)>,
+        start: usize,
+    ) -> Result<()> {
+        let template = keyword == "template";
+        let name = self.word(if template {
+            "a template name"
+        } else {
+            "a task name"
+        })?;
+        if template && is_keyword(&name) {
+            return Err(self.error_at(start, format!("'{name}' is a keyword")));
+        }
+        let parent = if keyword == "subtask" {
+            self.keyword("of")?;
+            Some(self.word("the parent task name")?)
+        } else {
+            None
+        };
+        let origin = self.origin(start);
+        let params = if template { self.params()? } else { Vec::new() };
+        let (header_needs, header_locks) = self.header_clauses()?;
+        self.open_brace()?;
+        let kind = if template {
+            BodyKind::Template
+        } else {
+            BodyKind::Task
+        };
+        let mut body = self.body(kind, start)?;
+        for (flag, at) in &flags {
+            match flag.as_str() {
+                "sudo" => body.block.sudo = true,
+                "terminal" => body.block.terminal = true,
+                "keep" => body.block.keep = true,
+                "manual" | "interactive" if template => {
+                    return Err(self.error_at(*at, format!("'{flag}' can only be used on tasks")));
+                }
+                "manual" => body.manual = true,
+                _ => body.interactive = true,
+            }
+        }
+        let mut needs = header_needs;
+        needs.extend(body.needs);
+        let mut locks = header_locks;
+        locks.append(&mut body.block.locks);
+        body.block.locks = locks;
+        if template {
+            if file.templates.contains_key(&name) {
+                return Err(self.error_at(start, format!("template '{name}' is defined twice")));
+            }
+            let template = Template {
+                name: name.clone(),
+                params,
+                needs,
+                vars: body.vars,
+                body: body.block,
+                origin,
+            };
+            file.templates.insert(name, template);
+        } else {
+            if file.tasks.contains_key(&name) {
+                return Err(self.error_at(start, format!("task '{name}' is defined twice")));
+            }
+            let task = Task {
+                name: name.clone(),
+                desc: body.desc,
+                needs,
+                parent,
+                manual: body.manual,
+                interactive: body.interactive,
+                workdir: body.workdir,
+                vars: body.vars,
+                body: body.block,
+                origin,
+            };
+            file.tasks.insert(name, task);
+        }
+        Ok(())
+    }
+
+    /// `needs a b` and `lock name` clauses before a definition's `{`.
+    fn header_clauses(&mut self) -> Result<(Vec<String>, Vec<String>)> {
+        let (mut needs, mut locks) = (Vec::new(), Vec::new());
+        loop {
+            self.skip_inline_ws();
+            if self.peek() == Some('{') || self.at_line_end() {
+                return Ok((needs, locks));
+            }
+            let at = self.pos;
+            let clause = self.word("'needs', 'lock' or '{'")?;
+            let (list, what) = match clause.as_str() {
+                "needs" => (&mut needs, "a task name"),
+                "lock" => (&mut locks, "a lock name"),
+                other => {
+                    return Err(self.error_at(
+                        at,
+                        format!("expected 'needs', 'lock' or '{{', found '{other}'"),
+                    ));
+                }
+            };
+            let before = list.len();
+            loop {
+                self.skip_inline_ws();
+                if self.peek() == Some('{') || self.at_line_end() {
+                    break;
+                }
+                let save = self.pos;
+                let word = self.word(what)?;
+                if word == "needs" || word == "lock" {
+                    self.pos = save;
+                    break;
+                }
+                list.push(word);
+            }
+            if list.len() == before {
+                return Err(self.error_at(at, format!("'{clause}' needs {what}")));
+            }
+        }
+    }
+
+    /// Named template parameters before the `{`, or a `needs` or `lock` clause:
+    /// `a b c="default"`.
+    fn params(&mut self) -> Result<Vec<Param>> {
+        let mut params: Vec<Param> = Vec::new();
+        loop {
+            self.skip_inline_ws();
+            if self.peek() == Some('{') || self.at_line_end() {
+                return Ok(params);
+            }
+            let start = self.pos;
+            let name = self.word("a parameter name or '{'")?;
+            if name == "needs" || name == "lock" {
+                self.pos = start;
+                return Ok(params);
+            }
+            if !name.chars().all(crate::vars::is_var_char)
+                || name.chars().all(|c| c.is_ascii_digit())
+                || matches!(name.as_str(), "args" | "tmp" | "value")
+            {
+                return Err(self.error_at(start, format!("'{name}' can't be a parameter name")));
+            }
+            if params.iter().any(|p| p.name == name) {
+                return Err(self.error_at(start, format!("parameter '{name}' is named twice")));
+            }
+            let default = if self.peek() == Some('=') {
+                self.bump();
+                Some(match self.peek() {
+                    Some('"' | '\'') => self.string()?,
+                    _ => self.word("a default value")?,
+                })
+            } else {
+                if params.iter().any(|p| p.default.is_some()) {
+                    return Err(self.error_at(
+                        start,
+                        format!(
+                            "'{name}' comes after an optional parameter, so it needs a default too"
+                        ),
+                    ));
+                }
+                None
+            };
+            params.push(Param { name, default });
+        }
+    }
+
+    /// `setting "value" {` with a `get` and a `set` line (or `{` blocks), and maybe `keep`.
+    fn setting(&mut self, start: usize) -> Result<SettingStep> {
+        self.skip_inline_ws();
+        let value = match self.peek() {
+            Some('"' | '\'') => self.string()?,
+            _ => self.word("the value it should have")?,
+        };
+        self.open_brace()?;
+        let (mut get, mut set, mut default, mut keep) = (None, None, None, false);
+        loop {
+            self.skip_trivia();
+            if self.eof() {
+                return Err(self.error_at(start, "missing closing '}'"));
+            }
+            if self.peek() == Some('}') {
+                self.bump();
+                self.end_of_line()?;
+                break;
+            }
+            let at = self.pos;
+            match self.word("'get', 'set', 'default' or 'keep'")?.as_str() {
+                "get" if get.is_none() => get = Some(self.run_script("get")?),
+                "set" if set.is_none() => set = Some(self.run_script("set")?),
+                word @ ("get" | "set") => {
+                    return Err(self.error_at(at, format!("a setting has one '{word}'")));
+                }
+                "keep" => {
+                    self.end_of_line()?;
+                    keep = true;
+                }
+                "default" if default.is_none() => {
+                    self.skip_inline_ws();
+                    default = Some(match self.peek() {
+                        Some('"' | '\'') => self.string()?,
+                        _ => self.word("the value undo sets without a record")?,
+                    });
+                    self.end_of_line()?;
+                }
+                other => {
+                    return Err(self.error_at(
+                        at,
+                        format!(
+                            "unexpected '{other}' in a setting, it has 'get', 'set' and maybe 'default' or 'keep'"
+                        ),
+                    ));
+                }
+            }
+        }
+        match (get, set) {
+            (Some(get), Some(set)) => Ok(SettingStep {
+                value,
+                get,
+                set,
+                default,
+                keep,
+            }),
+            (None, _) => Err(self.error_at(
+                start,
+                "a setting needs a `get` command that prints its value",
+            )),
+            (_, None) => Err(self.error_at(
+                start,
+                "a setting needs a `set` command that sets it to {{ value }}",
+            )),
+        }
     }
 
     /// `let name = "string" | $(command) | word`
@@ -564,7 +829,7 @@ impl<'s> Parser<'s> {
             }
             let start = self.pos;
             match self
-                .word("file content, 'from', 'mode', 'owner', 'encoding', 'sudo', 'new' or 'keep'")?
+                .word("file content, 'from', 'url', 'mode', 'owner', 'encoding', 'sudo', 'new' or 'keep'")?
                 .as_str()
             {
                 "mode" => {
@@ -614,6 +879,23 @@ impl<'s> Parser<'s> {
                 "sudo" => sudo = true,
                 "new" => new = true,
                 "keep" => keep = true,
+                "url" => {
+                    let url = self.string()?;
+                    self.skip_inline_ws();
+                    let at = self.pos;
+                    if self.word("'sha256'").ok().as_deref() != Some("sha256") {
+                        return Err(self.error_at(
+                            at,
+                            "a downloaded file needs its checksum: url \"...\" sha256 \"...\"",
+                        ));
+                    }
+                    let at = self.pos;
+                    let sha256 = self.string()?.to_ascii_lowercase();
+                    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Err(self.error_at(at, "sha256 is 64 hexadecimal digits"));
+                    }
+                    break FileSource::Url { url, sha256 };
+                }
                 "from" => {
                     let source = self.string()?;
                     let relative = !(source.contains("{{")
@@ -630,6 +912,12 @@ impl<'s> Parser<'s> {
                 }
             }
         };
+        if dir && let FileSource::Url { .. } = source {
+            return Err(self.error_at(
+                origin.after_path,
+                "a directory can't be downloaded, only a file",
+            ));
+        }
         if dir && let FileSource::Inline(_) = source {
             return Err(self.error_at(
                 origin.after_path,
@@ -643,7 +931,14 @@ impl<'s> Parser<'s> {
             ));
         }
         self.end_of_line()?;
-        let raw = encoding.is_none() && matches!(source, FileSource::Copy(_));
+        if matches!(source, FileSource::Url { .. }) && encoding.is_some() {
+            return Err(self.error_at(
+                origin.after_path,
+                "a downloaded file is written as it is, it has no encoding",
+            ));
+        }
+        let raw =
+            encoding.is_none() && matches!(source, FileSource::Copy(_) | FileSource::Url { .. });
         Ok(FileStep {
             path,
             dir,
@@ -1029,6 +1324,18 @@ impl<'s> Parser<'s> {
     }
 }
 
+/// Flags that can come before `task`, `subtask` or `template`.
+fn is_header_flag(word: &str) -> bool {
+    matches!(
+        word,
+        "sudo" | "terminal" | "keep" | "manual" | "interactive"
+    )
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '+')
+}
+
 fn is_keyword(word: &str) -> bool {
     matches!(
         word,
@@ -1052,6 +1359,8 @@ fn is_keyword(word: &str) -> bool {
             | "file"
             | "directory"
             | "line"
+            | "setting"
+            | "else"
     )
 }
 

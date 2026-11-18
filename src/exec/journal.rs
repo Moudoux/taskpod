@@ -229,3 +229,48 @@ pub fn write_lines(ctx: &Ctx, task: &str, path: &Path, root: bool, lines: &Lines
     )
     .with_context(|| format!("failed to record {shown}'s lines in the undo journal"))
 }
+
+/// A setting's entry: named by its `get` command (`setting:<command>`),
+/// which can't clash with a file's, whose paths are absolute. Kept with the
+/// user's files: it's the output of a command the user can run.
+fn setting_entry(ctx: &Ctx, get: &str) -> Result<PathBuf> {
+    entry(ctx, Path::new(&format!("setting:{get}")), false)
+}
+
+/// The value a setting had before taskpod first set it, if recorded.
+pub fn read_setting(ctx: &Ctx, task: &str, get: &str) -> Result<Option<String>> {
+    let file = setting_entry(ctx, get)?;
+    let bytes = match target::read(ctx, task, &file, false)? {
+        Current::Content(bytes) => bytes,
+        Current::Missing => return Ok(None),
+        Current::Unreadable => {
+            return Err(anyhow!("can't read the journal entry {}", file.display()));
+        }
+    };
+    let value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("the journal entry {} is damaged", file.display()))?;
+    value["value"]
+        .as_str()
+        .map(|v| Some(v.to_string()))
+        .ok_or_else(|| anyhow!("the journal entry {} has no value", file.display()))
+}
+
+/// Record a setting's value before taskpod sets it, unless it's recorded already.
+pub fn record_setting(ctx: &Ctx, task: &str, get: &str, value: &str) -> Result<()> {
+    let file = setting_entry(ctx, get)?;
+    if target::stat(ctx, &file).is_some() {
+        return Ok(());
+    }
+    let bytes = json!({ "setting": get, "value": value }).to_string();
+    target::write(ctx, task, &file, bytes.as_bytes(), 0o600, None, false)
+        .with_context(|| format!("failed to record `{get}` in the undo journal"))
+}
+
+/// Forget a setting, once it's undone.
+pub fn remove_setting(ctx: &Ctx, task: &str, get: &str) -> Result<()> {
+    let file = setting_entry(ctx, get)?;
+    if target::stat(ctx, &file).is_none() {
+        return Ok(());
+    }
+    target::remove(ctx, task, &file, false)
+}

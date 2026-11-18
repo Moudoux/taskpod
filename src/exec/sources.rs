@@ -159,6 +159,11 @@ impl<'a> Sources<'a> {
                 Step::Run(text) | Step::Undo(text) | Step::Notice(text) => {
                     found.scan(text, layers);
                 }
+                Step::Setting(setting) => {
+                    for text in [&setting.value, &setting.get, &setting.set] {
+                        found.scan(text, layers);
+                    }
+                }
                 Step::File(file) => {
                     for text in std::iter::once(&file.path).chain(&file.owner) {
                         found.scan(text, layers);
@@ -171,6 +176,12 @@ impl<'a> Sources<'a> {
                             found
                                 .nodes
                                 .push(Node::new(format!("{label} → {}", file.path)));
+                        }
+                        FileSource::Url { url, .. } => {
+                            found.scan(url, layers);
+                            found
+                                .nodes
+                                .push(Node::new(format!("{url} → {}", file.path)));
                         }
                         FileSource::Empty => {}
                     }
@@ -200,7 +211,12 @@ impl<'a> Sources<'a> {
                     );
                     found.nodes.extend(inner.into_node(label));
                 }
-                Step::Block(inner) => self.block(inner, layers, found),
+                Step::Block(inner) => {
+                    self.block(inner, layers, found);
+                    if let Some(other) = &inner.otherwise {
+                        self.block(other, layers, found);
+                    }
+                }
             }
         }
     }

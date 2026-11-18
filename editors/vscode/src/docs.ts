@@ -15,8 +15,9 @@ export interface KeywordDoc {
 export const KEYWORDS: Record<string, KeywordDoc> = {
   task: {
     places: ["top"],
-    summary: "Defines a task. Tasks run in parallel unless `needs` orders them.",
-    syntax: "task name {\n    desc \"What it does\"\n    run command\n}",
+    summary:
+      "Defines a task. Tasks run in parallel unless `needs` orders them. Flags (`sudo`, `terminal`, `keep`, `manual`, `interactive`) can go before `task`, and `needs` and `lock` after the name, or all of them in the body.",
+    syntax: 'task name {\n    desc "What it does"\n    run command\n}\n\nsudo interactive task update-aur needs yay lock pacman {\n    run yay -Sua\n}',
     snippet: "task ${1:name} {\n\t$0\n}",
   },
   subtask: {
@@ -29,8 +30,8 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   template: {
     places: ["top"],
     summary:
-      "Reusable steps, called by name inside tasks: `name words...`. Inside, `{{ args }}` is all the words and `{{ 1 }}`, `{{ 2 }}`... each one. A template's guards only apply to that call.",
-    syntax: "template pkg {\n    unless pacman -Q {{ args }}\n    run yay -S --needed {{ args }}\n}",
+      "Reusable steps, called by name inside tasks: `name words...`. Inside, `{{ args }}` is all the words and `{{ 1 }}`, `{{ 2 }}`... each one. Name the words after the template's name (`name=\"default\"` for optional ones, last), and calls with too few or too many are an error. A template's guards only apply to that call. Flags can go before `template`, and `needs` and `lock` after the parameters.",
+    syntax: 'template pkg {\n    unless pacman -Q {{ args }}\n    run yay -S --needed {{ args }}\n}\n\ntemplate greet who greeting="hello" {\n    run echo "{{ greeting }}, {{ who }}"\n}',
     snippet: "template ${1:name} {\n\t$0\n}",
   },
   let: {
@@ -84,7 +85,7 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   needs: {
     places: ["body"],
     summary:
-      "Tasks that must finish first. They run either way (unless a guard skips them), but if one fails, this task doesn't run.",
+      "Tasks that must finish first. They run either way (unless a guard skips them), but if one fails, this task doesn't run. In the body, or in the header: `task name needs base files {`.",
     syntax: "needs base files",
     snippet: "needs ${1:task}",
   },
@@ -112,41 +113,69 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   changed: {
     places: ["body"],
     summary:
-      "Only if an earlier step in this task changed something, like restarting a service after its config file. `changed {` guards a block; in a template, a `changed` line makes the call wait for a change before it in the calling task. In undo, its `undo` runs where it stands either way. A subtask does the same as its own task.",
-    syntax: 'file "/etc/app.conf" sudo from "files/app.conf"\nchanged {\n    run sudo systemctl restart app\n}',
+      "Only if an earlier step in this task changed something, like restarting a service after its config file. `changed {` guards a block, `changed run <command>` is a block with one command; in a template, a `changed` line makes the call wait for a change before it in the calling task. In undo, one with only `run` commands (no `undo` or `keep`) runs again once the files, lines and settings right before it are undone (back to the command or template call before them), if that changed something; one with an `undo` runs that where it stands. A subtask does the same as its own task.",
+    syntax: 'file "/etc/app.conf" sudo from "files/app.conf"\nchanged run sudo systemctl try-restart app',
     snippet: "changed {\n\t$0\n}",
+  },
+  else: {
+    places: [],
+    summary:
+      "After an `if` block: runs when its check fails. The check runs once, so the first block can't change which one runs. For `unless X { A } else { B }`, write `if X { B } else { A }`.",
+    syntax: 'if mountpoint -q /mnt/data {\n    directory "/mnt/data/app" keep\n} else {\n    notice "/mnt/data isn\'t mounted"\n}',
+  },
+  setting: {
+    places: ["body"],
+    summary:
+      "A value commands read and write. `get` prints it (compared trimmed); when it's not the value, `set` runs with it as `{{ value }}`, and then `get` must print it. Diffs show the old and new value, and `--undo` sets the value from before taskpod first set it, from the journal (`keep`: undo leaves it). `default \"x\"` is what undo sets when the journal has no record.",
+    syntax: 'setting "org.kde.dolphin.desktop" {\n    get xdg-mime query default inode/directory\n    set xdg-mime default {{ value }} inode/directory\n}',
+    snippet: 'setting "${1:value}" {\n\tget ${2:command}\n\tset ${3:command {{ value \\}\\}}}\n}',
+  },
+  default: {
+    places: [],
+    summary: "In a `setting`: what `--undo` sets when the journal has no record of the value before taskpod, like for one set before taskpod kept them.",
+    syntax: 'setting "us,se" {\n    default "us"\n    ...\n}',
+  },
+  get: {
+    places: [],
+    summary: "In a `setting`: the shell command that prints its current value.",
+    syntax: "get tailscale debug prefs | jq .ShieldsUp",
+  },
+  set: {
+    places: [],
+    summary: "In a `setting`: the shell command that sets it to `{{ value }}`.",
+    syntax: "set sudo tailscale set --shields-up={{ value }}",
   },
   lock: {
     places: ["body"],
     summary:
-      "Tasks holding the same lock never run at the same time, e.g. `lock pacman` for package installs. While waiting, a task doesn't take up a job slot.",
+      "Tasks holding the same lock never run at the same time, e.g. `lock pacman` for package installs. While waiting, a task doesn't take up a job slot. In the body, or in the header: `task name lock pacman {`.",
     syntax: "lock pacman",
     snippet: "lock ${1:name}",
   },
   sudo: {
-    places: ["body", "file", "line"],
+    places: ["top", "body", "file", "line"],
     summary:
-      "Ask for sudo once before running, so parallel tasks never prompt at the same time. Commands that call `sudo` do this automatically. Implies `terminal`. On a `file` or `line`, reads and writes the file as root.",
+      "Ask for sudo once before running, so parallel tasks never prompt at the same time. Commands that call `sudo` do this automatically. Implies `terminal`. On a `file` or `line`, reads and writes the file as root. Can also go before `task`, `subtask` or `template`.",
     syntax: "sudo",
     snippet: "sudo",
   },
   terminal: {
-    places: ["body"],
+    places: ["top", "body"],
     summary:
-      "A command that asks on the terminal anyway (a tool running `sudo -k`, doas, su, a security key touch, a question) gets the terminal when it asks: the live display pauses until it ends, and tasks that ask at once take turns. Without this (or `sudo`, or `interactive`), such a command is stopped and the step fails instead of waiting out of sight.",
+      "A command that asks on the terminal anyway (a tool running `sudo -k`, doas, su, a security key touch, a question) gets the terminal when it asks: the live display pauses until it ends, and tasks that ask at once take turns. Without this (or `sudo`, or `interactive`), such a command is stopped and the step fails instead of waiting out of sight. Can also go before `task`, `subtask` or `template`.",
     syntax: "terminal",
     snippet: "terminal",
   },
   manual: {
-    places: ["body"],
-    summary: "Only runs when selected with `--run`, or when another task needs it.",
+    places: ["top", "body"],
+    summary: "Only runs when selected with `--run`, or when another task needs it. Can also go before `task`, `subtask` or `template`.",
     syntax: "manual",
     snippet: "manual",
   },
   interactive: {
-    places: ["body"],
+    places: ["top", "body"],
     summary:
-      "The task gets the terminal: nothing else runs alongside it, the live display pauses, and its commands can ask questions.",
+      "The task gets the terminal: nothing else runs alongside it, the live display pauses, and its commands can ask questions. Can also go before `task`, `subtask` or `template`.",
     syntax: "interactive",
     snippet: "interactive",
   },
@@ -178,9 +207,9 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
     snippet: 'notice "${1:text}"',
   },
   keep: {
-    places: ["body", "file", "line"],
+    places: ["top", "body", "file", "line"],
     summary:
-      "`--undo` leaves what this task or block did in place, and doesn't count its commands as impossible to undo. On a `file`, undo leaves the file as it is; on a `line`, the line stays.",
+      "`--undo` leaves what this task or block did in place, and doesn't count its commands as impossible to undo. On a `file`, undo leaves the file as it is; on a `line`, the line stays. Can also go before `task`, `subtask` or `template`.",
     syntax: "keep",
     snippet: "keep",
   },
@@ -258,6 +287,18 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
     syntax: "encoding utf-16le",
     snippet: "encoding ${1|utf-8,utf-8-bom,utf-16le,utf-16be,latin1,ascii|}",
   },
+  url: {
+    places: ["file"],
+    summary:
+      "Download the content with curl, on the machine running taskpod, and check it against the `sha256` that must follow. When the file on the system already has that sha256, nothing is downloaded. `--pull` leaves it alone.",
+    syntax: 'file "/etc/apt/keyrings/docker.asc" sudo new url "https://download.docker.com/linux/debian/gpg" sha256 "..."',
+    snippet: 'url "${1:https://}" sha256 "${2}"',
+  },
+  sha256: {
+    places: [],
+    summary: "The sha256 of a downloaded file, 64 hexadecimal digits. A download with another one fails.",
+    syntax: 'url "https://example.com/key.asc" sha256 "..."',
+  },
   from: {
     places: ["file"],
     summary:
@@ -293,6 +334,8 @@ export const BUILTIN_VARS: Record<string, string> = {
   pwd: "The directory taskpod was started in.",
   dir: "The directory of the main task file.",
   args: "In a template: every word it was called with.",
+  tmp: "In a `run`, `undo` or `set` command: a new empty directory, deleted once the command ends.",
+  value: "In a `setting`'s `set` command: the value to set.",
 };
 
 export const ENCODINGS = ["utf-8", "utf-8-bom", "utf-16le", "utf-16be", "latin1", "ascii"];

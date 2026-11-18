@@ -102,7 +102,7 @@ test("tokenizes the example files without leaking state", async () => {
 test("continued template calls stay arguments", async () => {
   const tokenize = await tokenizer();
   const tokens = tokenize("task a {\n    pkg one \\\n        two\n    needs x \\\n        y\n}");
-  expect(scopeOf(tokens, "        two")).not.toContain("entity.name.function.call");
+  expect(scopeOf(tokens, "two")).not.toContain("entity.name.function.call");
   expect(scopeOf(tokens, "y")).toContain("entity.name.function");
 });
 
@@ -167,4 +167,54 @@ test("highlights notice as a keyword with a string", async () => {
 }`);
   expect(scopeOf(tokens, "notice")).toContain("keyword.other.directive");
   expect(scopeOf(tokens, "notice")).not.toContain("entity.name.function.call");
+});
+
+test("highlights else, settings, downloads, parameters and changed run", async () => {
+  const tokens = (await tokenizer())(`template github repo path="." {
+    run echo {{ repo }}
+}
+task t {
+    if test -e x {
+        run a
+    } else {
+        changed run restart
+    }
+    setting on {
+        get cat state
+        set echo {{ value }} > state
+    }
+    file "/etc/k" url "https://e/k" sha256 "00"
+}`);
+  expect(scopeOf(tokens, "repo")).toContain("variable.parameter");
+  expect(scopeOf(tokens, "path")).toContain("variable.parameter");
+  expect(scopeOf(tokens, "else")).toContain("keyword.control.conditional");
+  expect(scopeOf(tokens, "changed")).toContain("keyword.control.conditional");
+  expect(scopeOf(tokens, " restart")).toContain("meta.embedded.line.shell");
+  expect(scopeOf(tokens, "setting")).toContain("keyword.other.directive");
+  expect(scopeOf(tokens, "get")).toContain("keyword.control.run");
+  expect(scopeOf(tokens, "set")).toContain("keyword.control.run");
+  expect(scopeOf(tokens, "url")).toContain("keyword.other.taskpod");
+  expect(scopeOf(tokens, "sha256")).toContain("keyword.other.taskpod");
+  expect(tokens.some(([, s]) => s.includes("entity.name.function.call"))).toBe(false);
+});
+
+test("highlights flags, needs and locks in definition headers", async () => {
+  const tokens = (await tokenizer())(`sudo interactive task update-aur needs yay \\
+        base lock pacman {
+    run true
+}
+sudo template pkg names needs yay {
+}`);
+  expect(scopeOf(tokens, "sudo interactive ")).toContain("storage.modifier");
+  expect(scopeOf(tokens, "task")).toContain("storage.type.task");
+  expect(scopeOf(tokens, "update-aur")).toContain("entity.name.function");
+  expect(scopeOf(tokens, "needs")).toContain("keyword.other.needs");
+  expect(scopeOf(tokens, "yay")).toContain("entity.name.function");
+  expect(scopeOf(tokens, "base")).toContain("entity.name.function");
+  expect(scopeOf(tokens, "lock")).toContain("keyword.other.lock");
+  expect(scopeOf(tokens, "pacman")).toContain("variable.other.constant.lock");
+  expect(scopeOf(tokens, "names")).toContain("variable.parameter");
+  expect(scopeOf(tokens, " true")).toContain("meta.embedded.line.shell");
+  const last = tokens.filter(([t]) => t === "}").pop()!;
+  expect(last[1]).not.toContain("meta.");
 });

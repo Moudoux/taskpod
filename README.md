@@ -7,8 +7,7 @@ does what's missing, and `--diff` shows what that would be, or tells you the
 system already matches.
 
 ```sh
-template pkg {
-    lock pacman                 # one package install at a time
+sudo template pkg lock pacman {   # one package install at a time
     unless pacman -Q {{ args }}
     run yay -S --needed --noconfirm {{ args }}
 }
@@ -133,6 +132,14 @@ parent, and inside a task the steps run last first.
   down` before deleting `compose.yml`). A block with commands and no `undo` is
   reported as not undoable, unless it says `keep`: leave it as it is (a system
   update, data directories). `keep` on a file step leaves the file.
+- **Reactions**: a `changed` block (or `changed run <command>`) with only
+  commands, like a restart after its config file changed, runs again once the
+  files, lines and settings right before it are undone (back to the command or
+  template call before them, like the package install), if that changed
+  something: the service picks up its old config before its package goes. One
+  with an `undo` runs that instead, where it stands.
+- **Settings**: a `setting` records what its `get` printed before taskpod first
+  ran its `set`, and undo sets that again.
 - **Directories**: a `directory` without `from` that taskpod made is deleted
   once it's empty (otherwise reported and left), and one that was there gets
   its mode and owner back; `keep` leaves it.

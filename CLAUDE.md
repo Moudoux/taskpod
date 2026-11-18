@@ -10,6 +10,8 @@ idempotent. Its main use is setting up an Arch system from
 ## Layout
 
 - `src/parser.rs`: line-based parser (statements end at the line end, `\` continues).
+  Definitions take flags before `task`/`template` and `needs`/`lock` after the name
+  (`Parser::definition`); the same directives in the body still work and add up.
   `run` lines and `run { }` blocks are raw shell; brace matching in blocks skips quotes and comments.
 - `src/ast.rs`: the parsed file, `link()` checks references and hoists template `needs` into tasks.
   File encodings live here too.
@@ -18,10 +20,14 @@ idempotent. Its main use is setting up an Arch system from
   hides the values from everything printed (lines, spinners, diffs, errors).
 - `src/exec/mod.rs`: task selection, the parallel scheduler (job slots, named locks,
   an RwLock so `interactive` tasks run alone), summaries. Modes: run, dry run (`-d`), diff (`-D`).
-- `src/exec/step.rs`: running steps: shell, files (content/mode/owner, diffs), template calls and inline blocks.
+- `src/exec/step.rs`: running steps: shell, files (content/mode/owner, diffs; `url` downloads with curl,
+  checked by sha256), settings, template calls (named parameters: `Template::arg_vars`) and inline
+  blocks (`else`: `Block::otherwise`). `{{ tmp }}` is `TaskRun::with_tmp`. In an undo, `changed`
+  reactions (`Block::is_reaction`) run again after the file/line/setting steps before them.
   With `--pull` (`Options::pull`, combined with the Run/DryRun/Diff mode) file steps are compared the
   other way and queue edits on `Runner::edits`, which `main` applies at the end.
-- `src/exec/journal.rs`: `--undo`'s record of each file before taskpod first wrote it, on the target
+- `src/exec/journal.rs`: `--undo`'s record of each file before taskpod first wrote it (and each `setting`'s
+  value, keyed by its `get` command), on the target
   machine (`~/.local/state/taskpod`, root files in `/var/lib/taskpod`); `Ctx::journal` overrides the
   place, and test builds always use the task file's directory. Undo itself (`undo_task`, `undo_block`,
   `undo_file`) is in `src/exec/step.rs`; `Runner::run` reverses dependencies when `Options::undo`.

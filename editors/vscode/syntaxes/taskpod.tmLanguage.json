@@ -57,21 +57,74 @@
       }
     },
     "definition": {
-      "match": "^\\s*(task|subtask|template)\\s+([\\p{L}\\p{N}_.+-]+)(?:\\s+(of)\\s+([\\p{L}\\p{N}_.+-]+))?",
-      "captures": {
+      "begin": "^\\s*((?:(?:sudo|terminal|keep|manual|interactive)\\s+)*)(task|subtask|template)\\s+([\\p{L}\\p{N}_.+-]+)(?:\\s+(of)\\s+([\\p{L}\\p{N}_.+-]+))?",
+      "beginCaptures": {
         "1": {
-          "name": "storage.type.$1.taskpod"
+          "name": "storage.modifier.taskpod"
         },
         "2": {
-          "name": "entity.name.function.taskpod"
+          "name": "storage.type.$2.taskpod"
         },
         "3": {
-          "name": "keyword.other.of.taskpod"
+          "name": "entity.name.function.taskpod"
         },
         "4": {
+          "name": "keyword.other.of.taskpod"
+        },
+        "5": {
           "name": "entity.name.function.taskpod"
         }
-      }
+      },
+      "end": "(?=\\{)|(?<![\\\\\\n])$",
+      "patterns": [
+        {
+          "include": "#comment"
+        },
+        {
+          "begin": "\\b(needs)\\b",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.other.needs.taskpod"
+            }
+          },
+          "end": "(?=\\{|\\block\\b)|(?<![\\\\\\n])$",
+          "patterns": [
+            {
+              "match": "[\\p{L}\\p{N}_.+-]+",
+              "name": "entity.name.function.taskpod"
+            }
+          ]
+        },
+        {
+          "begin": "\\b(lock)\\b",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.other.lock.taskpod"
+            }
+          },
+          "end": "(?=\\{|\\bneeds\\b)|(?<![\\\\\\n])$",
+          "patterns": [
+            {
+              "match": "[\\p{L}\\p{N}_.+-]+",
+              "name": "variable.other.constant.lock.taskpod"
+            }
+          ]
+        },
+        {
+          "include": "#strings"
+        },
+        {
+          "match": "([\\p{L}\\p{N}_.+-]+)(=)?",
+          "captures": {
+            "1": {
+              "name": "variable.parameter.taskpod"
+            },
+            "2": {
+              "name": "keyword.operator.assignment.taskpod"
+            }
+          }
+        }
+      ]
     },
     "let": {
       "begin": "^\\s*(let)\\s+([\\p{L}\\p{N}_.+-]+)\\s*(=)\\s*(?:(choose|input|confirm)\\b)?",
@@ -156,12 +209,15 @@
       ]
     },
     "run-block": {
-      "begin": "^(\\s*)(run|undo)\\s*(\\{)\\s*(?=(#.*)?$)",
+      "begin": "^(\\s*)(?:(changed)\\s+)?(run|undo|get|set)\\s*(\\{)\\s*(?=(#.*)?$)",
       "beginCaptures": {
         "2": {
-          "name": "keyword.control.run.taskpod"
+          "name": "keyword.control.conditional.taskpod"
         },
         "3": {
+          "name": "keyword.control.run.taskpod"
+        },
+        "4": {
           "name": "punctuation.section.block.begin.taskpod"
         }
       },
@@ -182,13 +238,16 @@
       ]
     },
     "run-line": {
-      "begin": "^\\s*(run|undo)\\b",
+      "begin": "^\\s*(?:(changed)\\s+)?(run|undo|get|set)\\b",
       "beginCaptures": {
         "1": {
+          "name": "keyword.control.conditional.taskpod"
+        },
+        "2": {
           "name": "keyword.control.run.taskpod"
         }
       },
-      "end": "(?<!\\\\)$",
+      "end": "(?<![\\\\\\n])$",
       "contentName": "meta.embedded.line.shell",
       "patterns": [
         {
@@ -208,7 +267,7 @@
               "name": "keyword.control.conditional.taskpod"
             }
           },
-          "end": "\\s*(\\{)\\s*$|(?<!\\\\)$",
+          "end": "\\s*(\\{)\\s*$|(?<![\\\\\\n])$",
           "endCaptures": {
             "1": {
               "name": "punctuation.section.block.begin.taskpod"
@@ -231,6 +290,20 @@
               "name": "keyword.control.conditional.taskpod"
             }
           }
+        },
+        {
+          "match": "^\\s*(\\})\\s*(else)\\s*(\\{)",
+          "captures": {
+            "1": {
+              "name": "punctuation.section.block.end.taskpod"
+            },
+            "2": {
+              "name": "keyword.control.conditional.taskpod"
+            },
+            "3": {
+              "name": "punctuation.section.block.begin.taskpod"
+            }
+          }
         }
       ]
     },
@@ -241,7 +314,7 @@
           "name": "keyword.other.needs.taskpod"
         }
       },
-      "end": "(?<!\\\\)$",
+      "end": "(?<![\\\\\\n])$",
       "patterns": [
         {
           "include": "#comment"
@@ -316,7 +389,7 @@
           }
         },
         {
-          "match": "\\b(sudo|from|new|keep|before|after|base|match)\\b",
+          "match": "\\b(sudo|from|url|sha256|new|keep|before|after|base|match)\\b",
           "name": "keyword.other.taskpod"
         },
         {
@@ -325,7 +398,7 @@
       ]
     },
     "directive": {
-      "match": "^\\s*(desc|sudo|terminal|manual|interactive|workdir|keep|notice)\\b",
+      "match": "^\\s*(desc|sudo|terminal|manual|interactive|workdir|keep|notice|setting)\\b",
       "captures": {
         "1": {
           "name": "keyword.other.directive.taskpod"
@@ -333,13 +406,13 @@
       }
     },
     "call": {
-      "begin": "^\\s+(?!(?:desc|needs|lock|if|unless|ask|changed|sudo|terminal|manual|interactive|workdir|keep|notice|let|run|undo|file|directory|line)\\b)([\\p{L}\\p{N}_.+-]+)(?=\\s|$)",
+      "begin": "^\\s+(?!(?:desc|needs|lock|if|unless|ask|changed|sudo|terminal|manual|interactive|workdir|keep|notice|let|run|undo|file|directory|line|setting|get|set|else)\\b)([\\p{L}\\p{N}_.+-]+)(?=\\s|$)",
       "beginCaptures": {
         "1": {
           "name": "entity.name.function.call.taskpod"
         }
       },
-      "end": "(?<!\\\\)$",
+      "end": "(?<![\\\\\\n])$",
       "patterns": [
         {
           "include": "#comment"

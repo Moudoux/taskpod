@@ -22,6 +22,8 @@ export interface TaskDef extends Span {
 
 export interface TemplateDef extends Span {
   name: string;
+  /** Named parameters, `template name a b="default" {`. */
+  params: string[];
   needs: string[];
   endLine: number;
 }
@@ -65,7 +67,13 @@ export interface Index {
 }
 
 const NAME = "[\\p{L}\\p{N}_.+-]+";
-const DEFINITION = new RegExp(`^(\\s*)(task|subtask|template)\\s+(${NAME})(?:\\s+of\\s+(${NAME}))?\\s*\\{?`, "u");
+// Flags may come before the keyword: `sudo interactive task name ... {`.
+const DEFINITION = new RegExp(
+  `^(\\s*)((?:(?:sudo|terminal|keep|manual|interactive)\\s+)*)(task|subtask|template)\\s+(${NAME})(?:\\s+of\\s+(${NAME}))?`,
+  "u",
+);
+/** A word of a definition's header, a quoted default included. */
+const HEADER_WORD = /(?:[^\s\\{"']|"[^"]*"|'[^']*')+/g;
 const LET = new RegExp(`^(\\s*)let\\s+(${NAME})\\s*=\\s*(.*)$`, "u");
 const WORD = new RegExp(NAME, "gu");
 const INTERPOLATION = /(?<!\\)\{\{\s*([\p{L}\p{N}_.\-/]+)\s*\}\}/gu;
@@ -178,6 +186,8 @@ export function parse(text: string): Index {
     }
     if ((line.match(/"""/g)?.length ?? 0) % 2 === 1) inTriple = true;
 
+    // `} else {` closes a block and opens the next one.
+    if (/^\}\s*else\s*\{$/.test(trimmed)) return;
     if (trimmed === "}" || trimmed.startsWith("} ")) {
       const frame = stack.pop();
       if (frame?.task) frame.task.endLine = number;
@@ -187,22 +197,24 @@ export function parse(text: string): Index {
 
     const definition = !stack.length && line.match(DEFINITION);
     if (definition) {
-      const [, indent, kind, name, parent] = definition;
-      const start = line.indexOf(name, indent.length + kind.length);
+      const [whole, indent, flags, kind, name, parent] = definition;
+      const start = line.indexOf(name, indent.length + flags.length + kind.length);
       const span = { line: number, start, end: start + name.length };
+      let template: TemplateDef | undefined;
+      let task: TaskDef | undefined;
       if (kind === "template") {
-        const template: TemplateDef = { ...span, name, needs: [], endLine: number };
+        template = { ...span, name, params: [], needs: [], endLine: number };
         index.templates.push(template);
         stack.push({ kind: "template", owner: name, ownerKind: "template", template });
       } else {
-        const task: TaskDef = {
+        task = {
           ...span,
           name,
           kind: kind as "task" | "subtask",
           parent,
           needs: [],
-          manual: false,
-          interactive: false,
+          manual: /\bmanual\b/.test(flags),
+          interactive: /\binteractive\b/.test(flags),
           endLine: number,
         };
         index.tasks.push(task);
@@ -211,6 +223,36 @@ export function parse(text: string): Index {
           index.refs.push({ name: parent, kind: "task", line: number, start: parentStart, end: parentStart + parent.length });
         }
         stack.push({ kind: "task", owner: name, ownerKind: "task", task });
+      }
+      // The header after the name: a template's parameters, then `needs` and
+      // `lock` clauses, up to the `{`, over `\` continued lines too.
+      let mode: "params" | "needs" | "lock" = "params";
+      let at = number;
+      let from = whole.length;
+      for (;;) {
+        const text = stripComment(lines[at] ?? "");
+        const brace = text.indexOf("{", from);
+        const segment = text.slice(from, brace < 0 ? text.length : brace);
+        for (const m of segment.matchAll(HEADER_WORD)) {
+          const word = m[0];
+          const wordStart = from + m.index!;
+          if (word === "needs" || word === "lock") {
+            mode = word;
+          } else if (mode === "needs") {
+            index.refs.push({ name: word, kind: "task", line: at, start: wordStart, end: wordStart + word.length });
+            task?.needs.push(word);
+            template?.needs.push(word);
+          } else if (mode === "params" && template) {
+            const param = word.match(new RegExp(`^(${NAME})(?:=(.*))?$`, "u"));
+            if (!param) continue;
+            template.params.push(param[1]);
+            const value = param[2]?.replace(/^["']|["']$/g, "");
+            index.vars.push({ name: param[1], value: value ?? "(parameter)", line: at, start: wordStart, end: wordStart + param[1].length, owner: name });
+          }
+        }
+        if (brace >= 0 || !text.trim().endsWith("\\")) break;
+        at++;
+        from = 0;
       }
       return;
     }
@@ -256,12 +298,24 @@ export function parse(text: string): Index {
       }
       case "run":
       case "undo":
+      case "get":
+      case "set":
         if (/^\s*\{\s*$/.test(rest)) shellDepth = 1;
+        return;
+      case "setting":
+        if (stack.length && /\{\s*$/.test(rest)) stack.push({ kind: "block", owner: frame?.owner, ownerKind: frame?.ownerKind });
+        return;
+      case "changed":
+        // `changed run <command>`, or `changed run {` with a shell block.
+        if (/^\s+run\b/.test(rest)) {
+          if (/^\s+run\s*\{\s*$/.test(rest)) shellDepth = 1;
+          return;
+        }
+        if (stack.length && /\{\s*$/.test(rest)) stack.push({ kind: "block", owner: frame?.owner, ownerKind: frame?.ownerKind });
         return;
       case "if":
       case "unless":
       case "ask":
-      case "changed":
         if (stack.length && /\{\s*$/.test(rest)) stack.push({ kind: "block", owner: frame?.owner, ownerKind: frame?.ownerKind });
         return;
       case "file":

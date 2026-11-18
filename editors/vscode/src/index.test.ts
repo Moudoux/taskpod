@@ -166,3 +166,79 @@ test("terminal isn't a template call", () => {
   const index = parse(`task t {\n    terminal\n    if true {\n        terminal\n        run x\n    }\n}\n`);
   expect(index.refs.filter((r) => r.kind === "template")).toEqual([]);
 });
+
+test("else, settings and changed run keep blocks and shell apart", () => {
+  const index = parse(`task t {
+    if test -e x {
+        run a
+    } else {
+        notice "no x"
+    }
+    setting on {
+        get cat state
+        set {
+            pkg-like-word {{ value }}
+        }
+    }
+    file "x" "y"
+    changed run {
+        restart-like-word
+    }
+    changed run echo done
+}
+task after {
+}
+`);
+  expect(index.refs.filter((r) => r.kind === "template")).toEqual([]);
+  expect(index.tasks.map((t) => [t.name, t.endLine])).toEqual([
+    ["t", 17],
+    ["after", 19],
+  ]);
+  expect(index.lines[9].context).toBe("shell");
+  expect(index.lines[14].context).toBe("shell");
+  expect(index.lines[16].context).toBe("body");
+});
+
+test("template parameters are the template's variables", () => {
+  const index = parse(`template github repo version commit path="." {
+    run cd {{ path }} && echo {{ repo }}
+}
+`);
+  expect(index.templates[0].params).toEqual(["repo", "version", "commit", "path"]);
+  expect(index.vars.map((v) => [v.name, v.value, v.owner])).toEqual([
+    ["repo", "(parameter)", "github"],
+    ["version", "(parameter)", "github"],
+    ["commit", "(parameter)", "github"],
+    ["path", ".", "github"],
+  ]);
+  expect(resolveVar(index, "repo", 1)?.owner).toBe("github");
+});
+
+test("definition headers hold flags, needs and locks", () => {
+  const index = parse(`sudo template github repo path="." needs yay lock pacman {
+    run echo {{ repo }}
+}
+manual interactive task signing-key needs git \\
+        dev lock key {
+    needs extra
+    run true
+}
+task old {
+    needs git
+    manual
+}
+`);
+  const [github] = index.templates;
+  expect(github.params).toEqual(["repo", "path"]);
+  expect(github.needs).toEqual(["yay"]);
+  const key = index.tasks.find((t) => t.name === "signing-key")!;
+  expect([key.manual, key.interactive]).toEqual([true, true]);
+  expect(key.needs).toEqual(["git", "dev", "extra"]);
+  expect(key.endLine).toBe(7);
+  const old = index.tasks.find((t) => t.name === "old")!;
+  expect([old.manual, old.needs]).toEqual([true, ["git"]]);
+  const refs = index.refs.filter((r) => r.kind === "task").map((r) => `${r.name}@${r.line}`);
+  expect(refs).toEqual(["yay@0", "git@3", "dev@4", "extra@5", "git@9"]);
+  expect(index.refs.filter((r) => r.kind === "template")).toEqual([]);
+  expect(index.vars.map((v) => v.name)).toEqual(["repo", "path"]);
+});

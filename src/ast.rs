@@ -61,10 +61,83 @@ pub struct Task {
 #[derive(Debug)]
 pub struct Template {
     pub name: String,
+    /// Named parameters, `template name a b c="default" {`. Without any,
+    /// calls take any arguments, as `{{ args }}` and `{{ 1 }}`, `{{ 2 }}`, ...
+    pub params: Vec<Param>,
     pub needs: Vec<String>,
     pub vars: Vars,
     pub body: Block,
     pub origin: String,
+}
+
+/// A template parameter: `name`, or `name="default"` for an optional one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Param {
+    pub name: String,
+    pub default: Option<String>,
+}
+
+impl Template {
+    /// Check the number of words a call gives, if the template names its
+    /// parameters. Optional ones come last.
+    pub fn check_arity(&self, words: usize) -> std::result::Result<(), String> {
+        if self.params.is_empty() {
+            return Ok(());
+        }
+        let required = self.params.iter().filter(|p| p.default.is_none()).count();
+        let names: Vec<String> = self
+            .params
+            .iter()
+            .map(|p| match &p.default {
+                Some(_) => format!("[{}]", p.name),
+                None => p.name.clone(),
+            })
+            .collect();
+        let usage = format!("{} {}", self.name, names.join(" "));
+        if words < required {
+            return Err(format!(
+                "template '{}' needs {}: {usage}",
+                self.name,
+                plural(required, "argument")
+            ));
+        }
+        if words > self.params.len() {
+            return Err(format!(
+                "template '{}' takes at most {}: {usage}",
+                self.name,
+                plural(self.params.len(), "argument")
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Template {
+    /// Variables for one call: `{{ args }}`, `{{ 1 }}`, `{{ 2 }}`, ... and
+    /// each named parameter, with its default when the call leaves it out.
+    pub fn arg_vars(&self, args: &str) -> Vars {
+        let mut vars = Vars::for_args(args);
+        let words: Vec<&str> = args.split_whitespace().collect();
+        for (i, param) in self.params.iter().enumerate() {
+            match (words.get(i), &param.default) {
+                (Some(word), _) => vars.literal(param.name.clone(), *word),
+                (None, Some(default)) => vars.set(
+                    param.name.clone(),
+                    crate::vars::Var::Template(default.clone()),
+                ),
+                (None, None) => {}
+            }
+        }
+        vars
+    }
+}
+
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -79,9 +152,31 @@ pub struct Block {
     /// `keep`: `--undo` leaves what this block did in place.
     pub keep: bool,
     pub steps: Vec<Step>,
+    /// `} else {` after an `if` block: run instead when its guard fails.
+    pub otherwise: Option<Box<Block>>,
 }
 
 impl Block {
+    /// A `changed` block that only runs commands, with no `undo` and no
+    /// `keep`, like a restart after a config file changed. `--undo` runs it
+    /// again once the steps before it are undone, if that changed something.
+    pub fn is_reaction(&self) -> bool {
+        self.guards.iter().any(|g| matches!(g, Guard::Changed))
+            && !self.keep
+            && !self.steps.is_empty()
+            && self.steps.iter().all(|s| matches!(s, Step::Run(_)))
+    }
+
+    /// The inline blocks directly in this one, `else` blocks included.
+    pub fn inner_blocks(&self) -> impl Iterator<Item = &Block> {
+        self.steps.iter().flat_map(|step| match step {
+            Step::Block(inner) => std::iter::once(inner)
+                .chain(inner.otherwise.as_deref())
+                .collect(),
+            _ => Vec::new(),
+        })
+    }
+
     /// Whether `--undo` knows what to do about this block's commands: it has
     /// an `undo`, or says `keep`.
     pub fn undo_covers_commands(&self) -> bool {
@@ -108,6 +203,23 @@ pub enum Step {
     /// `notice "text"`: a message for me, shown under the task and again
     /// at the end of the run. Changes nothing.
     Notice(String),
+    /// `setting "value" { get ...; set ... }`: a value read and written by commands.
+    Setting(Box<SettingStep>),
+}
+
+/// `setting "value" { get <command> set <command> }`: `get` prints the
+/// current value, `set` changes it to `{{ value }}`. The journal keeps the
+/// value from before taskpod first set it, so `--undo` sets that again.
+#[derive(Debug, Clone)]
+pub struct SettingStep {
+    pub value: String,
+    pub get: String,
+    pub set: String,
+    /// `default "value"`: what `--undo` sets when the journal has no record,
+    /// like a setting made before taskpod kept one.
+    pub default: Option<String>,
+    /// `--undo` leaves it as it is.
+    pub keep: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -319,6 +431,11 @@ pub enum FileSource {
     Inline(String),
     /// Copy of a file. Relative paths are relative to the file that uses them.
     Copy(String),
+    /// `url "https://..." sha256 "..."`: downloaded, and checked against the hash.
+    Url {
+        url: String,
+        sha256: String,
+    },
     /// A `directory` with no `from`: only the directory itself.
     Empty,
 }
@@ -353,6 +470,7 @@ impl Step {
             Step::Run(script) => script.clone(),
             Step::Undo(script) => format!("undo {script}"),
             Step::Notice(text) => format!("notice {text}"),
+            Step::Setting(setting) => format!("setting {}", setting.get),
             Step::File(file) if file.dir => format!("directory {}", file.path),
             Step::File(file) => format!("file {}", file.path),
             Step::Line(line) => format!("line {}", line.path),
@@ -423,14 +541,20 @@ impl TaskFile {
         stack: &mut Vec<&'a str>,
         origin: &str,
     ) -> Result<()> {
+        for inner in block.inner_blocks() {
+            self.check_calls(inner, stack, origin)?;
+        }
         for step in &block.steps {
-            if let Step::Block(inner) = step {
-                self.check_calls(inner, stack, origin)?;
-            }
-            if let Step::Call { template, .. } = step {
+            if let Step::Call { template, args } = step {
                 let Some(called) = self.templates.get(template) else {
                     bail!("{origin}: unknown directive or template '{template}'");
                 };
+                // Arguments with variables are checked once they're worked out.
+                if !args.contains("{{")
+                    && let Err(e) = called.check_arity(args.split_whitespace().count())
+                {
+                    bail!("{origin}: `{}`: {e}", format!("{template} {args}").trim());
+                }
                 if stack.contains(&template.as_str()) {
                     bail!("{origin}: template '{template}' calls itself");
                 }
@@ -443,10 +567,10 @@ impl TaskFile {
     }
 
     fn template_needs<'a>(&'a self, block: &'a Block, needs: &mut BTreeSet<&'a str>) {
+        for inner in block.inner_blocks() {
+            self.template_needs(inner, needs);
+        }
         for step in &block.steps {
-            if let Step::Block(inner) = step {
-                self.template_needs(inner, needs);
-            }
             if let Step::Call { template, .. } = step {
                 let template = &self.templates[template];
                 needs.extend(template.needs.iter().map(String::as_str));
@@ -472,9 +596,7 @@ impl TaskFile {
 
 fn collect_locks(block: &Block, names: &mut BTreeSet<String>) {
     names.extend(block.locks.iter().cloned());
-    for step in &block.steps {
-        if let Step::Block(inner) = step {
-            collect_locks(inner, names);
-        }
+    for inner in block.inner_blocks() {
+        collect_locks(inner, names);
     }
 }

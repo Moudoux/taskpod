@@ -1895,3 +1895,426 @@ fn steps_that_want_the_terminal_fail_fast() {
     assert_eq!(outcomes["fine"], Outcome::Ran);
     assert_eq!(read(dir.path(), "fine").trim(), "ok");
 }
+
+#[cfg(unix)]
+#[test]
+fn changed_reactions_run_again_after_an_undo() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = r#"
+        template restart {
+            changed
+            run test -e {{ 1 }}.conf && echo "{{ 1 }} with it" >> {{ 1 }}.log || echo "{{ 1 }} without it" >> {{ 1 }}.log
+        }
+        task inline {
+            file "a.conf" new "v1\n"
+            changed run test -e a.conf && echo with >> a.log || echo without >> a.log
+        }
+        task call {
+            file "b.conf" new "v1\n"
+            restart b
+        }
+        task kept {
+            file "c.conf" new "v1\n"
+            changed {
+                keep
+                run echo once >> c.log
+            }
+        }
+    task ordered {
+            undo echo removed >> d.log
+            file "d.conf" new "v1\n"
+            changed run echo restart >> d.log
+            file "e.conf" new "v1\n"
+            changed run echo again >> d.log
+        }
+    "#;
+    let outcomes = run(source, dir.path(), &options(1), &[]);
+    assert!(
+        outcomes.values().all(|o| *o == Outcome::Ran),
+        "{outcomes:?}"
+    );
+    assert_eq!(read(dir.path(), "a.log"), "with\n");
+    assert_eq!(read(dir.path(), "b.log"), "b with it\n");
+
+    // It runs again after the file goes, and says so.
+    let (outcome, report) = undo_report(source, dir.path(), "inline");
+    assert_eq!(outcome, Outcome::Ran);
+    let labels: Vec<&str> = report.steps.iter().map(|s| s.label.as_str()).collect();
+    assert!(
+        labels[0].ends_with("delete it, taskpod created it"),
+        "{labels:?}"
+    );
+    assert_eq!(labels[1], "changed · again, after the undo");
+    assert_eq!(read(dir.path(), "a.log"), "with\nwithout\n");
+    assert_eq!(read(dir.path(), "b.log"), "b with it\nb without it\n");
+    // `keep`: it ran after the change, but not again in the undo.
+    assert_eq!(read(dir.path(), "c.log"), "once\n");
+    assert!(!dir.path().join("a.conf").exists());
+    // Each one right after the files before it, back to the command before
+    // them: so before what installed the service is undone.
+    assert_eq!(
+        read(dir.path(), "d.log"),
+        "restart\nagain\nagain\nrestart\nremoved\n"
+    );
+
+    // Nothing left to undo: nothing runs again.
+    let outcomes = undo(source, dir.path(), Mode::Run, &["inline"]);
+    assert_eq!(outcomes["inline"], Outcome::UpToDate);
+    assert_eq!(read(dir.path(), "a.log"), "with\nwithout\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn else_runs_when_the_if_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = r#"
+        task pick {
+            if test -e flag {
+                run echo yes > out
+                undo echo undo yes >> log
+            } else {
+                run echo no > out
+                undo echo undo no >> log
+            }
+        }
+    "#;
+    run(source, dir.path(), &options(1), &[]);
+    assert_eq!(read(dir.path(), "out"), "no\n");
+    undo(source, dir.path(), Mode::Run, &[]);
+    assert_eq!(read(dir.path(), "log"), "undo no\n");
+    std::fs::write(dir.path().join("flag"), "").unwrap();
+    run(source, dir.path(), &options(1), &[]);
+    assert_eq!(read(dir.path(), "out"), "yes\n");
+    undo(source, dir.path(), Mode::Run, &[]);
+    assert_eq!(read(dir.path(), "log"), "undo no\nundo yes\n");
+}
+
+#[test]
+fn else_only_follows_if() {
+    let parse = |source: &str| parse_str(source, Path::new("/tmp")).map(|_| ());
+    let err =
+        parse("task a {\n unless true {\n run true\n } else {\n run true\n }\n}\n").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("as `if X { B } else { A }`"),
+        "{err:#}"
+    );
+    let err = parse(
+        "task a {\n if true {\n run true\n } else {\n run true\n } else {\n run true\n }\n}\n",
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("has no `else`"), "{err:#}");
+    assert!(parse("task a {\n if true {\n run true\n }else{\n run true\n }\n}\n").is_ok());
+    // A word starting with `else` isn't one.
+    let err = parse("task a {\n if true {\n run true\n } elsewhere\n}\n").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("expected the end of the line"),
+        "{err:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn settings_are_set_and_put_back() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("state"), "off\n").unwrap();
+    let source = r#"
+        task switch {
+            setting "on" {
+                get cat state
+                set echo "{{ value }}" > state
+            }
+        }
+        task broken {
+            manual
+            setting "on" {
+                get echo off
+                set true
+            }
+        }
+    "#;
+    let mut opts = options(1);
+    opts.mode = Mode::Diff;
+    let file = parse_str(source, dir.path()).unwrap();
+    let runner = Runner::new(&file, &opts);
+    runner.run(&["switch".to_string()]);
+    let label = runner.reports.lock().unwrap()["switch"].steps[0]
+        .label
+        .clone();
+    assert_eq!(label, "setting cat state · off → on");
+    assert_eq!(read(dir.path(), "state"), "off\n");
+
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["switch"],
+        Outcome::Ran
+    );
+    assert_eq!(read(dir.path(), "state"), "on\n");
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["switch"],
+        Outcome::UpToDate
+    );
+
+    // Undo sets what was there before taskpod, and forgets it.
+    assert_eq!(
+        undo(source, dir.path(), Mode::Run, &["switch"])["switch"],
+        Outcome::Ran
+    );
+    assert_eq!(read(dir.path(), "state"), "off\n");
+    assert_eq!(
+        undo(source, dir.path(), Mode::Run, &["switch"])["switch"],
+        Outcome::UpToDate
+    );
+
+    // No record, and set by hand: undo can't know what it was.
+    std::fs::write(dir.path().join("state"), "on\n").unwrap();
+    let (outcome, report) = undo_report(source, dir.path(), "switch");
+    assert_eq!(outcome, Outcome::UpToDate);
+    assert_eq!(report.cannot, 1);
+    // Unless it has a default.
+    let with_default = source.replace("get cat state", "get cat state\n default \"idle\"");
+    let (outcome, _) = undo_report(&with_default, dir.path(), "switch");
+    assert_eq!(outcome, Outcome::Ran);
+    assert_eq!(read(dir.path(), "state"), "idle\n");
+
+    // `set` must make `get` print the value.
+    let outcome = &run(source, dir.path(), &options(1), &["broken"])["broken"];
+    assert!(
+        matches!(outcome, Outcome::Failed(e) if e.contains("prints off instead of on")),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn settings_parse() {
+    let parse = |source: &str| parse_str(source, Path::new("/tmp")).map(|_| ());
+    assert!(
+        parse("task a {\n setting on {\n get echo\n set {\n  echo {{ value }}\n }\n keep\n }\n}\n")
+            .is_ok()
+    );
+    let err = parse("task a {\n setting on {\n get echo\n }\n}\n").unwrap_err();
+    assert!(format!("{err:#}").contains("needs a `set`"), "{err:#}");
+    let err =
+        parse("task a {\n setting on {\n get echo\n get echo\n set true\n }\n}\n").unwrap_err();
+    assert!(format!("{err:#}").contains("one 'get'"), "{err:#}");
+}
+
+#[cfg(unix)]
+#[test]
+fn downloads_are_checked_and_only_fetched_when_needed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |n: &str| dir.path().join(n);
+    std::fs::write(path("served"), "hello\n").unwrap();
+    let url = format!("file://{}", path("served").display());
+    let sha = "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03";
+    let source = format!(
+        r#"
+        task fetch {{
+            file "got" url "{url}" sha256 "{sha}"
+        }}
+        task wrong {{
+            manual
+            file "other" url "{url}" sha256 "{}"
+        }}
+    "#,
+        "0".repeat(64)
+    );
+    assert_eq!(
+        run(&source, dir.path(), &options(1), &[])["fetch"],
+        Outcome::Ran
+    );
+    assert_eq!(read(dir.path(), "got"), "hello\n");
+    // Already the file with that sha256: not downloaded again.
+    std::fs::remove_file(path("served")).unwrap();
+    assert_eq!(
+        run(&source, dir.path(), &options(1), &[])["fetch"],
+        Outcome::UpToDate
+    );
+
+    std::fs::write(path("served"), "hello\n").unwrap();
+    let outcome = &run(&source, dir.path(), &options(1), &["wrong"])["wrong"];
+    assert!(
+        matches!(outcome, Outcome::Failed(e) if e.contains(&format!("has sha256 {sha}"))),
+        "{outcome:?}"
+    );
+    assert!(!path("other").exists());
+
+    let err = parse_str(
+        "task a {\n file \"x\" url \"https://e\"\n}\n",
+        Path::new("/tmp"),
+    )
+    .err()
+    .unwrap();
+    assert!(format!("{err:#}").contains("needs its checksum"), "{err:#}");
+}
+
+#[cfg(unix)]
+#[test]
+fn templates_name_their_parameters() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = r#"
+        let default = "hello"
+        template greet who greeting="{{ default }}" {
+            run echo {{ greeting }} {{ who }} >> log
+        }
+        task greetings {
+            greet world
+            greet you hi
+        }
+    "#;
+    run(source, dir.path(), &options(1), &[]);
+    assert_eq!(read(dir.path(), "log"), "hello world\nhi you\n");
+
+    let parse = |source: &str| parse_str(source, Path::new("/tmp")).map(|_| ());
+    let template = "template greet who greeting=\"hi\" {\n run true\n}\n";
+    let err = parse(&format!("{template}task a {{\n greet\n}}\n")).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("needs 1 argument: greet who [greeting]"),
+        "{err:#}"
+    );
+    let err = parse(&format!("{template}task a {{\n greet a b c\n}}\n")).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("takes at most 2 arguments"),
+        "{err:#}"
+    );
+    let err = parse("template t a=1 b {\n run true\n}\n").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("needs a default too"),
+        "{err:#}"
+    );
+    let err = parse("template t args {\n run true\n}\n").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("can't be a parameter name"),
+        "{err:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tmp_is_a_new_directory_for_each_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = r#"
+        task scratch {
+            run test -d {{ tmp }} && test -z "$(ls -A {{ tmp }})" && touch {{ tmp }}/x && echo {{ tmp }} >> where
+            run echo {{ tmp }} >> where
+            run echo '\{{ tmp }}' > literal
+        }
+    "#;
+    assert_eq!(
+        run(source, dir.path(), &options(1), &[])["scratch"],
+        Outcome::Ran
+    );
+    let where_ = read(dir.path(), "where");
+    let dirs: Vec<&str> = where_.lines().collect();
+    assert_eq!(dirs.len(), 2);
+    assert_ne!(dirs[0], dirs[1]);
+    assert!(dirs.iter().all(|d| !Path::new(d).exists()), "{dirs:?}");
+    assert_eq!(read(dir.path(), "literal"), "{{ tmp }}\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn tmp_and_settings_over_ssh() {
+    let dir = tempfile::tempdir().unwrap();
+    let (remote, home) = fake_remote(dir.path());
+    std::fs::write(home.join("state"), "off\n").unwrap();
+    let source = r#"
+        task remote {
+            run test -d {{ tmp }} && echo {{ tmp }} > where
+            setting on {
+                get cat state
+                set echo {{ value }} > state
+            }
+        }
+    "#;
+    let outcomes = run_remote(source, dir.path(), &remote, &options(1));
+    assert_eq!(outcomes["remote"], Outcome::Ran, "{outcomes:?}");
+    let tmp = read(&home, "where");
+    assert!(
+        !tmp.trim().is_empty() && !Path::new(tmp.trim()).exists(),
+        "{tmp}"
+    );
+    assert_eq!(read(&home, "state"), "on\n");
+    assert_eq!(
+        run_remote(source, dir.path(), &remote, &options(1))["remote"],
+        Outcome::Ran,
+        "the unguarded run step always runs"
+    );
+}
+
+#[test]
+fn definitions_take_flags_needs_and_locks_in_their_header() {
+    let source = r#"
+        sudo template pkg names="x" needs base lock pacman {
+            run true
+        }
+        task base {
+            run true
+        }
+        task other {
+            run true
+        }
+        manual interactive task app needs base \
+            lock pacman lock other-lock {
+            needs other
+            lock body-lock
+            pkg a
+        }
+        terminal keep subtask after of app needs other {
+            run true
+        }
+        task old-style {
+            needs base
+            lock pacman
+            sudo
+            manual
+            run true
+        }
+    "#;
+    let file = parse_str(source, Path::new("/tmp")).unwrap_or_else(|e| panic!("{e:#}"));
+    let pkg = &file.templates["pkg"];
+    assert!(pkg.body.sudo);
+    assert_eq!(pkg.params.len(), 1);
+    assert_eq!(pkg.needs, ["base"]);
+    assert_eq!(pkg.body.locks, ["pacman"]);
+    let app = &file.tasks["app"];
+    assert!(app.manual && app.interactive);
+    // The header's first, then the body's, then templates' (hoisted).
+    assert_eq!(app.needs, ["base", "other"]);
+    assert_eq!(app.body.locks, ["pacman", "other-lock", "body-lock"]);
+    let after = &file.tasks["after"];
+    assert!(after.body.terminal && after.body.keep);
+    assert_eq!(after.parent.as_deref(), Some("app"));
+    assert_eq!(after.needs, ["other"]);
+    let old = &file.tasks["old-style"];
+    assert!(old.body.sudo && old.manual);
+    assert_eq!(old.needs, ["base"]);
+    assert_eq!(old.body.locks, ["pacman"]);
+
+    let parse = |source: &str| parse_str(source, Path::new("/tmp")).map(|_| ());
+    let err = parse("manual template t {\n run true\n}\n").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("can only be used on tasks"),
+        "{err:#}"
+    );
+    let err = parse("sudo sudo task t {\n run true\n}\n").unwrap_err();
+    assert!(format!("{err:#}").contains("given twice"), "{err:#}");
+    let err = parse("sudo let x = 1\n").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("expected 'task', 'subtask' or 'template'"),
+        "{err:#}"
+    );
+    let err = parse("task t needs {\n run true\n}\n").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("'needs' needs a task name"),
+        "{err:#}"
+    );
+    let err = parse("task t after x {\n run true\n}\n").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("expected 'needs', 'lock' or '{'"),
+        "{err:#}"
+    );
+    let err = parse("task a needs nope {\n run true\n}\n").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("unknown task 'nope'"),
+        "{err:#}"
+    );
+}
