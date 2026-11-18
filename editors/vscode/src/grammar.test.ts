@@ -65,7 +65,7 @@ subtask notify of build {
   expect(scopeOf(tokens, "task")).toContain("storage.type.task");
   expect(scopeOf(tokens, "build")).toContain("entity.name.function");
   expect(scopeOf(tokens, "lint")).toContain("entity.name.function");
-  expect(scopeOf(tokens, "terminal")).toContain("keyword.other.directive");
+  expect(scopeOf(tokens, "terminal")).toContain("storage.modifier");
   expect(scopeOf(tokens, " test -e out")).toContain("meta.embedded.line.shell");
   expect(scopeOf(tokens, "{")).toContain("punctuation.section.block");
   expect(scopeOf(tokens, '        if [ -n "${A}" ]; then echo "}"; fi')).toContain("meta.embedded.block.shell");
@@ -83,7 +83,7 @@ test("highlights an age-key plugin", async () => {
   const tokens = tokenize(`age-key "k.age" plugin fido2-hmac # comment`);
   expect(scopeOf(tokens, "age-key")).toContain("keyword.control.import");
   expect(scopeOf(tokens, '"k.age"')).toContain("string.quoted");
-  expect(scopeOf(tokens, "plugin")).toContain("keyword.other");
+  expect(scopeOf(tokens, "plugin")).toContain("entity.other.attribute-name");
   expect(scopeOf(tokens, "fido2-hmac")).toContain("variable.other.constant.plugin");
   expect(scopeOf(tokens, " comment")).toContain("comment.line");
 });
@@ -117,9 +117,9 @@ test("highlights undo", async () => {
         systemctl disable --now app
     }
 }`);
-  expect(scopeOf(tokens, "keep")).toContain("keyword.other.directive");
-  expect(scopeOf(tokens, "new")).toContain("keyword.other.taskpod");
-  expect(scopeOf(tokens, "undo")).toContain("keyword.control.run");
+  expect(scopeOf(tokens, "keep")).toContain("storage.modifier");
+  expect(scopeOf(tokens, "new")).toContain("entity.other.attribute-name");
+  expect(scopeOf(tokens, "undo")).toContain("support.type.step");
   expect(scopeOf(tokens, " rm -f /tmp/marker")).toContain("meta.embedded.line.shell");
   expect(scopeOf(tokens, "        systemctl disable --now app")).toContain("meta.embedded.block.shell");
   expect(tokens.some(([, s]) => s.includes("entity.name.function.call"))).toBe(false);
@@ -131,9 +131,9 @@ test("highlights directory and line steps", async () => {
     directory "/etc/app" sudo from "files/app"
     line "/etc/pam.d/sudo" sudo before "auth" "auth sufficient x"
 }`);
-  expect(scopeOf(tokens, "directory")).toContain("keyword.other.file");
-  expect(scopeOf(tokens, "line")).toContain("keyword.other.file");
-  expect(scopeOf(tokens, "before")).toContain("keyword.other.taskpod");
+  expect(scopeOf(tokens, "directory")).toContain("support.type.step");
+  expect(scopeOf(tokens, "line")).toContain("support.type.step");
+  expect(scopeOf(tokens, "before")).toContain("entity.other.attribute-name");
   expect(tokens.some(([, s]) => s.includes("entity.name.function.call"))).toBe(false);
 });
 
@@ -154,8 +154,8 @@ test("highlights a directory without from", async () => {
   const tokens = tokenize(`task app {
     directory "/var/lib/app" sudo keep mode 750 owner app:app
 }`);
-  expect(scopeOf(tokens, "directory")).toContain("keyword.other.file");
-  expect(scopeOf(tokens, "keep")).toContain("keyword.other.taskpod");
+  expect(scopeOf(tokens, "directory")).toContain("support.type.step");
+  expect(scopeOf(tokens, "keep")).toContain("entity.other.attribute-name");
   expect(tokens.some(([, s]) => s.includes("entity.name.function.call"))).toBe(false);
 });
 
@@ -190,11 +190,11 @@ task t {
   expect(scopeOf(tokens, "else")).toContain("keyword.control.conditional");
   expect(scopeOf(tokens, "changed")).toContain("keyword.control.conditional");
   expect(scopeOf(tokens, " restart")).toContain("meta.embedded.line.shell");
-  expect(scopeOf(tokens, "setting")).toContain("keyword.other.directive");
-  expect(scopeOf(tokens, "get")).toContain("keyword.control.run");
-  expect(scopeOf(tokens, "set")).toContain("keyword.control.run");
-  expect(scopeOf(tokens, "url")).toContain("keyword.other.taskpod");
-  expect(scopeOf(tokens, "sha256")).toContain("keyword.other.taskpod");
+  expect(scopeOf(tokens, "setting")).toContain("support.type.step");
+  expect(scopeOf(tokens, "get")).toContain("support.type.step");
+  expect(scopeOf(tokens, "set")).toContain("support.type.step");
+  expect(scopeOf(tokens, "url")).toContain("entity.other.attribute-name");
+  expect(scopeOf(tokens, "sha256")).toContain("entity.other.attribute-name");
   expect(tokens.some(([, s]) => s.includes("entity.name.function.call"))).toBe(false);
 });
 
@@ -217,4 +217,29 @@ sudo template pkg names needs yay {
   expect(scopeOf(tokens, " true")).toContain("meta.embedded.line.shell");
   const last = tokens.filter(([t]) => t === "}").pop()!;
   expect(last[1]).not.toContain("meta.");
+});
+
+test("tells control flow, steps, flags and options apart", async () => {
+  const tokens = (await tokenizer())(`task t {
+    sudo
+    desc "d"
+    unless test -e x
+    run make
+    file "/etc/x" mode 600 from "x"
+    setting "s" default "old" keep {
+        get cat s
+    }
+}`);
+  expect(scopeOf(tokens, "sudo")).toContain("storage.modifier");
+  expect(scopeOf(tokens, "desc")).toContain("keyword.other.directive");
+  expect(scopeOf(tokens, "unless")).toContain("keyword.control.conditional");
+  expect(scopeOf(tokens, "run")).toContain("support.type.step");
+  expect(scopeOf(tokens, "file")).toContain("support.type.step");
+  expect(scopeOf(tokens, "mode")).toContain("entity.other.attribute-name");
+  expect(scopeOf(tokens, "from")).toContain("entity.other.attribute-name");
+  expect(scopeOf(tokens, "setting")).toContain("support.type.step");
+  expect(scopeOf(tokens, "default")).toContain("entity.other.attribute-name");
+  expect(scopeOf(tokens, "keep")).toContain("entity.other.attribute-name");
+  expect(scopeOf(tokens, "old")).toContain("string.quoted");
+  expect(tokens.some(([, s]) => s.includes("entity.name.function.call"))).toBe(false);
 });

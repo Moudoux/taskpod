@@ -191,7 +191,7 @@
               "name": "string.quoted.taskpod"
             },
             "3": {
-              "name": "keyword.other.taskpod"
+              "name": "entity.other.attribute-name.taskpod"
             },
             "4": {
               "name": "variable.other.constant.plugin.taskpod"
@@ -215,7 +215,7 @@
           "name": "keyword.control.conditional.taskpod"
         },
         "3": {
-          "name": "keyword.control.run.taskpod"
+          "name": "support.type.step.taskpod"
         },
         "4": {
           "name": "punctuation.section.block.begin.taskpod"
@@ -244,7 +244,7 @@
           "name": "keyword.control.conditional.taskpod"
         },
         "2": {
-          "name": "keyword.control.run.taskpod"
+          "name": "support.type.step.taskpod"
         }
       },
       "end": "(?<![\\\\\\n])$",
@@ -347,7 +347,7 @@
       "begin": "^\\s*(file|directory|line)\\b",
       "beginCaptures": {
         "1": {
-          "name": "keyword.other.file.taskpod"
+          "name": "support.type.step.taskpod"
         }
       },
       "end": "$",
@@ -359,7 +359,7 @@
           "match": "\\b(mode)\\s+([0-7]{3,4})\\b",
           "captures": {
             "1": {
-              "name": "keyword.other.taskpod"
+              "name": "entity.other.attribute-name.taskpod"
             },
             "2": {
               "name": "constant.numeric.octal.taskpod"
@@ -370,7 +370,7 @@
           "match": "\\b(encoding)\\s+([\\w-]+)",
           "captures": {
             "1": {
-              "name": "keyword.other.taskpod"
+              "name": "entity.other.attribute-name.taskpod"
             },
             "2": {
               "name": "constant.language.encoding.taskpod"
@@ -381,7 +381,7 @@
           "match": "\\b(owner)\\s+([\\w.-]+(?::[\\w.-]+)?)",
           "captures": {
             "1": {
-              "name": "keyword.other.taskpod"
+              "name": "entity.other.attribute-name.taskpod"
             },
             "2": {
               "name": "variable.other.constant.owner.taskpod"
@@ -390,7 +390,7 @@
         },
         {
           "match": "\\b(sudo|from|url|sha256|new|keep|before|after|base|match)\\b",
-          "name": "keyword.other.taskpod"
+          "name": "entity.other.attribute-name.taskpod"
         },
         {
           "include": "#comment"
@@ -398,12 +398,45 @@
       ]
     },
     "directive": {
-      "match": "^\\s*(desc|sudo|terminal|manual|interactive|workdir|keep|notice|setting)\\b",
-      "captures": {
-        "1": {
-          "name": "keyword.other.directive.taskpod"
+      "patterns": [
+        {
+          "match": "^\\s*(sudo|terminal|manual|interactive|keep)\\b",
+          "captures": {
+            "1": {
+              "name": "storage.modifier.taskpod"
+            }
+          }
+        },
+        {
+          "match": "^\\s*(desc|workdir|notice)\\b",
+          "captures": {
+            "1": {
+              "name": "keyword.other.directive.taskpod"
+            }
+          }
+        },
+        {
+          "begin": "^\\s*(setting)\\b",
+          "beginCaptures": {
+            "1": {
+              "name": "support.type.step.taskpod"
+            }
+          },
+          "end": "(?=\\{)|(?<![\\\\\\n])$",
+          "patterns": [
+            {
+              "include": "#comment"
+            },
+            {
+              "include": "#strings"
+            },
+            {
+              "match": "\\b(default|keep|sudo)\\b",
+              "name": "entity.other.attribute-name.taskpod"
+            }
+          ]
         }
-      }
+      ]
     },
     "call": {
       "begin": "^\\s+(?!(?:desc|needs|lock|if|unless|ask|changed|sudo|terminal|manual|interactive|workdir|keep|notice|let|run|undo|file|directory|line|setting|get|set|else)\\b)([\\p{L}\\p{N}_.+-]+)(?=\\s|$)",
