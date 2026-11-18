@@ -6,7 +6,7 @@
 
 use crate::vars::Prompt;
 use anyhow::{Result, bail};
-use console::{Style, style};
+use console::{Style, StyledObject, style};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -370,42 +370,27 @@ impl Drop for TaskLine {
     }
 }
 
+/// A task's status line: a symbol, its name in bold, then the detail.
+fn status_line(symbol: StyledObject<&str>, name: &str, detail: StyledObject<&str>) -> String {
+    format!("{symbol} {} {detail}", style(name).bold())
+}
+
 /// Status line symbols and styles.
 pub fn done(name: &str, detail: &str) -> String {
-    format!(
-        "{} {} {}",
-        style("✓").green(),
-        style(name).bold(),
-        style(detail).dim()
-    )
+    status_line(style("✓").green(), name, style(detail).dim())
 }
 
 pub fn would_change(name: &str, detail: &str) -> String {
-    format!(
-        "{} {} {}",
-        style("~").yellow().bold(),
-        style(name).bold(),
-        style(detail).dim()
-    )
+    status_line(style("~").yellow().bold(), name, style(detail).dim())
 }
 
 /// A task whose files differ from the system, in `--pull`.
 pub fn differs(name: &str, detail: &str) -> String {
-    format!(
-        "{} {} {}",
-        style("⇠").yellow().bold(),
-        style(name).bold(),
-        style(detail).dim()
-    )
+    status_line(style("⇠").yellow().bold(), name, style(detail).dim())
 }
 
 pub fn undone(name: &str, detail: &str) -> String {
-    format!(
-        "{} {} {}",
-        style("↶").cyan().bold(),
-        style(name).bold(),
-        style(detail).dim()
-    )
+    status_line(style("↶").cyan().bold(), name, style(detail).dim())
 }
 
 pub fn nothing_to_undo(name: &str) -> String {
@@ -414,13 +399,8 @@ pub fn nothing_to_undo(name: &str) -> String {
         .to_string()
 }
 
-/// A `notice` step's message.
+/// A `notice` step's message, or something `--undo` can't do.
 pub fn notice(text: &str) -> String {
-    format!("{} {}", style("!").yellow().bold(), style(text).yellow())
-}
-
-/// Something `--undo` can't do.
-pub fn cannot(text: &str) -> String {
     format!("{} {}", style("!").yellow().bold(), style(text).yellow())
 }
 
@@ -446,12 +426,7 @@ pub fn unchecked(name: &str, reason: &str) -> String {
 }
 
 pub fn failed(name: &str, error: &str) -> String {
-    format!(
-        "{} {} {}",
-        style("✗").red().bold(),
-        style(name).bold(),
-        style(error).red()
-    )
+    status_line(style("✗").red().bold(), name, style(error).red())
 }
 
 pub fn change(text: &str) -> String {

@@ -122,12 +122,7 @@ pub fn ask(prompt: &str) -> Result<bool> {
 /// The tasks to run for `targets` (or every non-manual task), with the tasks
 /// they need, in an order where each task comes after its dependencies.
 pub fn select(file: &TaskFile, targets: &[String]) -> Result<Vec<String>> {
-    for target in targets {
-        if !file.tasks.contains_key(target) {
-            let names: Vec<&str> = file.tasks.keys().map(String::as_str).collect();
-            bail!("no task named '{target}' (tasks: {})", names.join(", "));
-        }
-    }
+    check_names(file, targets, "")?;
     let mut stack: Vec<&str> = if targets.is_empty() {
         file.tasks
             .values()
@@ -145,13 +140,7 @@ pub fn select(file: &TaskFile, targets: &[String]) -> Result<Vec<String>> {
             }
         }
         // Subtasks follow their parent.
-        stack.extend(
-            file.tasks
-                .values()
-                .filter(|t| !t.manual && !selected.contains(t.name.as_str()))
-                .filter(|t| t.parent.as_deref().is_some_and(|p| selected.contains(p)))
-                .map(|t| t.name.as_str()),
-        );
+        stack.extend(subtasks_of(file, |name| selected.contains(name)));
         if stack.is_empty() {
             break;
         }
@@ -173,21 +162,10 @@ pub fn select_undo(file: &TaskFile, targets: &[String]) -> Result<Vec<String>> {
     if targets.is_empty() {
         return select(file, &[]);
     }
-    for target in targets {
-        if !file.tasks.contains_key(target) {
-            let names: Vec<&str> = file.tasks.keys().map(String::as_str).collect();
-            bail!("no task named '{target}' (tasks: {})", names.join(", "));
-        }
-    }
+    check_names(file, targets, "")?;
     let mut chosen: HashSet<&str> = targets.iter().map(String::as_str).collect();
     loop {
-        let more: Vec<&str> = file
-            .tasks
-            .values()
-            .filter(|t| !t.manual && !chosen.contains(t.name.as_str()))
-            .filter(|t| t.parent.as_deref().is_some_and(|p| chosen.contains(p)))
-            .map(|t| t.name.as_str())
-            .collect();
+        let more: Vec<&str> = subtasks_of(file, |name| chosen.contains(name)).collect();
         if more.is_empty() {
             break;
         }
@@ -228,6 +206,32 @@ pub fn select_undo(file: &TaskFile, targets: &[String]) -> Result<Vec<String>> {
         .into_iter()
         .filter(|n| chosen.contains(n.as_str()))
         .collect())
+}
+
+/// Fail if one of `names` isn't a task, listing the tasks there are.
+/// `option` is the command line option it was given with, if any (`--skip`).
+pub fn check_names(file: &TaskFile, names: &[String], option: &str) -> Result<()> {
+    if let Some(unknown) = names.iter().find(|n| !file.tasks.contains_key(*n)) {
+        let tasks: Vec<&str> = file.tasks.keys().map(String::as_str).collect();
+        let option = if option.is_empty() {
+            String::new()
+        } else {
+            format!("{option}: ")
+        };
+        bail!(
+            "{option}no task named '{unknown}' (tasks: {})",
+            tasks.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The non-manual subtasks of the tasks `chosen` says yes to, not chosen themselves.
+fn subtasks_of(file: &TaskFile, chosen: impl Fn(&str) -> bool) -> impl Iterator<Item = &str> {
+    file.tasks
+        .values()
+        .filter(move |t| !t.manual && !chosen(&t.name) && t.parent.as_deref().is_some_and(&chosen))
+        .map(|t| t.name.as_str())
 }
 
 fn deps(task: &Task) -> impl Iterator<Item = &str> {

@@ -195,6 +195,9 @@ pub fn stat(ctx: &Ctx, path: &Path) -> Option<(u32, String)> {
             let script = format!("set -- {}\n{STAT}", quote(&arg(path)));
             remote.output(&script, &[]).ok()?
         }
+        #[cfg(unix)]
+        None => return stat_local(path),
+        #[cfg(not(unix))]
         None => {
             if !path.exists() {
                 return None;
@@ -213,6 +216,73 @@ pub fn stat(ctx: &Ctx, path: &Path) -> Option<(u32, String)> {
     let text = String::from_utf8_lossy(&output.stdout);
     let (mode, owner) = text.trim().split_once(' ')?;
     Some((u32::from_str_radix(mode, 8).ok()?, owner.to_string()))
+}
+
+/// [`stat`] on this machine, without starting `stat` for every file: the
+/// same permission bits and `user:group` (ids for unknown ones), through symlinks.
+#[cfg(unix)]
+fn stat_local(path: &Path) -> Option<(u32, String)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    let user = id_name(meta.uid(), libc::getpwuid_r, |p| p.pw_name);
+    let group = id_name(meta.gid(), libc::getgrgid_r, |g| g.gr_name);
+    Some((meta.mode() & 0o7777, format!("{user}:{group}")))
+}
+
+/// The name of a user or group id, with `getpwuid_r` or `getgrgid_r`; the
+/// id itself if it has none.
+#[cfg(unix)]
+fn id_name<T>(
+    id: u32,
+    get: unsafe extern "C" fn(
+        u32,
+        *mut T,
+        *mut libc::c_char,
+        libc::size_t,
+        *mut *mut T,
+    ) -> libc::c_int,
+    name: fn(&T) -> *const libc::c_char,
+) -> String {
+    let mut buf: Vec<libc::c_char> = vec![0; 1024];
+    loop {
+        // SAFETY: `passwd` and `group` are plain data, filled in by `get`
+        // with strings in `buf`, which outlives every use of them here.
+        unsafe {
+            let mut entry: T = std::mem::zeroed();
+            let mut found = std::ptr::null_mut();
+            let rc = get(id, &mut entry, buf.as_mut_ptr(), buf.len(), &mut found);
+            if rc == libc::ERANGE && buf.len() < 1 << 20 {
+                let len = buf.len() * 2;
+                buf.resize(len, 0);
+                continue;
+            }
+            if rc != 0 || found.is_null() {
+                return id.to_string();
+            }
+            return std::ffi::CStr::from_ptr(name(&entry))
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+}
+
+/// Whether there's something at `path`. With `sudo`, a path the user can't
+/// see (in a directory only root can enter) is looked for as root too.
+pub fn exists(ctx: &Ctx, task: &str, path: &Path, sudo: bool) -> Result<bool> {
+    let check = |root: bool| -> Result<bool> {
+        Ok(script_output(ctx, r#"[ -e "$1" ]"#, &[arg(path)], root)?
+            .status
+            .success())
+    };
+    let seen = match &ctx.remote {
+        Some(_) => check(false)?,
+        None => path.exists(),
+    };
+    if seen || !sudo {
+        return Ok(seen);
+    }
+    sudo::ensure(task, ctx)?;
+    check(true)
 }
 
 /// Write a file with `mode`, creating parent directories. With `sudo` or
@@ -503,7 +573,7 @@ pub fn remove_dir(ctx: &Ctx, task: &str, path: &Path, sudo: bool) -> Result<()> 
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::INSTALL;
+    use super::{INSTALL, STAT};
     use std::io::Write;
     use std::path::Path;
     use std::process::{Command, Stdio};
@@ -632,5 +702,33 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
         assert_eq!(std::fs::read_to_string(&new).unwrap(), "x\n");
         assert_eq!(names(&dir.path().join("new/dir")), ["file.conf"]);
+    }
+
+    #[test]
+    fn local_stat_matches_the_stat_command() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o4751)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        for path in [file.as_path(), link.as_path(), dir.path(), Path::new("/")] {
+            let output = Command::new("sh")
+                .args(["-c", STAT, "sh"])
+                .arg(path)
+                .output()
+                .unwrap();
+            let text = String::from_utf8(output.stdout).unwrap();
+            let (mode, owner) = text.trim().split_once(' ').unwrap();
+            let expected = (u32::from_str_radix(mode, 8).unwrap(), owner.to_string());
+            assert_eq!(
+                super::stat_local(path),
+                Some(expected),
+                "{}",
+                path.display()
+            );
+        }
+        assert_eq!(super::stat_local(&dir.path().join("missing")), None);
     }
 }

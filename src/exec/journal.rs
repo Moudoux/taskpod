@@ -47,8 +47,20 @@ fn dir(ctx: &Ctx, root: bool) -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/state/taskpod/journal"))
 }
 
+/// Whether entries are only visible to root, so looking for one takes sudo:
+/// root entries in their usual place, not in [`Ctx::journal`]'s (tests).
+fn root_only(ctx: &Ctx, root: bool) -> bool {
+    root && ctx.journal.is_none()
+}
+
+/// The longest entry name kept readable: file names are limited to 255
+/// bytes, and a line entry adds `%lines`.
+const MAX_NAME: usize = 240;
+
 /// The entry's file: the path with everything but letters, digits, `.`, `-`
-/// and `_` written as `%XX`, so names stay readable and unique.
+/// and `_` written as `%XX`, so names stay readable and unique. A name too
+/// long for the file system keeps its start, then `%h` and the sha256 of the
+/// whole name (`%h` isn't `%XX`, so it can't clash with a readable name).
 fn entry(ctx: &Ctx, path: &Path, root: bool) -> Result<PathBuf> {
     let mut name = String::new();
     for byte in path.to_string_lossy().bytes() {
@@ -58,12 +70,16 @@ fn entry(ctx: &Ctx, path: &Path, root: bool) -> Result<PathBuf> {
             name.push_str(&format!("%{byte:02X}"));
         }
     }
+    if name.len() > MAX_NAME {
+        use sha2::{Digest, Sha256};
+        let hash: String = Sha256::digest(name.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        // The name is ASCII, so any length is a character boundary.
+        name = format!("{}%h{hash}", &name[..MAX_NAME - 2 - hash.len()]);
+    }
     Ok(dir(ctx, root)?.join(name))
-}
-
-/// Whether there's an entry for `path`.
-pub fn exists(ctx: &Ctx, path: &Path, root: bool) -> Result<bool> {
-    Ok(target::stat(ctx, &entry(ctx, path, root)?).is_some())
 }
 
 /// The entry for `path`. With `sudo`, a root entry is read as root.
@@ -96,7 +112,10 @@ pub fn read(ctx: &Ctx, task: &str, path: &Path, root: bool, sudo: bool) -> Resul
 
 /// Record what `path` was before taskpod writes it, unless it's recorded already.
 pub fn record(ctx: &Ctx, task: &str, path: &Path, root: bool, previous: &Previous) -> Result<()> {
-    if exists(ctx, path, root)? {
+    // Looked for as root: a root entry the user can't see must not be
+    // replaced, it's what the file was before taskpod.
+    let file = entry(ctx, path, root)?;
+    if target::exists(ctx, task, &file, root_only(ctx, root))? {
         return Ok(());
     }
     let shown = path.display().to_string();
@@ -113,7 +132,6 @@ pub fn record(ctx: &Ctx, task: &str, path: &Path, root: bool, previous: &Previou
         bytes.extend_from_slice(content);
     }
     // Written as root (by sudo's `install`), root owns it.
-    let file = entry(ctx, path, root)?;
     target::write(ctx, task, &file, &bytes, 0o600, None, root)
         .with_context(|| format!("failed to record {shown} in the undo journal"))
 }
@@ -201,7 +219,7 @@ pub fn read_lines(
 pub fn write_lines(ctx: &Ctx, task: &str, path: &Path, root: bool, lines: &Lines) -> Result<()> {
     let file = lines_entry(ctx, path, root)?;
     if lines.lines.is_empty() {
-        if target::stat(ctx, &file).is_none() {
+        if !target::exists(ctx, task, &file, root_only(ctx, root))? {
             return Ok(());
         }
         return target::remove(ctx, task, &file, root);
@@ -258,7 +276,7 @@ pub fn read_setting(ctx: &Ctx, task: &str, get: &str) -> Result<Option<String>> 
 /// Record a setting's value before taskpod sets it, unless it's recorded already.
 pub fn record_setting(ctx: &Ctx, task: &str, get: &str, value: &str) -> Result<()> {
     let file = setting_entry(ctx, get)?;
-    if target::stat(ctx, &file).is_some() {
+    if target::exists(ctx, task, &file, false)? {
         return Ok(());
     }
     let bytes = json!({ "setting": get, "value": value }).to_string();
@@ -269,8 +287,31 @@ pub fn record_setting(ctx: &Ctx, task: &str, get: &str, value: &str) -> Result<(
 /// Forget a setting, once it's undone.
 pub fn remove_setting(ctx: &Ctx, task: &str, get: &str) -> Result<()> {
     let file = setting_entry(ctx, get)?;
-    if target::stat(ctx, &file).is_none() {
+    if !target::exists(ctx, task, &file, false)? {
         return Ok(());
     }
     target::remove(ctx, task, &file, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_names_stay_readable_and_fit() {
+        let ctx = Ctx::new(PathBuf::from("/tmp/x"));
+        let short = entry(&ctx, Path::new("/etc/a b.conf"), false).unwrap();
+        assert_eq!(short.file_name().unwrap(), "%2Fetc%2Fa%20b.conf");
+        let deep = format!("/home/me{}/file.conf", "/dir".repeat(80));
+        let long = entry(&ctx, Path::new(&deep), false).unwrap();
+        let name = long.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name.len(), MAX_NAME);
+        assert!(name.starts_with("%2Fhome%2Fme%2Fdir"), "{name}");
+        // Another long path with the same start gets another name.
+        let other = entry(&ctx, Path::new(&format!("{deep}.bak")), false).unwrap();
+        assert_ne!(long, other);
+        // With `%lines`, it still fits in a file name.
+        let lines = lines_entry(&ctx, Path::new(&deep), false).unwrap();
+        assert!(lines.file_name().unwrap().len() <= 255);
+    }
 }

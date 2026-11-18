@@ -2318,3 +2318,27 @@ fn definitions_take_flags_needs_and_locks_in_their_header() {
         "{err:#}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn templated_sources_are_relative_to_their_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub/x.conf"), "from sub\n").unwrap();
+    std::fs::write(root.join("main.task"), "include \"sub/inc.task\"\n").unwrap();
+    std::fs::write(
+        root.join("sub/inc.task"),
+        "let n = \"x\"\ntask t {\n  file \"plain\" from \"x.conf\"\n  file \"templated\" from \"{{ n }}.conf\"\n}\n",
+    )
+    .unwrap();
+    let file = crate::parser::parse_file(&root.join("main.task")).unwrap();
+    let order = select(&file, &[]).unwrap();
+    let outcomes: HashMap<String, Outcome> = Runner::new(&file, &options(1))
+        .run(&order)
+        .into_iter()
+        .collect();
+    assert_eq!(outcomes["t"], Outcome::Ran, "{outcomes:?}");
+    assert_eq!(read(root, "plain"), "from sub\n");
+    assert_eq!(read(root, "templated"), "from sub\n");
+}

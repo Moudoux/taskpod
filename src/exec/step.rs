@@ -5,6 +5,7 @@ use super::target::{self, Current, DirState, describe};
 use super::{Mode, Outcome, Runner, StepKind, StepRecord, TaskReport, pull, sudo};
 use crate::ast::{
     Block, Encoding, FileSource, FileStep, Guard, LinePlace, LineStep, SettingStep, Step, Task,
+    Template,
 };
 use crate::parser::guard_passes;
 use crate::ui::{self, TaskLine, ui};
@@ -249,6 +250,18 @@ impl<'r> TaskRun<'r> {
 
     /// Run a block's steps. Its guards were already checked.
     fn block(&mut self, block: &'r Block, scope: &Scope, depth: usize) -> Result<()> {
+        self.enter(block, scope, depth, Self::block_steps)
+    }
+
+    /// Run `steps` on a block with its locks held, sudo ready and the
+    /// terminal given to commands that ask, if it says so.
+    fn enter(
+        &mut self,
+        block: &'r Block,
+        scope: &Scope,
+        depth: usize,
+        steps: fn(&mut Self, &'r Block, &Scope, usize) -> Result<()>,
+    ) -> Result<()> {
         let mut _locks: Vec<MutexGuard<'r, ()>> = Vec::new();
         if !self.checking() {
             for name in &block.locks {
@@ -261,7 +274,7 @@ impl<'r> TaskRun<'r> {
         }
         let terminal = block.sudo || block.terminal;
         self.terminal += usize::from(terminal);
-        let result = self.block_steps(block, scope, depth);
+        let result = steps(self, block, scope, depth);
         self.terminal -= usize::from(terminal);
         result
     }
@@ -298,17 +311,14 @@ impl<'r> TaskRun<'r> {
             Step::File(file) => self.file(file, scope, depth),
             Step::Line(line) => self.line(line, scope, depth),
             Step::Call { template, args } => {
-                let template = &self.runner.file.templates[template];
                 let args = scope.expand(args)?;
-                let label = format!("{} {args}", template.name).trim().to_string();
-                template
+                let call = Call::new(&self.runner.file.templates[template], &args);
+                call.template
                     .check_arity(args.split_whitespace().count())
-                    .map_err(|e| anyhow!("`{label}`: {e}"))?;
-                let arg_vars = template.arg_vars(&args);
-                let call_scope = scope.child(&arg_vars);
-                let template_vars = template.vars.for_call();
-                let inner = call_scope.child(&template_vars);
-                self.nested(&template.body, &inner, depth, &label)
+                    .map_err(|e| anyhow!("`{}`: {e}", call.label))?;
+                let call_scope = scope.child(&call.args);
+                let inner = call_scope.child(&call.vars);
+                self.nested(&call.template.body, &inner, depth, &call.label)
             }
             Step::Block(inner) => {
                 let label = inner
@@ -589,6 +599,11 @@ impl<'r> TaskRun<'r> {
         let path = self.target(&scope.expand(&file.path)?);
         let shown = path.display().to_string();
         let owner = file.owner.as_deref().map(|o| scope.expand(o)).transpose()?;
+        // A step that writes as root reads as root too, when running for
+        // real: a file only root can read is otherwise rewritten every run.
+        let as_root = self.mode() == Mode::Run && (file.sudo || owner.is_some());
+        // What's on the system, when it was already read to check a download.
+        let mut read = None;
         let content = match &file.source {
             // Nothing to pull: the content is the download's.
             FileSource::Url { .. } if self.runner.opts.pull => {
@@ -597,14 +612,17 @@ impl<'r> TaskRun<'r> {
             }
             FileSource::Url { url, sha256 } => {
                 // Already the right file: no need to download it again.
-                let as_root = self.mode() == Mode::Run && (file.sudo || owner.is_some());
-                match target::read(ctx, &self.task.name, &path, as_root)? {
-                    Current::Content(bytes) if sha256_hex(&bytes) == *sha256 => bytes,
+                let current = target::read(ctx, &self.task.name, &path, as_root)?;
+                let bytes = match &current {
+                    Current::Content(bytes) if sha256_hex(bytes) == *sha256 => bytes.clone(),
                     _ => download(&scope.expand(url)?, sha256)
                         .with_context(|| format!("file {shown}"))?,
-                }
+                };
+                read = Some(current);
+                bytes
             }
-            _ => file_content(file, scope, &ctx.dir).with_context(|| format!("file {shown}"))?,
+            _ => file_content(file, scope, source_dir(file, &ctx.dir))
+                .with_context(|| format!("file {shown}"))?,
         };
         let mode = file.mode.unwrap_or(if content.starts_with(b"#!") {
             0o755
@@ -618,10 +636,11 @@ impl<'r> TaskRun<'r> {
             return self.undo_file(file, depth, &path, &content, owner.as_deref());
         }
 
-        // A step that writes as root reads as root too, when running for
-        // real: a file only root can read is otherwise rewritten every run.
-        let as_root = self.mode() == Mode::Run && (file.sudo || owner.is_some());
-        let existing = match target::read(ctx, &self.task.name, &path, as_root)? {
+        let current = match read {
+            Some(current) => current,
+            None => target::read(ctx, &self.task.name, &path, as_root)?,
+        };
+        let existing = match current {
             Current::Content(bytes) => Some(bytes),
             Current::Missing | Current::Unreadable => None,
         };
@@ -692,7 +711,7 @@ impl<'r> TaskRun<'r> {
             bail!("directory {}: needs `from` a directory", file.path);
         };
         let join = |base: &str, name: &str| format!("{}/{name}", base.trim_end_matches('/'));
-        let dir = copy_source(source, scope, &self.runner.file.ctx.dir)?;
+        let dir = copy_source(source, scope, source_dir(file, &self.runner.file.ctx.dir))?;
         let mut names = Vec::new();
         list_files(&dir, "", &mut names)
             .with_context(|| format!("failed to list {}", dir.display()))?;
@@ -939,14 +958,12 @@ impl<'r> TaskRun<'r> {
                     }
                 }
                 Step::Call { template, args } => {
-                    let template = &self.runner.file.templates[template];
                     let Ok(args) = scope.expand(args) else {
                         continue;
                     };
-                    let arg_vars = template.arg_vars(&args);
-                    let call_scope = scope.child(&arg_vars);
-                    let template_vars = template.vars.for_call();
-                    self.written_paths(&template.body, &call_scope.child(&template_vars), out);
+                    let call = Call::new(&self.runner.file.templates[template], &args);
+                    let call_scope = scope.child(&call.args);
+                    self.written_paths(&call.template.body, &call_scope.child(&call.vars), out);
                 }
                 _ => {}
             }
@@ -1439,21 +1456,7 @@ impl<'r> TaskRun<'r> {
 
     /// Undo a block's steps, last first. Its guards were already checked.
     fn undo_block(&mut self, block: &'r Block, scope: &Scope, depth: usize) -> Result<()> {
-        let mut _locks: Vec<MutexGuard<'r, ()>> = Vec::new();
-        if !self.checking() {
-            for name in &block.locks {
-                self.status(&format!("waiting for lock {name}"));
-                _locks.push(self.lock(name));
-            }
-            if block.sudo {
-                sudo::ensure(&self.task.name, &self.runner.file.ctx)?;
-            }
-        }
-        let terminal = block.sudo || block.terminal;
-        self.terminal += usize::from(terminal);
-        let result = self.undo_steps(block, scope, depth);
-        self.terminal -= usize::from(terminal);
-        result
+        self.enter(block, scope, depth, Self::undo_steps)
     }
 
     fn undo_steps(&mut self, block: &'r Block, scope: &Scope, depth: usize) -> Result<()> {
@@ -1532,15 +1535,13 @@ impl<'r> TaskRun<'r> {
                 Vars::default(),
             ),
             Step::Call { template, args } => {
-                let template = &self.runner.file.templates[template];
-                let args = scope.expand(args)?;
-                let label = format!("{} {args}", template.name).trim().to_string();
-                (
-                    &template.body,
+                let Call {
+                    template,
                     label,
-                    template.arg_vars(&args),
-                    template.vars.for_call(),
-                )
+                    args,
+                    vars,
+                } = Call::new(&self.runner.file.templates[template], &scope.expand(args)?);
+                (&template.body, label, args, vars)
             }
             _ => unreachable!("only blocks and calls are reactions"),
         };
@@ -1726,7 +1727,7 @@ impl<'r> TaskRun<'r> {
     fn cannot(&mut self, depth: usize, text: &str) {
         self.report.cannot += 1;
         self.record(depth, StepKind::Note, text);
-        self.push(depth, ui::cannot(text));
+        self.push(depth, ui::notice(text));
     }
 
     /// Put a file back as it was before taskpod wrote it, from the journal, or
@@ -1927,7 +1928,7 @@ impl<'r> TaskRun<'r> {
             _ => file.encoding,
         };
         if system != content {
-            match pull_content(file, encoding, scope, &ctx.dir, &system) {
+            match pull_content(file, encoding, scope, source_dir(file, &ctx.dir), &system) {
                 Ok(pulled) => {
                     if let Some(edit) = pulled.edit {
                         edits.push(edit);
@@ -2056,6 +2057,28 @@ impl<'r> TaskRun<'r> {
             self.push(depth + 1, style("not pulled").dim().to_string());
         }
         Ok(())
+    }
+}
+
+/// A template call with its arguments worked out.
+struct Call<'t> {
+    template: &'t Template,
+    /// How the call is shown: the template's name and its arguments.
+    label: String,
+    /// `{{ args }}`, `{{ 1 }}`, ... and the named parameters.
+    args: Vars,
+    /// The template's own variables, for this call.
+    vars: Vars,
+}
+
+impl<'t> Call<'t> {
+    fn new(template: &'t Template, args: &str) -> Self {
+        Call {
+            template,
+            label: format!("{} {args}", template.name).trim().to_string(),
+            args: template.arg_vars(args),
+            vars: template.vars.for_call(),
+        }
     }
 }
 
@@ -2269,6 +2292,17 @@ fn content_difference(old: &[u8], new: &[u8], encoding: Option<Encoding>) -> Str
     } else {
         "content".into()
     }
+}
+
+/// Where a step's relative `from` paths start: the directory of the task
+/// file it's written in, which may be an included one. Paths without
+/// variables were already made absolute by the parser; this is for the others.
+fn source_dir<'a>(file: &'a FileStep, main: &'a Path) -> &'a Path {
+    file.origin
+        .file
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(main)
 }
 
 /// Where a `from` file is.
@@ -2513,11 +2547,12 @@ pub(crate) fn list_files(dir: &Path, prefix: &str, names: &mut Vec<String>) -> R
     Ok(())
 }
 
-/// The bytes a file step writes.
+/// The bytes a file step writes, for content that isn't downloaded:
+/// [`TaskRun::file`] downloads `url` files itself, once it knows they differ.
 fn file_content(file: &FileStep, scope: &Scope, dir: &Path) -> Result<Vec<u8>> {
     match &file.source {
         FileSource::Empty => bail!("a directory without `from` has no content"),
-        FileSource::Url { url, sha256 } => download(&scope.expand(url)?, sha256),
+        FileSource::Url { .. } => bail!("a downloaded file's content comes from its url"),
         FileSource::Inline(text) => file.encoding.encode(&scope.expand(text)?),
         FileSource::Copy(source) => {
             let source = copy_source(source, scope, dir)?;
@@ -2593,7 +2628,6 @@ fn download(url: &str, sha256: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-/// Feed a stream to the task's line. For `\r` progress updates, the last one wins.
 /// Where a command's output goes.
 enum Output {
     /// The task's live line.
@@ -2610,6 +2644,7 @@ impl Output {
     }
 }
 
+/// Feed a stream to the task's line. For `\r` progress updates, the last one wins.
 fn pump(stream: impl Read, line: &TaskLine, output: &std::sync::Mutex<Output>) {
     let mut reader = BufReader::new(stream);
     let mut buffer = Vec::new();

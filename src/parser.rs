@@ -205,10 +205,7 @@ impl<'s> Parser<'s> {
                 self.bump();
                 if kind == BodyKind::Block {
                     self.skip_inline_ws();
-                    if self.rest().starts_with("else")
-                        && !self.rest()[4..].starts_with(|c: char| is_word_char(c))
-                    {
-                        self.pos += 4;
+                    if self.eat_keyword("else") {
                         self.open_brace()?;
                         body.else_follows = true;
                         return Ok(body);
@@ -278,10 +275,7 @@ impl<'s> Parser<'s> {
                 "changed" => {
                     self.skip_inline_ws();
                     // `changed run <command>`: a block with one command.
-                    if self.rest().starts_with("run")
-                        && !self.rest()[3..].starts_with(|c: char| is_word_char(c))
-                    {
-                        self.pos += 3;
+                    if self.eat_keyword("run") {
                         let script = self.run_script("run")?;
                         body.block.steps.push(Step::Block(Block {
                             guards: vec![Guard::Changed],
@@ -1109,7 +1103,7 @@ impl<'s> Parser<'s> {
         self.skip_inline_ws();
         let len = self
             .rest()
-            .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '+')))
+            .find(|c: char| !is_word_char(c))
             .unwrap_or(self.rest().len());
         if len == 0 {
             return Err(match self.peek() {
@@ -1130,6 +1124,18 @@ impl<'s> Parser<'s> {
         }
         self.end_of_line()?;
         Ok(words)
+    }
+
+    /// Move past `keyword` if it's next, as a whole word.
+    fn eat_keyword(&mut self, keyword: &str) -> bool {
+        let found = self
+            .rest()
+            .strip_prefix(keyword)
+            .is_some_and(|after| !after.starts_with(is_word_char));
+        if found {
+            self.pos += keyword.len();
+        }
+        found
     }
 
     fn keyword(&mut self, expected: &str) -> Result<()> {
