@@ -5,9 +5,9 @@ use super::target::{self, Current, DirState, describe};
 use super::{Mode, Outcome, Runner, StepKind, StepRecord, TaskReport, pull, sudo};
 use crate::ast::{
     Block, Encoding, FileSource, FileStep, Guard, LinePlace, LineStep, SettingStep, Step, Task,
-    Template,
+    Template, WaitStep,
 };
-use crate::parser::guard_passes;
+use crate::parser::{check_passes, guard_passes};
 use crate::ui::{self, TaskLine, ui};
 use crate::vars::{Ctx, Scope, Vars, expand_tilde};
 use anyhow::{Context, Result, anyhow, bail};
@@ -110,9 +110,28 @@ impl<'r> TaskRun<'r> {
     }
 
     fn run_inner(&mut self) -> Result<Outcome> {
-        self.cwd = self.runner.workdir(self.task)?;
         let root = self.runner.root_scope();
-        let scope = root.child(&self.task.vars);
+        let task_scope = root.child(&self.task.vars);
+        let tmp = crate::vars::tmp_vars(&task_scope, self.checking());
+        let scope = task_scope.child(&tmp);
+        let result = self.run_task(&scope);
+        self.remove_tmp(&tmp, result)
+    }
+
+    /// Remove a `{{ tmp }}` directory once what used it is done. Failing to
+    /// is said, but the result of what used it matters more.
+    fn remove_tmp<T>(&mut self, tmp: &Vars, result: Result<T>) -> Result<T> {
+        if let Err(e) = crate::vars::remove_tmp(tmp, &self.runner.file.ctx) {
+            if result.is_ok() {
+                self.push(0, style(format!("{e:#}")).dim().to_string());
+            }
+        }
+        result
+    }
+
+    fn run_task(&mut self, scope: &Scope) -> Result<Outcome> {
+        let scope = *scope;
+        self.cwd = self.runner.workdir(self.task, &scope)?;
         self.status("checking");
         if self.runner.opts.undo {
             return self.undo_task(&scope);
@@ -298,9 +317,7 @@ impl<'r> TaskRun<'r> {
 
     fn step(&mut self, step: &'r Step, scope: &Scope, depth: usize) -> Result<()> {
         match step {
-            Step::Run(script) => self.with_tmp(&[script], scope, |this, scope| {
-                this.run_step(&scope.expand(script)?, depth)
-            }),
+            Step::Run(script) => self.run_step(&scope.expand(script)?, depth),
             Step::Setting(setting) => self.setting(setting, scope, depth),
             // Only `--undo` runs these, see `undo_block`.
             Step::Undo(_) => Ok(()),
@@ -308,6 +325,7 @@ impl<'r> TaskRun<'r> {
                 self.notice(&scope.expand(text)?, depth);
                 Ok(())
             }
+            Step::Wait(wait) => self.wait(wait, scope, depth),
             Step::File(file) => self.file(file, scope, depth),
             Step::Line(line) => self.line(line, scope, depth),
             Step::Call { template, args } => {
@@ -318,7 +336,10 @@ impl<'r> TaskRun<'r> {
                     .map_err(|e| anyhow!("`{}`: {e}", call.label))?;
                 let call_scope = scope.child(&call.args);
                 let inner = call_scope.child(&call.vars);
-                self.nested(&call.template.body, &inner, depth, &call.label)
+                let tmp = crate::vars::tmp_vars(&inner, self.checking());
+                let inner = inner.child(&tmp);
+                let result = self.nested(&call.template.body, &inner, depth, &call.label);
+                self.remove_tmp(&tmp, result)
             }
             Step::Block(inner) => {
                 let label = inner
@@ -329,6 +350,38 @@ impl<'r> TaskRun<'r> {
                 self.nested(inner, scope, depth, &label)
             }
         }
+    }
+
+    /// Where the steps of a template or inline block run, if it says
+    /// (`workdir`), relative to the directory around it. Its own guards are
+    /// checked around it: they say whether to go in.
+    fn block_cwd(&self, block: &Block, scope: &Scope) -> Result<Option<PathBuf>> {
+        let Some(dir) = &block.workdir else {
+            return Ok(None);
+        };
+        let ctx = &self.runner.file.ctx;
+        let dir = PathBuf::from(ctx.target_path(&scope.expand(dir)?));
+        Ok(Some(if dir.is_absolute() {
+            dir
+        } else {
+            self.cwd.join(dir)
+        }))
+    }
+
+    /// Run `f` in a block's `workdir`, if it has one.
+    fn in_workdir<T>(
+        &mut self,
+        block: &Block,
+        scope: &Scope,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let Some(dir) = self.block_cwd(block, scope)? else {
+            return f(self);
+        };
+        let outer = std::mem::replace(&mut self.cwd, dir);
+        let result = f(self);
+        self.cwd = outer;
+        result
     }
 
     /// A template call or inline block: check its guards, then run it.
@@ -372,11 +425,13 @@ impl<'r> TaskRun<'r> {
         let step_mark = self.report.steps.len();
         let unchecked_before = self.report.unchecked;
         self.status(label);
-        let result = if undo {
-            self.undo_block(block, scope, depth + 1)
-        } else {
-            self.block(block, scope, depth + 1)
-        };
+        let result = self.in_workdir(block, scope, |this| {
+            if undo {
+                this.undo_block(block, scope, depth + 1)
+            } else {
+                this.block(block, scope, depth + 1)
+            }
+        });
         let inner_changed = self.changed;
         self.changed = changed_before || inner_changed;
         self.changed_before = outer_changed;
@@ -428,36 +483,6 @@ impl<'r> TaskRun<'r> {
             }
         }
         self.exec(script)
-    }
-
-    /// Run `f` with `{{ tmp }}` set to a new empty directory on the machine
-    /// being configured, removed afterwards, if one of `scripts` uses it (and
-    /// the task file has no variable of that name). Checks only show a name.
-    fn with_tmp<T>(
-        &mut self,
-        scripts: &[&str],
-        scope: &Scope,
-        f: impl FnOnce(&mut Self, &Scope) -> Result<T>,
-    ) -> Result<T> {
-        if !scripts.iter().any(|s| crate::vars::mentions(s, "tmp")) || scope.defines("tmp") {
-            return f(self, scope);
-        }
-        let mut vars = Vars::default();
-        if self.checking() {
-            vars.literal("tmp", "$TMPDIR/taskpod.XXXXXX");
-            return f(self, &scope.child(&vars));
-        }
-        let ctx = &self.runner.file.ctx;
-        let dir = ctx.make_temp_dir()?;
-        vars.literal("tmp", dir.clone());
-        let result = f(self, &scope.child(&vars));
-        if let Err(e) = self.runner.file.ctx.remove_temp_dir(&dir) {
-            // The step's own result matters more; say so, but don't fail for it.
-            if result.is_ok() {
-                self.push(0, style(format!("{e:#}")).dim().to_string());
-            }
-        }
-        result
     }
 
     /// Take a named lock, giving the job slot back while waiting for it.
@@ -1485,11 +1510,9 @@ impl<'r> TaskRun<'r> {
                     self.cannot(depth, &text);
                     Ok(())
                 }
-                Step::Undo(script) => self.with_tmp(&[script], scope, |this, scope| {
-                    this.run_step(&scope.expand(script)?, depth)
-                }),
-                // Notices are about doing the task, not undoing it.
-                Step::Notice(_) => Ok(()),
+                Step::Undo(script) => self.run_step(&scope.expand(script)?, depth),
+                // Notices and waits are about doing the task, not undoing it.
+                Step::Notice(_) | Step::Wait(_) => Ok(()),
                 // Files and nested blocks know they're undoing.
                 other => self.step(other, scope, depth),
             };
@@ -1551,16 +1574,33 @@ impl<'r> TaskRun<'r> {
             self.current(depth, &format!("{label} · nothing undone before it"));
             return Ok(());
         }
+        let tmp = match step {
+            Step::Call { .. } => crate::vars::tmp_vars(&inner, self.checking()),
+            _ => Vars::default(),
+        };
+        let inner = inner.child(&tmp);
+        let result = self.react_in(block, &inner, depth, &label);
+        self.remove_tmp(&tmp, result)
+    }
+
+    /// [`Self::react`], with the template call's variables in `scope`.
+    fn react_in(
+        &mut self,
+        block: &'r Block,
+        scope: &Scope,
+        depth: usize,
+        label: &str,
+    ) -> Result<()> {
         if self
             .runner
-            .failing_guard(&block.guards, &inner, &self.cwd)?
+            .failing_guard(&block.guards, scope, &self.cwd)?
             .is_some()
         {
-            self.current(depth, &label);
+            self.current(depth, label);
             return Ok(());
         }
         self.change(depth, &format!("{label} · again, after the undo"));
-        self.block(block, &inner, depth + 1)
+        self.in_workdir(block, scope, |this| this.block(block, scope, depth + 1))
     }
 
     /// `setting "value" { get ...; set ... }`: run `set` when `get` prints
@@ -1625,9 +1665,7 @@ impl<'r> TaskRun<'r> {
         let mut vars = Vars::default();
         vars.literal("value", value);
         let inner = scope.child(&vars);
-        self.with_tmp(&[&setting.set], &inner, |this, scope| {
-            this.run_step(&scope.expand(&setting.set)?, depth + 1)
-        })
+        self.run_step(&inner.expand(&setting.set)?, depth + 1)
     }
 
     /// Set a setting back to its value from before taskpod, from the journal.
@@ -1709,6 +1747,54 @@ impl<'r> TaskRun<'r> {
         if recorded_value {
             journal::remove_setting(&self.runner.file.ctx, &task, get)?;
         }
+        Ok(())
+    }
+
+    /// `wait ... until <check>`: check every second until it passes, with
+    /// the job slot given back meanwhile. Checks only say they'd wait. It
+    /// doesn't count as a change.
+    fn wait(&mut self, wait: &WaitStep, scope: &Scope, depth: usize) -> Result<()> {
+        if self.runner.opts.pull {
+            return Ok(());
+        }
+        let label = scope.expand(&wait.label())?;
+        if check_passes(&wait.check, scope, &self.cwd)? {
+            self.current(depth, &label);
+            return Ok(());
+        }
+        if self.checking() {
+            self.current(depth, &format!("{label} · would wait"));
+            return Ok(());
+        }
+        // Shown with live output too: nothing else says why it's stuck.
+        if let Some(line) = &self.line {
+            line.status(&label);
+        }
+        let start = std::time::Instant::now();
+        let timeout = wait.timeout.map(std::time::Duration::from_secs);
+        self.slot.release();
+        let result = loop {
+            if let Some(timeout) = timeout {
+                let left = timeout.saturating_sub(start.elapsed());
+                if left.is_zero() {
+                    break Err(anyhow!(
+                        "{label}: still waiting after {}s, gave up",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(left.min(std::time::Duration::from_secs(1)));
+            } else {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            match check_passes(&wait.check, scope, &self.cwd) {
+                Ok(true) => break Ok(()),
+                Ok(false) => {}
+                Err(e) => break Err(e),
+            }
+        };
+        self.slot.reacquire();
+        result?;
+        self.current(depth, &label);
         Ok(())
     }
 
@@ -2128,7 +2214,7 @@ impl ResolvedLine {
 /// something): what a `changed` reaction follows in an undo.
 fn is_config(step: &Step) -> bool {
     match step {
-        Step::File(_) | Step::Line(_) | Step::Setting(_) | Step::Notice(_) => true,
+        Step::File(_) | Step::Line(_) | Step::Setting(_) | Step::Notice(_) | Step::Wait(_) => true,
         Step::Block(block) => {
             block.steps.iter().all(is_config)
                 && block

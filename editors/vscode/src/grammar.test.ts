@@ -243,3 +243,36 @@ test("tells control flow, steps, flags and options apart", async () => {
   expect(scopeOf(tokens, "old")).toContain("string.quoted");
   expect(tokens.some(([, s]) => s.includes("entity.name.function.call"))).toBe(false);
 });
+
+test("highlights built-in checks and waits", async () => {
+  const tokens = (await tokenizer())(`task t {
+    unless exists "~/x" {
+    }
+    if which tool
+    if $(docker context show) == "rootless" {
+    }
+    unless $(x) has-line 'y'
+    if $(cmd) args
+    wait "Insert the key" timeout 30 until $(fido2-token -L) != ""
+    wait until exists "/run/a"
+    after
+}`);
+  expect(scopeOf(tokens, "exists")).toContain("support.function.check");
+  expect(scopeOf(tokens, "~/x")).toContain("string.quoted");
+  expect(scopeOf(tokens, "which")).toContain("support.function.check");
+  expect(scopeOf(tokens, "docker context show")).toContain("meta.embedded.line.shell");
+  expect(scopeOf(tokens, "==")).toContain("keyword.operator.comparison");
+  expect(scopeOf(tokens, "rootless")).toContain("string.quoted");
+  expect(scopeOf(tokens, "has-line")).toContain("keyword.operator.comparison");
+  expect(scopeOf(tokens, "wait")).toContain("support.type.step");
+  expect(scopeOf(tokens, "Insert the key")).toContain("string.quoted");
+  expect(scopeOf(tokens, "timeout")).toContain("entity.other.attribute-name");
+  expect(scopeOf(tokens, "until")).toContain("keyword.control.conditional");
+  expect(scopeOf(tokens, "!=")).toContain("keyword.operator.comparison");
+  expect(scopeOf(tokens, "/run/a")).toContain("string.quoted");
+  // `$(cmd) args` is shell, and doesn't run on past its line.
+  expect(tokens.some(([t, s]) => t.includes("cmd) args") && s.includes("meta.embedded.line.shell"))).toBe(true);
+  expect(scopeOf(tokens, "after")).toContain("entity.name.function.call");
+  const last = tokens.filter(([t]) => t === "}").pop()!;
+  expect(last[1]).not.toContain("meta.");
+});

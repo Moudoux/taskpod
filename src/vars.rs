@@ -23,6 +23,9 @@ pub enum Var {
     Shell(String, Cache),
     /// The answer to a question, asked the first time the variable is used.
     Prompt(Prompt, Cache),
+    /// `{{ tmp }}`: a new empty directory on the machine being configured,
+    /// made the first time it's used; its owner removes it (`Var::remove_tmp`).
+    Tmp(Cache),
 }
 
 impl Var {
@@ -46,8 +49,41 @@ impl Var {
             Var::Prompt(prompt, cache) => {
                 Var::Prompt(prompt.clone(), fresh(cache, prompt.is_templated()))
             }
+            Var::Tmp(_) => Var::Tmp(Cache::default()),
         }
     }
+}
+
+/// Variables with `{{ tmp }}` for a task or a template call, unless the task
+/// file has a variable of that name. In checks it's only a name.
+pub fn tmp_vars(scope: &Scope, checking: bool) -> Vars {
+    let mut vars = Vars::default();
+    let mut current = Some(scope);
+    while let Some(layer) = current {
+        match layer.vars.get("tmp") {
+            // A task's own; a template call gets a new one.
+            Some(Var::Tmp(_)) => break,
+            // The task file's, or the name in a check.
+            Some(_) => return vars,
+            None => current = layer.parent,
+        }
+    }
+    if checking {
+        vars.literal("tmp", "$TMPDIR/taskpod.XXXXXX");
+    } else {
+        vars.set("tmp", Var::Tmp(Cache::default()));
+    }
+    vars
+}
+
+/// Remove the `{{ tmp }}` directory of `vars` (see [`tmp_vars`]), if it was made.
+pub fn remove_tmp(vars: &Vars, ctx: &Ctx) -> Result<()> {
+    if let Some(Var::Tmp(cache)) = vars.get("tmp")
+        && let Some(Ok(dir)) = cache.get()
+    {
+        ctx.remove_temp_dir(dir)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -344,6 +380,55 @@ impl Ctx {
         Ok(status.success())
     }
 
+    /// What a command prints, trimmed, whether or not it succeeds. Its
+    /// errors are discarded. Fails only if it can't run, or wants the terminal.
+    pub fn stdout(&self, script: &str, cwd: &Path) -> Result<String> {
+        let mut spawn = self.command(script, cwd);
+        spawn.command.stdout(Stdio::piped()).stderr(Stdio::null());
+        let (child, job) = spawn
+            .spawn()
+            .map_err(|e| anyhow!("failed to start {:?}: {e}", self.program()))?;
+        let output = child.wait_with_output()?;
+        if let Some(process) = job.finish() {
+            bail!(
+                "`{script}`: {}, and checks can't ask",
+                crate::tty::wanted(&process)
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Whether `name` is a program on the PATH (or, with a `/`, an
+    /// executable file) on the machine being configured.
+    pub fn which(&self, name: &str, cwd: &Path) -> Result<bool> {
+        if self.remote.is_some() {
+            let script = format!("command -v {} >/dev/null", crate::remote::quote(name));
+            return self.check(&script, cwd);
+        }
+        if name.contains('/') {
+            return Ok(is_executable(&cwd.join(expand_tilde(name))));
+        }
+        let path = self
+            .exports
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| std::ffi::OsString::from(value))
+            .or_else(|| std::env::var_os("PATH"))
+            .unwrap_or_default();
+        let found = std::env::split_paths(&path).any(|dir| {
+            let dir = cwd.join(dir);
+            if cfg!(windows) {
+                ["", ".exe", ".cmd", ".bat", ".com"]
+                    .iter()
+                    .any(|ext| is_executable(&dir.join(format!("{name}{ext}"))))
+            } else {
+                is_executable(&dir.join(name))
+            }
+        });
+        Ok(found)
+    }
+
     /// Run a command and return its trimmed stdout.
     pub fn capture(&self, script: &str, cwd: &Path) -> std::result::Result<String, String> {
         let mut spawn = self.command(script, cwd);
@@ -369,6 +454,22 @@ impl Ctx {
             ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+}
+
+/// A file that can be run: on Unix, with an execute bit.
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
     }
 }
 
@@ -520,6 +621,10 @@ impl<'a> Scope<'a> {
                 })
                 .clone()
                 .map_err(|e| anyhow!("variable '{name}': {e}")),
+            Var::Tmp(cache) => cache
+                .get_or_init(|| self.ctx.make_temp_dir().map_err(|e| format!("{e:#}")))
+                .clone()
+                .map_err(|e| anyhow!(e)),
         }
     }
 

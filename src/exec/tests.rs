@@ -2189,25 +2189,225 @@ fn templates_name_their_parameters() {
 
 #[cfg(unix)]
 #[test]
-fn tmp_is_a_new_directory_for_each_step() {
+fn tmp_is_shared_by_a_task_and_new_for_each_template_call() {
     let dir = tempfile::tempdir().unwrap();
     let source = r#"
-        task scratch {
+        template scratch {
+            run test -z "$(ls -A {{ tmp }})" && echo {{ tmp }} >> calls
+        }
+        task build {
             run test -d {{ tmp }} && test -z "$(ls -A {{ tmp }})" && touch {{ tmp }}/x && echo {{ tmp }} >> where
-            run echo {{ tmp }} >> where
+            if true {
+                run test -e {{ tmp }}/x && echo {{ tmp }} >> where
+            }
+            scratch
+            scratch
             run echo '\{{ tmp }}' > literal
         }
+        task unused {
+            run true
+        }
     "#;
-    assert_eq!(
-        run(source, dir.path(), &options(1), &[])["scratch"],
-        Outcome::Ran
-    );
+    let outcomes = run(source, dir.path(), &options(1), &[]);
+    assert_eq!(outcomes["build"], Outcome::Ran);
     let where_ = read(dir.path(), "where");
     let dirs: Vec<&str> = where_.lines().collect();
     assert_eq!(dirs.len(), 2);
-    assert_ne!(dirs[0], dirs[1]);
-    assert!(dirs.iter().all(|d| !Path::new(d).exists()), "{dirs:?}");
+    assert_eq!(dirs[0], dirs[1], "inline blocks share the task's");
+    let calls = read(dir.path(), "calls");
+    let calls: Vec<&str> = calls.lines().collect();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[0] != calls[1] && calls[0] != dirs[0], "{calls:?}");
+    assert!(
+        dirs.iter().chain(&calls).all(|d| !Path::new(d).exists()),
+        "{dirs:?} {calls:?}"
+    );
     assert_eq!(read(dir.path(), "literal"), "{{ tmp }}\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn workdir_in_templates_and_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("c/a/b")).unwrap();
+    let source = r#"
+        template here name {
+            workdir "{{ name }}"
+            unless exists "{{ name }}/done"
+            run pwd > done
+        }
+        task t {
+            here a
+            here a
+            if exists "a/b" {
+                workdir "a"
+                run touch from-block
+            } else {
+                run touch wrong
+            }
+            if exists "nope" {
+                workdir "a"
+                run touch wrong
+            } else {
+                run touch from-else
+            }
+            workdir "c"
+            run touch from-task
+        }
+        task clone {
+            if true {
+                workdir "{{ tmp }}"
+                run touch x
+            }
+            run test -e {{ tmp }}/x && touch c/tmp-ok
+        }
+    "#;
+    let outcomes = run(source, dir.path(), &options(1), &[]);
+    assert_eq!(outcomes["t"], Outcome::Ran, "{outcomes:?}");
+    assert_eq!(outcomes["clone"], Outcome::Ran, "{outcomes:?}");
+    let p = dir.path();
+    assert!(read(&p.join("c/a"), "done").trim_end().ends_with("/c/a"));
+    assert!(p.join("c/a/from-block").exists());
+    assert!(p.join("c/from-else").exists());
+    assert!(p.join("c/from-task").exists());
+    assert!(!p.join("c/wrong").exists() && !p.join("c/a/wrong").exists());
+    assert!(p.join("c/tmp-ok").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn builtin_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("there"), "").unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    crate::test_util::write_script(&bin.join("tool"), "#!/bin/sh\necho hi\n");
+    std::fs::write(bin.join("not-executable"), "").unwrap();
+    std::fs::write(
+        dir.path().join("vars.env"),
+        format!("PATH={}:/usr/bin:/bin\n", bin.display()),
+    )
+    .unwrap();
+    let source = r#"
+        env "vars.env"
+        task checks {
+            if exists "there" {
+                run echo exists >> out
+            }
+            unless exists "not-there" {
+                run echo missing >> out
+            }
+            if which tool {
+                run echo tool >> out
+            }
+            if which "sh" {
+                run echo sh >> out
+            }
+            unless which not-executable {
+                run echo not-executable >> out
+            }
+            if $(printf 'a\n  b  \nc') has-line "b" {
+                run echo has-line >> out
+            }
+            if $(echo hello world) contains "lo wo" {
+                run echo contains >> out
+            }
+            if $(echo '  same  ') == "same" {
+                run echo equals >> out
+            }
+            if $(exit 1) == "" {
+                run echo failed-is-empty >> out
+            }
+            if $(echo printed; exit 3) == "printed" {
+                run echo failed-prints >> out
+            }
+            if $(echo x) != "" {
+                run echo not-empty >> out
+            }
+            if $(echo "a)b") == "a)b" {
+                run echo parens >> out
+            }
+            if $(echo x) == "y" {
+                run echo wrong >> out
+            }
+        }
+    "#;
+    let outcomes = run(source, dir.path(), &options(1), &[]);
+    assert_eq!(outcomes["checks"], Outcome::Ran, "{outcomes:?}");
+    assert_eq!(
+        read(dir.path(), "out"),
+        "exists\nmissing\ntool\nsh\nnot-executable\nhas-line\ncontains\nequals\n\
+         failed-is-empty\nfailed-prints\nnot-empty\nparens\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn builtin_checks_over_ssh() {
+    let dir = tempfile::tempdir().unwrap();
+    let (remote, home) = fake_remote(dir.path());
+    std::fs::write(home.join("there"), "").unwrap();
+    let source = r#"
+        task remote {
+            if exists "~/there" {
+                run echo exists >> out
+            }
+            unless exists "not-there" {
+                run echo missing >> out
+            }
+            if which sh {
+                run echo sh >> out
+            }
+            unless which no-such-program-anywhere {
+                run echo none >> out
+            }
+            if $(cat there; echo x) == "x" {
+                run echo output >> out
+            }
+        }
+    "#;
+    let outcomes = run_remote(source, dir.path(), &remote, &options(1));
+    assert_eq!(outcomes["remote"], Outcome::Ran, "{outcomes:?}");
+    assert_eq!(read(&home, "out"), "exists\nmissing\nsh\nnone\noutput\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn wait_until_a_check_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = r#"
+        task waits {
+            run (sleep 1.5; touch ready) >/dev/null 2>&1 &
+            wait "for ready" until exists "ready"
+            run echo after > out
+            wait until $(echo x) == "x"
+        }
+        task gives-up {
+            manual
+            wait timeout 1 until exists "never"
+            run echo wrong > wrong
+        }
+    "#;
+    let start = std::time::Instant::now();
+    let outcomes = run(source, dir.path(), &options(1), &[]);
+    assert_eq!(outcomes["waits"], Outcome::Ran, "{outcomes:?}");
+    assert!(start.elapsed() >= std::time::Duration::from_secs(1));
+    assert_eq!(read(dir.path(), "out"), "after\n");
+
+    let outcomes = run(source, dir.path(), &options(1), &["gives-up"]);
+    assert!(
+        matches!(outcomes["gives-up"], Outcome::Failed(_)),
+        "{outcomes:?}"
+    );
+    assert!(!dir.path().join("wrong").exists());
+
+    // A check doesn't wait.
+    let mut check = options(1);
+    check.mode = Mode::DryRun;
+    let start = std::time::Instant::now();
+    let outcomes = run(source, dir.path(), &check, &["gives-up"]);
+    assert_eq!(outcomes["gives-up"], Outcome::Ran, "{outcomes:?}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
 }
 
 #[cfg(unix)]

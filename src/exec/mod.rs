@@ -7,7 +7,7 @@ pub mod pull;
 pub mod sources;
 mod step;
 pub mod sudo;
-mod target;
+pub(crate) mod target;
 
 use crate::ast::{Guard, Task, TaskFile};
 use crate::parser::guard_passes;
@@ -327,14 +327,12 @@ impl<'a> Runner<'a> {
     }
 
     /// The directory a task runs in.
-    pub fn workdir(&self, task: &Task) -> Result<PathBuf> {
+    pub fn workdir(&self, task: &Task, scope: &Scope) -> Result<PathBuf> {
         let ctx = &self.file.ctx;
         let base = ctx.default_cwd(&ctx.dir);
         let Some(workdir) = &task.workdir else {
             return Ok(base);
         };
-        let root = self.root_scope();
-        let scope = root.child(&task.vars);
         let dir = PathBuf::from(ctx.target_path(&scope.expand(workdir)?));
         Ok(if dir.is_absolute() {
             dir

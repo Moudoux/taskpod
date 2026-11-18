@@ -151,6 +151,10 @@ pub struct Block {
     pub terminal: bool,
     /// `keep`: `--undo` leaves what this block did in place.
     pub keep: bool,
+    /// `workdir` in a template or an inline block: where its checks and
+    /// commands run, relative to the directory around it. A task's own is
+    /// [`Task::workdir`].
+    pub workdir: Option<String>,
     pub steps: Vec<Step>,
     /// `} else {` after an `if` block: run instead when its guard fails.
     pub otherwise: Option<Box<Block>>,
@@ -205,6 +209,27 @@ pub enum Step {
     Notice(String),
     /// `setting "value" { get ...; set ... }`: a value read and written by commands.
     Setting(Box<SettingStep>),
+    /// `wait "message" until <check>`: poll the check until it passes.
+    Wait(Box<WaitStep>),
+}
+
+/// `wait ["message"] [timeout <seconds>] until <check>`: checked every
+/// second until it passes. Changes nothing.
+#[derive(Debug, Clone)]
+pub struct WaitStep {
+    pub message: Option<String>,
+    pub timeout: Option<u64>,
+    pub check: Check,
+}
+
+impl WaitStep {
+    /// What it's shown as: the message, or the check.
+    pub fn label(&self) -> String {
+        match &self.message {
+            Some(message) => format!("wait: {message}"),
+            None => format!("wait until {}", self.check.text),
+        }
+    }
 }
 
 /// `setting "value" { get <command> set <command> }`: `get` prints the
@@ -440,12 +465,72 @@ pub enum FileSource {
     Empty,
 }
 
+/// What `if`, `unless` and `wait ... until` check: a shell command, or one
+/// of the built-in checks, which need no shell.
+#[derive(Debug, Clone)]
+pub struct Check {
+    /// As written, with `\` continuations joined: a shell command is run as this.
+    pub text: String,
+    pub kind: CheckKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheckKind {
+    /// Passes if the command (`Check::text`) succeeds.
+    Shell,
+    /// `exists "path"`: something is at the path, on the machine being configured.
+    Exists(String),
+    /// `which name`: an executable of that name is on the PATH.
+    Which(String),
+    /// `$(command) == "value"`: compares what the command prints, trimmed,
+    /// whether or not it succeeds.
+    Output {
+        command: String,
+        compare: Compare,
+        value: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Compare {
+    /// `==`
+    Equals,
+    /// `!=`
+    NotEquals,
+    /// `contains`
+    Contains,
+    /// `has-line`: one of its lines is the value, ignoring spaces at either end.
+    HasLine,
+}
+
+impl Compare {
+    pub fn matches(self, output: &str, value: &str) -> bool {
+        let value = value.trim();
+        match self {
+            Compare::Equals => output.trim() == value,
+            Compare::NotEquals => output.trim() != value,
+            Compare::Contains => output.contains(value),
+            Compare::HasLine => output.lines().any(|line| line.trim() == value),
+        }
+    }
+}
+
+impl Check {
+    /// A check that runs `command` in the shell.
+    pub fn shell(command: impl Into<String>) -> Self {
+        Check {
+            text: command.into(),
+            kind: CheckKind::Shell,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Guard {
-    /// Run only if the command succeeds.
-    If(String),
-    /// Skip if the command succeeds.
-    Unless(String),
+    /// Run only if the check passes.
+    If(Check),
+    /// Skip if the check passes.
+    Unless(Check),
     /// Ask the user.
     Ask(String),
     /// `changed`: run only if an earlier step in the task changed something.
@@ -456,8 +541,8 @@ pub enum Guard {
 impl Guard {
     pub fn describe(&self) -> String {
         match self {
-            Guard::If(cmd) => format!("if {cmd}"),
-            Guard::Unless(cmd) => format!("unless {cmd}"),
+            Guard::If(check) => format!("if {}", check.text),
+            Guard::Unless(check) => format!("unless {}", check.text),
             Guard::Ask(prompt) => format!("ask {prompt:?}"),
             Guard::Changed => "changed".to_string(),
         }
@@ -470,6 +555,7 @@ impl Step {
             Step::Run(script) => script.clone(),
             Step::Undo(script) => format!("undo {script}"),
             Step::Notice(text) => format!("notice {text}"),
+            Step::Wait(wait) => wait.label(),
             Step::Setting(setting) => format!("setting {}", setting.get),
             Step::File(file) if file.dir => format!("directory {}", file.path),
             Step::File(file) => format!("file {}", file.path),

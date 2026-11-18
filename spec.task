@@ -29,9 +29,11 @@ let today = $(date +%A)        # shell output, run once when first used
 # Without a terminal: confirm is false, choose takes the first option, input the default.
 # Built in: {{ home }}, {{ user }}, {{ pwd }} and {{ dir }} (this file's
 # directory). Unknown names fall back to environment variables: {{ HOME }}.
-# In a `run`, `undo` or `set` command, {{ tmp }} is a new empty directory on
-# the machine being configured, deleted once the command ends (a dry run
-# shows $TMPDIR/taskpod.XXXXXX).
+# {{ tmp }} is a new empty directory on the machine being configured, made
+# when first used: one for each task (its inline blocks share it) and one for
+# each template call, deleted once that ends (a dry run shows
+# $TMPDIR/taskpod.XXXXXX). So a task can download into it in one step and
+# install from it in the next.
 
 # Load KEY=value lines as variables, also exported to every command:
 #   env ".env"
@@ -53,6 +55,7 @@ let today = $(date +%A)        # shell output, run once when first used
 #   age-key "taskpod.key.age" plugin fido2-hmac
 # Merge another file, paths are relative to this one; `if`/`unless` optional:
 #   include "desktop.task" if pacman -Q plasma-workspace
+#   include "kde.task" if which plasmashell
 # Commands run with `sh -ec` by default, change it with:
 #   shell "bash -eo pipefail -c"
 
@@ -73,11 +76,25 @@ task hello {
     # but if one fails, this task doesn't run. Also `task hello needs main {`.
     needs main
     # Guards, all must pass for the task to run:
-    #   if <command>       run only if the command succeeds
-    #   unless <command>   skip if the command succeeds
+    #   if <check>         run only if the check passes
+    #   unless <check>     skip if the check passes
     #   ask "Question?"    ask first (a dry run assumes yes)
+    # A check is a shell command that passes when it succeeds, or one of these
+    # built-in checks, which need no shell (when the whole check is one of them):
+    #   exists "path"          something is at the path (through symlinks), on the
+    #                          machine being configured; relative to the workdir
+    #   which name             a program on the PATH (an `env` file's PATH counts),
+    #                          or with a /, an executable file
+    #   $(command) == "value"  what the command prints, trimmed, is the value;
+    #                          whether it succeeds doesn't matter, and what it
+    #                          prints on stderr is dropped, so a failing command
+    #                          prints "". Also != "value", contains "text", and
+    #                          has-line "text": one of its lines is the text,
+    #                          ignoring spaces at either end
+    # Anything else is shell, like `exists x` without quotes or `$(cmd) args`.
     if test -d /tmp
-    unless test -e /tmp/taskpod-never-exists
+    unless exists "/tmp/taskpod-never-exists"
+    if $(uname -s) != ""
     run echo "Hello"
     # End a guard with { to only guard the steps inside, not the whole task.
     unless test -e /tmp/taskpod-hello {
@@ -110,9 +127,16 @@ task hello {
     # task, and again above the final summary so it isn't lost (a command's
     # output only shows while it runs). It changes nothing, so a task with
     # only notices is still up to date; --undo and --pull skip them.
-    unless test -d /tmp/taskpod-example {
+    unless exists "/tmp/taskpod-example" {
         notice "/tmp/taskpod-example doesn't exist yet, run -r setup"
     }
+    # `wait` checks every second until a check passes (any `if` check), with
+    # the message on the task's line meanwhile; already passing, it's done.
+    # `timeout 30` gives up after 30 seconds, failing the step. Dry runs and
+    # diffs never wait, --undo and --pull skip it, and it changes nothing.
+    # While it waits, the task gives its job slot to others.
+    #   wait "Insert the security key" until $(fido2-token -L) != ""
+    wait timeout 5 until exists "/tmp"
 }
 
 # Subtasks run after their parent, and only if the parent changed something:
@@ -144,6 +168,17 @@ template greet who greeting="hello" {
     run echo "{{ greeting }}, {{ who }}"
 }
 
+# `workdir` in a template or an inline block is where its steps run, relative
+# to the directory around it. Its own guards are checked outside it: they say
+# whether to go in. Each call gets its own {{ tmp }}, so a template can build in it:
+template build-from repo {
+    run git clone -q {{ repo }} {{ tmp }}
+    if exists "{{ tmp }}/Makefile" {
+        workdir "{{ tmp }}"
+        run make
+    }
+}
+
 task greetings {
     greet world        # hello, world
     greet you hi       # hi, you
@@ -152,6 +187,7 @@ task greetings {
 task setup {
     manual                     # only runs with -r, or when another task needs it
     workdir "/tmp"             # where commands run, default: this file's directory
+                               # (in a template or block: see build-from above)
     let where = "{{ home }}"   # variables can be per task
     # Files are written only when their content, mode or owner differs (through
     # symlinks); diffs say when only the encoding, line endings or final newline do.

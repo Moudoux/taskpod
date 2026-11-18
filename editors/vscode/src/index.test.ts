@@ -242,3 +242,18 @@ task old {
   expect(index.refs.filter((r) => r.kind === "template")).toEqual([]);
   expect(index.vars.map((v) => v.name)).toEqual(["repo", "path"]);
 });
+
+test("waits and built-in checks aren't template calls", () => {
+  const index = parse(`task t {
+    wait "x" until exists "/run/a"
+    unless exists "~/x" {
+        pkg a
+    }
+    if $(x) == "y" {
+        workdir "d"
+    }
+}`);
+  expect(index.refs.filter((r) => r.kind === "template").map((r) => r.name)).toEqual(["pkg"]);
+  expect(index.lines[4]).toMatchObject({ owner: "t" });
+  expect(index.lines[7]).toMatchObject({ owner: "t", context: "body" });
+});

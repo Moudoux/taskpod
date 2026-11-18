@@ -13,6 +13,8 @@ idempotent. Its main use is setting up an Arch system from
   Definitions take flags before `task`/`template` and `needs`/`lock` after the name
   (`Parser::definition`); the same directives in the body still work and add up.
   `run` lines and `run { }` blocks are raw shell; brace matching in blocks skips quotes and comments.
+  Checks (`if`/`unless`/`wait until`, `Parser::check`) are shell unless the whole check is a built-in
+  (`CheckKind`: `exists`, `which`, `$( )` comparisons), run by `parser::check_passes`.
 - `src/ast.rs`: the parsed file, `link()` checks references and hoists template `needs` into tasks.
   File encodings live here too.
 - `src/vars.rs`: `{{ name }}` templating, scopes, lazy `$( )` and prompt variables, how commands are spawned.
@@ -22,7 +24,8 @@ idempotent. Its main use is setting up an Arch system from
   an RwLock so `interactive` tasks run alone), summaries. Modes: run, dry run (`-d`), diff (`-D`).
 - `src/exec/step.rs`: running steps: shell, files (content/mode/owner, diffs; `url` downloads with curl,
   checked by sha256), settings, template calls (named parameters: `Template::arg_vars`) and inline
-  blocks (`else`: `Block::otherwise`). `{{ tmp }}` is `TaskRun::with_tmp`. In an undo, `changed`
+  blocks (`else`: `Block::otherwise`), a block's `workdir` (`TaskRun::in_workdir`) and `wait`.
+  `{{ tmp }}` is a lazy `Var::Tmp`, one per task run and template call (`vars::tmp_vars`). In an undo, `changed`
   reactions (`Block::is_reaction`) run again after the file/line/setting steps before them.
   With `--pull` (`Options::pull`, combined with the Run/DryRun/Diff mode) file steps are compared the
   other way and queue edits on `Runner::edits`, which `main` applies at the end.

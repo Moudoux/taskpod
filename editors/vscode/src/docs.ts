@@ -92,16 +92,16 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   if: {
     places: ["top", "body"],
     summary:
-      "Run only if the shell command succeeds. In a task, it applies to the task; ending the line with `{` makes a block, so it only applies to the steps inside.",
-    syntax: "if lsusb | grep Logitech\n\nunless test -d ~/.oh-my-zsh {\n    run ...\n}",
-    snippet: "if ${1:command}",
+      "Run only if the check passes: a shell command that succeeds, or a built-in check (`exists \"path\"`, `which name`, `$(command) == \"value\"`, also `!=`, `contains` and `has-line`). In a task, it applies to the task; ending the line with `{` makes a block, so it only applies to the steps inside.",
+    syntax: 'if lsusb | grep Logitech\n\nunless exists "~/.oh-my-zsh" {\n    run ...\n}\n\nif $(yay -Qua) != ""',
+    snippet: "if ${1:check}",
   },
   unless: {
     places: ["top", "body"],
     summary:
-      "Skip if the shell command succeeds: the usual way to make a step idempotent. End the line with `{` to guard only the steps in the block.",
-    syntax: "unless pacman -Q zsh\n\nunless systemctl is-enabled -q cups {\n    run sudo systemctl enable --now cups\n}",
-    snippet: "unless ${1:command}",
+      "Skip if the check passes (a shell command that succeeds, or a built-in check, see `if`): the usual way to make a step idempotent. End the line with `{` to guard only the steps in the block.",
+    syntax: 'unless pacman -Q zsh\n\nunless $(docker context show) == "rootless" {\n    run docker context use rootless\n}',
+    snippet: "unless ${1:check}",
   },
   ask: {
     places: ["top", "body"],
@@ -179,9 +179,49 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
     syntax: "interactive",
     snippet: "interactive",
   },
+  exists: {
+    places: [],
+    summary:
+      "A built-in check: something is at the path (a file, directory or other), on the machine being configured, through symlinks. `~/` is the home directory there; relative paths are from the workdir. No shell is involved.",
+    syntax: 'unless exists "~/.oh-my-zsh"',
+  },
+  which: {
+    places: [],
+    summary:
+      "A built-in check: a program of that name is on the PATH (an `env` file's PATH counts), or with a `/`, the file is executable. Over `--host`, the remote shell's `command -v`.",
+    syntax: "if which checkupdates",
+  },
+  contains: {
+    places: [],
+    summary: "In a check: what the command prints contains the text. See `if`.",
+    syntax: '$(tailscale serve status) contains "(svc:git)"',
+  },
+  "has-line": {
+    places: [],
+    summary: "In a check: one of the lines the command prints is the text, ignoring spaces at either end. See `if`.",
+    syntax: '$(flatpak remotes --user --columns=name) has-line "flathub"',
+  },
+  wait: {
+    places: ["body"],
+    summary:
+      "Waits until the check passes (any `if` check), checking every second, with the message on the task's line meanwhile; `timeout` gives up after that many seconds, failing the step. If the check already passes, it's done. Dry runs and diffs never wait, and `--undo` and `--pull` skip it. It changes nothing, and the task gives its job slot back while it waits.",
+    syntax: 'wait "Insert the security key" until $(fido2-token -L) != ""\nwait timeout 30 until exists "/run/app.sock"',
+    snippet: 'wait "${1:message}" until ${2:check}',
+  },
+  until: {
+    places: [],
+    summary: "In a `wait`: the check to wait for.",
+    syntax: 'wait until exists "/run/app.sock"',
+  },
+  timeout: {
+    places: [],
+    summary: "In a `wait`: give up (failing the step) after this many seconds.",
+    syntax: 'wait "Starting" timeout 30 until exists "/run/app.sock"',
+  },
   workdir: {
     places: ["body"],
-    summary: "Where the task's commands run, relative to the task file. Default: the task file's directory.",
+    summary:
+      "Where commands and checks run. In a task, relative to the task file (default: its directory). In a template or inline block, where its steps run, relative to the directory around it; its own guards are checked outside it, since they say whether to go in.",
     syntax: 'workdir "build"',
     snippet: 'workdir "${1:dir}"',
   },
@@ -334,7 +374,7 @@ export const BUILTIN_VARS: Record<string, string> = {
   pwd: "The directory taskpod was started in.",
   dir: "The directory of the main task file.",
   args: "In a template: every word it was called with.",
-  tmp: "In a `run`, `undo` or `set` command: a new empty directory, deleted once the command ends.",
+  tmp: "A new empty directory on the machine being configured, made when first used: one for the task (its inline blocks share it), and one for each template call. Deleted once that ends.",
   value: "In a `setting`'s `set` command: the value to set.",
 };
 

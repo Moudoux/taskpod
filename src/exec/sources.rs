@@ -150,14 +150,24 @@ impl<'a> Sources<'a> {
 
     fn block(&self, block: &'a Block, layers: &[&'a Vars], found: &mut Found) {
         for guard in &block.guards {
-            if let Guard::If(text) | Guard::Unless(text) | Guard::Ask(text) = guard {
-                found.scan(text, layers);
+            match guard {
+                Guard::If(check) | Guard::Unless(check) => found.scan(&check.text, layers),
+                Guard::Ask(text) => found.scan(text, layers),
+                Guard::Changed => {}
             }
+        }
+        if let Some(dir) = &block.workdir {
+            found.scan(dir, layers);
         }
         for step in &block.steps {
             match step {
                 Step::Run(text) | Step::Undo(text) | Step::Notice(text) => {
                     found.scan(text, layers);
+                }
+                Step::Wait(wait) => {
+                    for text in wait.message.iter().chain([&wait.check.text]) {
+                        found.scan(text, layers);
+                    }
                 }
                 Step::Setting(setting) => {
                     for text in [&setting.value, &setting.get, &setting.set] {

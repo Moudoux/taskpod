@@ -321,9 +321,17 @@ impl<'s> Parser<'s> {
                     body.interactive = true;
                 }
                 "workdir" => {
-                    task_only(self)?;
-                    body.workdir = Some(self.string()?);
+                    let dir = self.string()?;
                     self.end_of_line()?;
+                    let slot = if kind == BodyKind::Task {
+                        &mut body.workdir
+                    } else {
+                        &mut body.block.workdir
+                    };
+                    if slot.is_some() {
+                        return Err(self.error_at(start, "'workdir' is given twice"));
+                    }
+                    *slot = Some(dir);
                 }
                 "let" => {
                     not_in_block(self)?;
@@ -346,6 +354,10 @@ impl<'s> Parser<'s> {
                     let text = self.string()?;
                     self.end_of_line()?;
                     body.block.steps.push(Step::Notice(text));
+                }
+                "wait" => {
+                    let wait = self.wait_step()?;
+                    body.block.steps.push(Step::Wait(Box::new(wait)));
                 }
                 "setting" => {
                     let setting = self.setting(start)?;
@@ -395,6 +407,35 @@ impl<'s> Parser<'s> {
             self.end_of_line()?;
             return Ok((guard, opens_block));
         }
+        let (check, opens_block) = self.check(keyword)?;
+        let guard = if keyword == "if" {
+            Guard::If(check)
+        } else {
+            Guard::Unless(check)
+        };
+        Ok((guard, opens_block))
+    }
+
+    /// The check after `if`, `unless` or `until`, to the end of the line, and
+    /// whether it ends with `{` (opening a block). A built-in check if it's
+    /// one as a whole, otherwise a shell command.
+    fn check(&mut self, keyword: &str) -> Result<(Check, bool)> {
+        self.skip_inline_ws();
+        let start = self.pos;
+        if let Some(kind) = self.builtin_check()? {
+            let text = self.src[start..self.pos]
+                .replace("\\\r\n", " ")
+                .replace("\\\n", " ");
+            self.skip_inline_ws();
+            let opens_block = self.peek() == Some('{');
+            if opens_block {
+                self.bump();
+            }
+            self.end_of_line()?;
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            return Ok((Check { text, kind }, opens_block));
+        }
+        self.pos = start;
         let mut command = self.rest_of_line();
         // `unless check { # why` opens a block too, like `run { # why`.
         let code = strip_comment(&command).trim_end();
@@ -403,31 +444,109 @@ impl<'s> Parser<'s> {
             command = code[..code.len() - 1].trim_end().to_string();
         }
         if command.is_empty() {
-            return Err(self.error(format!("'{keyword}' needs a command")));
+            return Err(self.error(format!("'{keyword}' needs a check")));
         }
         self.end_of_line()?;
-        let guard = if keyword == "if" {
-            Guard::If(command)
-        } else {
-            Guard::Unless(command)
-        };
-        Ok((guard, opens_block))
+        Ok((Check::shell(command), opens_block))
     }
 
-    /// `include "x" if <command>`
+    /// `exists "path"`, `which name` or `$(command) <compare> "value"`, if
+    /// the check is one of them; the position is left after it. Anything
+    /// else is a shell command, and returns `None`.
+    fn builtin_check(&mut self) -> Result<Option<CheckKind>> {
+        let start = self.pos;
+        if self.rest().starts_with("$(") {
+            let command = self.command_substitution()?;
+            self.skip_inline_ws();
+            let at = self.pos;
+            let compare = if self.rest().starts_with("==") {
+                self.pos += 2;
+                Compare::Equals
+            } else if self.rest().starts_with("!=") {
+                self.pos += 2;
+                Compare::NotEquals
+            } else if self.eat_keyword("contains") {
+                Compare::Contains
+            } else if self.eat_keyword("has-line") {
+                Compare::HasLine
+            } else if self.rest().starts_with('=') {
+                return Err(self.error_at(at, "compare with '==' (or '!=')"));
+            } else {
+                // `$(cmd) args`: runs what the command prints, in the shell.
+                self.pos = start;
+                return Ok(None);
+            };
+            self.skip_inline_ws();
+            if !matches!(self.peek(), Some('"' | '\'')) {
+                return Err(
+                    self.error("expected a string to compare with, like `$(command) == \"value\"`")
+                );
+            }
+            let value = self.string()?;
+            if !self.at_check_end() {
+                return Err(self.error("expected the end of the check after the value"));
+            }
+            return Ok(Some(CheckKind::Output {
+                command,
+                compare,
+                value,
+            }));
+        }
+        let kind = match self.word("").ok().as_deref() {
+            Some("exists") => {
+                self.skip_inline_ws();
+                match self.peek() {
+                    Some('"' | '\'') => Some(CheckKind::Exists(self.string()?)),
+                    _ => None,
+                }
+            }
+            Some("which") => {
+                self.skip_inline_ws();
+                match self.peek() {
+                    Some('"' | '\'') => Some(CheckKind::Which(self.string()?)),
+                    _ => self.word("").ok().map(CheckKind::Which),
+                }
+            }
+            _ => None,
+        };
+        match kind {
+            Some(kind) if self.at_check_end() => Ok(Some(kind)),
+            _ => {
+                self.pos = start;
+                Ok(None)
+            }
+        }
+    }
+
+    /// At the end of a check: the line ends, or a `{` opens a block.
+    fn at_check_end(&mut self) -> bool {
+        if self.at_line_end() {
+            return true;
+        }
+        let save = self.pos;
+        self.bump();
+        let block = self.src[save..].starts_with('{') && self.at_line_end();
+        self.pos = save;
+        block
+    }
+
+    /// `include "x" if <check>`
     fn optional_guard(&mut self) -> Result<Option<Guard>> {
         self.skip_inline_ws();
         let save = self.pos;
         match self.word("").ok().as_deref() {
             Some(keyword @ ("if" | "unless")) => {
-                let command = self.rest_of_line();
-                if command.is_empty() {
-                    return Err(self.error(format!("'{keyword}' needs a command")));
+                let start = self.pos;
+                let (check, opens_block) = self.check(keyword)?;
+                if opens_block {
+                    return Err(self.error_at(start, "an include can't open a block"));
                 }
+                // `check` read the end of the line, which the caller reads again.
+                self.pos = self.src[..self.pos].trim_end_matches(['\n', '\r']).len();
                 Ok(Some(if keyword == "if" {
-                    Guard::If(command)
+                    Guard::If(check)
                 } else {
-                    Guard::Unless(command)
+                    Guard::Unless(check)
                 }))
             }
             _ => {
@@ -435,6 +554,46 @@ impl<'s> Parser<'s> {
                 Ok(None)
             }
         }
+    }
+
+    /// `wait ["message"] [timeout <seconds>] until <check>`
+    fn wait_step(&mut self) -> Result<WaitStep> {
+        let mut wait = WaitStep {
+            message: None,
+            timeout: None,
+            check: Check::shell(""),
+        };
+        loop {
+            self.skip_inline_ws();
+            if matches!(self.peek(), Some('"' | '\'')) && wait.message.is_none() {
+                wait.message = Some(self.string()?);
+                continue;
+            }
+            let at = self.pos;
+            match self.word("'until', 'timeout' or a message")?.as_str() {
+                "timeout" if wait.timeout.is_none() => {
+                    let at = self.pos;
+                    let seconds = self.word("a number of seconds")?;
+                    wait.timeout = Some(seconds.parse().map_err(|_| {
+                        self.error_at(at, format!("'{seconds}' isn't a number of seconds"))
+                    })?);
+                }
+                "until" => break,
+                other => {
+                    return Err(self.error_at(
+                        at,
+                        format!("unexpected '{other}', expected `wait [\"message\"] [timeout <seconds>] until <check>`"),
+                    ));
+                }
+            }
+        }
+        let at = self.pos;
+        let (check, opens_block) = self.check("until")?;
+        if opens_block {
+            return Err(self.error_at(at, "`wait` doesn't open a block"));
+        }
+        wait.check = check;
+        Ok(wait)
     }
 
     /// An optional `plugin NAME` after an `age-key` path.
@@ -1366,6 +1525,7 @@ fn is_keyword(word: &str) -> bool {
             | "directory"
             | "line"
             | "setting"
+            | "wait"
             | "else"
     )
 }
@@ -1444,11 +1604,38 @@ pub fn string_literal(text: &str) -> Result<String> {
 
 pub fn guard_passes(guard: &Guard, scope: &Scope, cwd: &Path) -> Result<bool> {
     match guard {
-        Guard::If(command) => scope.ctx.check(&scope.expand(command)?, cwd),
-        Guard::Unless(command) => Ok(!scope.ctx.check(&scope.expand(command)?, cwd)?),
+        Guard::If(check) => check_passes(check, scope, cwd),
+        Guard::Unless(check) => Ok(!check_passes(check, scope, cwd)?),
         Guard::Ask(prompt) => crate::exec::ask(&scope.expand(prompt)?),
         // Only a task run knows; see `TaskRun::nested`.
         Guard::Changed => bail!("`changed` is only checked inside a task"),
+    }
+}
+
+/// Whether a check passes, on the machine being configured, with relative
+/// paths and commands from `cwd`.
+pub fn check_passes(check: &Check, scope: &Scope, cwd: &Path) -> Result<bool> {
+    let ctx = scope.ctx;
+    match &check.kind {
+        CheckKind::Shell => ctx.check(&scope.expand(&check.text)?, cwd),
+        CheckKind::Exists(path) => {
+            let path = PathBuf::from(ctx.target_path(&scope.expand(path)?));
+            let path = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            };
+            crate::exec::target::exists(ctx, "", &path, false)
+        }
+        CheckKind::Which(name) => ctx.which(&scope.expand(name)?, cwd),
+        CheckKind::Output {
+            command,
+            compare,
+            value,
+        } => {
+            let output = ctx.stdout(&scope.expand(command)?, cwd)?;
+            Ok(compare.matches(&output, &scope.expand(value)?))
+        }
     }
 }
 
@@ -1684,7 +1871,7 @@ mod tests {
         let Step::Block(block) = &steps[0] else {
             panic!()
         };
-        assert!(matches!(&block.guards[0], Guard::Unless(c) if c == "test -e x"));
+        assert!(matches!(&block.guards[0], Guard::Unless(c) if c.text == "test -e x"));
         assert_eq!(block.steps.len(), 2);
         assert!(matches!(&steps[1], Step::Block(b) if matches!(&b.guards[0], Guard::Ask(_))));
         let Step::File(x) = &steps[2] else { panic!() };
@@ -1714,7 +1901,7 @@ mod tests {
         let Step::Block(block) = &steps[0] else {
             panic!("{steps:?}")
         };
-        assert!(matches!(&block.guards[0], Guard::Unless(c) if c == "test -e x"));
+        assert!(matches!(&block.guards[0], Guard::Unless(c) if c.text == "test -e x"));
         assert!(
             matches!(&block.steps[0], Step::Call { args, .. } if args == "a \"b # c\""),
             "{:?}",
@@ -1722,7 +1909,7 @@ mod tests {
         );
         // A `{` inside quotes doesn't open a block.
         let guards = &file.tasks["t"].body.guards;
-        assert!(matches!(&guards[..], [Guard::If(c)] if c == "grep -q 'a { #b' f"));
+        assert!(matches!(&guards[..], [Guard::If(c)] if c.text == "grep -q 'a { #b' f"));
         assert_eq!(strip_comment(r"echo a\ #b # c"), r"echo a\ #b ");
     }
 
@@ -1800,5 +1987,147 @@ mod tests {
         let file = parse_file(&dir.path().join("main.task")).unwrap();
         assert!(file.tasks.contains_key("a"));
         assert!(!file.tasks.contains_key("b"));
+
+        std::fs::write(
+            dir.path().join("main.task"),
+            "include \"sub/a.task\" if exists \"sub/b.task\" # why\n\
+             include \"sub/b.task\" unless $(echo x) == \"x\"\n",
+        )
+        .unwrap();
+        let file = parse_file(&dir.path().join("main.task")).unwrap();
+        assert!(file.tasks.contains_key("a"));
+        assert!(!file.tasks.contains_key("b"));
+    }
+
+    /// The guards of the first block in task `t`.
+    fn block_checks(source: &str) -> Vec<Check> {
+        let file = parse(source);
+        let mut checks = Vec::new();
+        for step in &file.tasks["t"].body.steps {
+            if let Step::Block(block) = step {
+                for guard in &block.guards {
+                    if let Guard::If(check) | Guard::Unless(check) = guard {
+                        checks.push(check.clone());
+                    }
+                }
+            }
+        }
+        checks
+    }
+
+    #[test]
+    fn parses_builtin_checks() {
+        let checks = block_checks(
+            r#"task t {
+                if exists "~/x" {
+                }
+                unless which tool { # why
+                }
+                if which "two words" {
+                }
+                if $(echo "a)" | wc -l) == "1" {
+                }
+                unless $(a \
+                    b) has-line 'x' {
+                }
+                if $(x) != "" {
+                }
+                if exists x {
+                }
+                if exists "x" y {
+                }
+                if which a b {
+                }
+                if $(cmd) {
+                }
+                if $(cmd) args {
+                }
+            }"#,
+        );
+        let kinds: Vec<&CheckKind> = checks.iter().map(|c| &c.kind).collect();
+        assert_eq!(kinds[0], &CheckKind::Exists("~/x".into()));
+        assert_eq!(kinds[1], &CheckKind::Which("tool".into()));
+        assert_eq!(kinds[2], &CheckKind::Which("two words".into()));
+        let output = |command: &str, compare, value: &str| CheckKind::Output {
+            command: command.into(),
+            compare,
+            value: value.into(),
+        };
+        assert_eq!(
+            kinds[3],
+            &output("echo \"a)\" | wc -l", Compare::Equals, "1")
+        );
+        let CheckKind::Output { command, .. } = kinds[4] else {
+            panic!("{:?}", kinds[4]);
+        };
+        assert_eq!(command.split_whitespace().collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(checks[4].text, "$(a b) has-line 'x'");
+        assert_eq!(kinds[5], &output("x", Compare::NotEquals, ""));
+        // Anything else is shell.
+        for (check, text) in checks[6..].iter().zip([
+            "exists x",
+            "exists \"x\" y",
+            "which a b",
+            "$(cmd)",
+            "$(cmd) args",
+        ]) {
+            assert_eq!(check.kind, CheckKind::Shell, "{text}");
+            assert_eq!(check.text, text);
+        }
+        assert_eq!(kinds.len(), 11);
+    }
+
+    #[test]
+    fn builtin_check_errors() {
+        let err = parse_err("task t {\n if $(x) = \"y\"\n}\n");
+        assert!(err.contains("2:10: compare with '=='"), "{err}");
+        let err = parse_err("task t {\n if $(x) == y\n}\n");
+        assert!(err.contains("expected a string to compare with"), "{err}");
+        let err = parse_err("task t {\n if $(x) == \"y\" z\n}\n");
+        assert!(err.contains("expected the end of the check"), "{err}");
+        let err = parse_err("task t {\n if $(x == \"y\"\n}\n");
+        assert!(err.contains("missing ')'"), "{err}");
+    }
+
+    #[test]
+    fn parses_waits() {
+        let file = parse(
+            "task t {\n wait \"for {{ x }}\" timeout 30 until exists \"/run/a\"\n wait until test -e b\n}\n",
+        );
+        let steps = &file.tasks["t"].body.steps;
+        let [Step::Wait(a), Step::Wait(b)] = &steps[..] else {
+            panic!("{steps:?}");
+        };
+        assert_eq!(a.message.as_deref(), Some("for {{ x }}"));
+        assert_eq!(a.timeout, Some(30));
+        assert_eq!(a.check.kind, CheckKind::Exists("/run/a".into()));
+        assert_eq!(a.label(), "wait: for {{ x }}");
+        assert_eq!(b.check.kind, CheckKind::Shell);
+        assert_eq!(b.label(), "wait until test -e b");
+
+        let err = parse_err("task t {\n wait \"x\"\n}\n");
+        assert!(err.contains("expected 'until'"), "{err}");
+        let err = parse_err("task t {\n wait timeout soon until true\n}\n");
+        assert!(err.contains("isn't a number of seconds"), "{err}");
+        let err = parse_err("task t {\n wait until true {\n }\n}\n");
+        assert!(err.contains("doesn't open a block"), "{err}");
+        let err = parse_err("task t {\n wait until\n}\n");
+        assert!(err.contains("'until' needs a check"), "{err}");
+        let err = parse_err("template wait {\n run true\n}\n");
+        assert!(err.contains("'wait' is a keyword"), "{err}");
+    }
+
+    #[test]
+    fn workdir_in_templates_and_blocks() {
+        let file = parse(
+            "template t {\n workdir \"a\"\n run true\n}\ntask x {\n if true {\n  workdir \"{{ tmp }}\"\n }\n}\n",
+        );
+        assert_eq!(file.templates["t"].body.workdir.as_deref(), Some("a"));
+        let Step::Block(block) = &file.tasks["x"].body.steps[0] else {
+            panic!();
+        };
+        assert_eq!(block.workdir.as_deref(), Some("{{ tmp }}"));
+        let err = parse_err("task x {\n workdir \"a\"\n workdir \"b\"\n}\n");
+        assert!(err.contains("'workdir' is given twice"), "{err}");
     }
 }
