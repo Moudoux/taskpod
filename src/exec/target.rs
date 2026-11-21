@@ -1013,6 +1013,28 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    /// Whether the stat command's details can be `local`'s. Not every stat
+    /// gives exact nanoseconds: Ubuntu 26.04's (uutils) was seen a tenth of a
+    /// microsecond off, with creation times in whole seconds. The journal only
+    /// keeps these times, and undo sets the modification time back, so that
+    /// much is harmless.
+    fn stat_matches(script: &super::Details, local: &super::Details) -> bool {
+        fn time(script: Option<i64>, local: Option<i64>) -> bool {
+            match (script, local) {
+                (Some(s), Some(l)) => {
+                    (s - l).abs() < 1_000
+                        || (s % 1_000_000_000 == 0 && s == l - l.rem_euclid(1_000_000_000))
+                }
+                (s, l) => s == l,
+            }
+        }
+        (script.dir, script.size, script.uid, script.gid)
+            == (local.dir, local.size, local.uid, local.gid)
+            && time(script.mtime, local.mtime)
+            && time(script.ctime, local.ctime)
+            && time(script.btime, local.btime)
+    }
+
     #[test]
     fn local_details_match_the_stat_command() {
         let dir = tempfile::tempdir().unwrap();
@@ -1027,8 +1049,38 @@ mod tests {
             let text = String::from_utf8(output.stdout).unwrap();
             let script = super::parse_details(&text).unwrap();
             let local = super::details_local(path).unwrap();
-            assert_eq!(script, local, "{text}");
+            assert!(
+                stat_matches(&script, &local),
+                "{text}\n{script:?}\n{local:?}"
+            );
         }
+        // Ubuntu 26.04's stat (uutils): the fraction off by about 0.1 µs, and
+        // the creation time in whole seconds.
+        let uutils = super::parse_details(
+            "f 7 1001 1001 1795287538.977342600 1795287538.977342600 1795287538",
+        )
+        .unwrap();
+        let exact = super::Details {
+            dir: false,
+            size: 7,
+            uid: 1001,
+            gid: 1001,
+            mtime: Some(1_795_287_538_977_342_713),
+            ctime: Some(1_795_287_538_977_342_713),
+            btime: Some(1_795_287_538_977_342_713),
+        };
+        assert!(stat_matches(&uutils, &exact));
+        // A second off, or a time missing, is still a mismatch.
+        let later = super::Details {
+            mtime: Some(1_795_287_539_977_342_713),
+            ..exact.clone()
+        };
+        assert!(!stat_matches(&uutils, &later));
+        let unknown = super::Details {
+            btime: None,
+            ..exact.clone()
+        };
+        assert!(!stat_matches(&uutils, &unknown));
         assert_eq!(super::parse_time("12.5"), Some(12_500_000_000));
         assert_eq!(super::parse_time("0"), None);
         assert_eq!(super::parse_time("-"), None);

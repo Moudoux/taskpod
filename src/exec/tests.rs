@@ -22,6 +22,17 @@ fn run(source: &str, dir: &Path, opts: &Options, targets: &[&str]) -> HashMap<St
     Runner::new(&file, opts).run(&order).into_iter().collect()
 }
 
+/// Sets a file's modification time, as `touch -d @<seconds>` would on GNU
+/// (BSD's `touch` doesn't take that).
+fn set_modified(path: &Path, secs: u64, nanos: u32) {
+    let time = std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_modified(time))
+        .unwrap();
+}
+
 fn read(dir: &Path, name: &str) -> String {
     std::fs::read_to_string(dir.join(name)).unwrap_or_default()
 }
@@ -620,12 +631,7 @@ fn root_journal_needs_root_and_undo_puts_times_back() {
     );
     let conf = home.join("conf.txt");
     std::fs::write(&conf, "old\n").unwrap();
-    let touched = std::process::Command::new("touch")
-        .args(["-m", "-d", "@1600000000.5"])
-        .arg(&conf)
-        .status()
-        .unwrap();
-    assert!(touched.success());
+    set_modified(&conf, 1_600_000_000, 500_000_000);
     let source = "task t {\n file \"~/conf.txt\" sudo \"new\\n\"\n}\n";
     let (outcome, _) = remote_labels(source, dir.path(), &remote, &options(1));
     assert_eq!(outcome, Outcome::Ran);
@@ -1160,12 +1166,7 @@ fn undo_puts_files_back() {
     let path = |n: &str| dir.path().join(n);
     std::fs::write(path("existing"), "before\n").unwrap();
     std::fs::set_permissions(path("existing"), std::fs::Permissions::from_mode(0o600)).unwrap();
-    let touched = std::process::Command::new("touch")
-        .args(["-m", "-d", "@1600000000.25"])
-        .arg(path("existing"))
-        .status()
-        .unwrap();
-    assert!(touched.success());
+    set_modified(&path("existing"), 1_600_000_000, 250_000_000);
     std::fs::write(path("unrecorded"), "theirs\n").unwrap();
     std::fs::write(path("kept"), "mine\n").unwrap();
     let source = r#"
