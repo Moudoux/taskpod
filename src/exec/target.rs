@@ -436,8 +436,10 @@ pub fn set_mtime(ctx: &Ctx, task: &str, path: &Path, mtime: i64, sudo: bool) -> 
     if sudo {
         sudo::ensure(task, ctx)?;
     }
-    // GNU and busybox `touch` take `@seconds`, BSD's a date.
+    // GNU and busybox `touch` take `@seconds`. BSD's takes a date: with `-d`
+    // it keeps the fraction (macOS, FreeBSD), with `-t` only whole seconds.
     let script = r#"touch -m -d "@$2" -- "$1" 2>/dev/null ||
+  touch -m -d "$(date -u -r "${2%.*}" +%Y-%m-%dT%H:%M:%S).${2#*.}Z" -- "$1" 2>/dev/null ||
   touch -m -t "$(date -r "${2%.*}" +%Y%m%d%H%M.%S)" -- "$1""#;
     let secs = mtime.div_euclid(1_000_000_000);
     let nanos = mtime.rem_euclid(1_000_000_000);
