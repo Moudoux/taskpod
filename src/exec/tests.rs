@@ -482,10 +482,14 @@ fn root_only_files_are_read_as_root() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let (remote, home) = fake_remote(dir.path());
-    // A fake sudo that can read what the user can't, by lending them read access.
+    // A fake sudo that can read what the user can't, by lending them read
+    // access for the command.
     crate::test_util::write_script(
         &dir.path().join("bin/sudo"),
-        "#!/bin/sh\n[ \"$1\" = -n ] && shift\nif [ \"$1\" = cat ]; then chmod u+r \"$3\"; cat -- \"$3\"; s=$?; chmod u-r \"$3\"; exit $s; fi\nexec \"$@\"\n",
+        &format!(
+            "#!/bin/sh\n[ \"$1\" = -n ] && shift\nf='{}'\n[ -e \"$f\" ] && chmod u+r \"$f\"\n\"$@\"\ns=$?\n[ -e \"$f\" ] && chmod u-r \"$f\"\nexit $s\n",
+            home.join("secret").display()
+        ),
     );
     let source = "task t {\n file \"~/secret\" sudo mode 200 \"x\\n\"\n}\n";
     let outcomes = run_remote(source, dir.path(), &remote, &options(1));
@@ -498,6 +502,104 @@ fn root_only_files_are_read_as_root() {
     // Unreadable as the user, it's still seen to be up to date.
     let outcomes = run_remote(source, dir.path(), &remote, &options(1));
     assert_eq!(outcomes["t"], Outcome::UpToDate, "{outcomes:?}");
+}
+
+/// The labels of a task's steps, after running `source` on the fake remote.
+#[cfg(unix)]
+fn remote_labels(
+    source: &str,
+    dir: &Path,
+    remote: &std::sync::Arc<crate::remote::Remote>,
+    opts: &Options,
+) -> (Outcome, Vec<String>) {
+    let mut file = parse_str(source, dir).unwrap_or_else(|e| panic!("{e:#}"));
+    file.ctx.remote = Some(remote.clone());
+    let order = if opts.undo {
+        select_undo(&file, &[]).unwrap()
+    } else {
+        select(&file, &[]).unwrap()
+    };
+    let runner = Runner::new(&file, opts);
+    let outcome = runner.run(&order).remove(0).1;
+    let labels = runner.reports.lock().unwrap()["t"]
+        .steps
+        .iter()
+        .map(|s| s.label.clone())
+        .collect();
+    (outcome, labels)
+}
+
+#[cfg(unix)]
+#[test]
+fn files_in_directories_only_root_can_enter_are_read_as_root() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (remote, home) = fake_remote(dir.path());
+    // Like /var/lib/plasmalogin (mode 750, another user's): the user can't
+    // even stat what's in it.
+    let locked = home.join("locked");
+    std::fs::create_dir_all(locked.join("data")).unwrap();
+    std::fs::write(locked.join("layout.json"), "old\n").unwrap();
+    std::fs::set_permissions(locked.join("data"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // A fake sudo that can enter it, by opening it for the command.
+    crate::test_util::write_script(
+        &dir.path().join("bin/sudo"),
+        &format!(
+            "#!/bin/sh\n[ \"$1\" = -n ] && shift\nchmod 700 '{l}'\n\"$@\"\ns=$?\nchmod 000 '{l}'\nexit $s\n",
+            l = locked.display()
+        ),
+    );
+    let source = r#"
+        task t {
+            file "~/locked/layout.json" sudo "new\n"
+            directory "~/locked/data" sudo mode 750
+            file "~/locked/missing.json" sudo "x\n"
+        }
+    "#;
+    let mut diff = options(1);
+    diff.mode = Mode::Diff;
+    // A check doesn't use sudo: it can't tell what's there, but never
+    // takes it for a new file.
+    let (outcome, labels) = remote_labels(source, dir.path(), &remote, &diff);
+    assert_eq!(outcome, Outcome::Ran);
+    assert!(
+        labels[0].ends_with("· can't read the current file"),
+        "{labels:?}"
+    );
+    assert!(
+        labels[1].ends_with("· can't see the current directory"),
+        "{labels:?}"
+    );
+    assert!(
+        labels[2].ends_with("· can't read the current file"),
+        "{labels:?}"
+    );
+
+    // Running, it reads, stats and journals them as root.
+    let (outcome, labels) = remote_labels(source, dir.path(), &remote, &options(1));
+    assert_eq!(outcome, Outcome::Ran, "{labels:?}");
+    assert!(labels[0].ends_with("layout.json · content"), "{labels:?}");
+    assert!(labels[1].ends_with("· mode 700 → 750"), "{labels:?}");
+    assert!(labels[2].ends_with("missing.json · new file"), "{labels:?}");
+    let (outcome, labels) = remote_labels(source, dir.path(), &remote, &options(1));
+    assert_eq!(outcome, Outcome::UpToDate, "{labels:?}");
+
+    // The journal has what was there: undo puts it back, and deletes only
+    // the file that was new.
+    let mut undo = options(1);
+    undo.undo = true;
+    undo.yes = true;
+    let (outcome, labels) = remote_labels(source, dir.path(), &remote, &undo);
+    assert_eq!(outcome, Outcome::Ran, "{labels:?}");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(read(&locked, "layout.json"), "old\n");
+    assert!(!locked.join("missing.json").exists());
+    let mode = std::fs::metadata(locked.join("data"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700);
 }
 
 #[cfg(unix)]

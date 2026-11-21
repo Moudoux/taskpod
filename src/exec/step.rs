@@ -665,15 +665,18 @@ impl<'r> TaskRun<'r> {
             Some(current) => current,
             None => target::read(ctx, &self.task.name, &path, as_root)?,
         };
+        // Unreadable, or not even seen (in a directory only root can
+        // enter): there may be a file, so it's never taken for a new one.
+        let missing = current == Current::Missing;
         let existing = match current {
             Current::Content(bytes) => Some(bytes),
             Current::Missing | Current::Unreadable => None,
         };
         let mut differences = Vec::new();
-        let stat = target::stat(ctx, &path);
+        let stat = target::stat(ctx, &self.task.name, &path, as_root)?;
         if existing.as_deref() != Some(&content) {
             differences.push(match &existing {
-                None if stat.is_some() => "can't read the current file".to_string(),
+                None if stat.is_some() || !missing => "can't read the current file".to_string(),
                 None => "new file".to_string(),
                 Some(old) if file.raw => content_difference(old, &content, None),
                 Some(old) => content_difference(old, &content, Some(file.encoding)),
@@ -710,7 +713,7 @@ impl<'r> TaskRun<'r> {
                 Ok(())
             }
             Mode::Run => {
-                self.remember(file, &path, existing, stat, owner.is_some())?;
+                self.remember(file, &path, existing, missing, stat, owner.is_some())?;
                 target::write(
                     ctx,
                     &self.task.name,
@@ -783,9 +786,13 @@ impl<'r> TaskRun<'r> {
         if state == DirState::NotDir {
             bail!("{} exists and isn't a directory", path.display());
         }
-        let stat = target::stat(ctx, &path).filter(|_| state != DirState::Missing);
+        let as_root = self.mode() == Mode::Run && root;
+        let stat = target::stat(ctx, &task, &path, as_root)?.filter(|_| state != DirState::Missing);
+        // Not seen, in a directory only root can enter: it may be there.
+        let unseen = stat.is_none() && state == DirState::Unlistable;
         let mut differences = Vec::new();
         match &stat {
+            None if unseen => differences.push("can't see the current directory".to_string()),
             None => differences.push("new directory".to_string()),
             Some((current, current_owner)) => {
                 if *current != mode {
@@ -807,14 +814,17 @@ impl<'r> TaskRun<'r> {
             return Ok(());
         }
         let previous = match stat {
-            None => Previous::Missing,
-            Some((mode, owner)) => Previous::File {
+            None if unseen => None,
+            None => Some(Previous::Missing),
+            Some((mode, owner)) => Some(Previous::File {
                 content: Vec::new(),
                 mode,
                 owner,
-            },
+            }),
         };
-        journal::record(ctx, &task, &path, root, &previous)?;
+        if let Some(previous) = &previous {
+            journal::record(ctx, &task, &path, root, previous)?;
+        }
         target::make_dir(ctx, &task, &path, mode, owner.as_deref(), file.sudo)
             .with_context(|| format!("failed to make {}", path.display()))
     }
@@ -837,7 +847,7 @@ impl<'r> TaskRun<'r> {
             Entry::Unreadable => None,
             Entry::None if file.new => Some(Previous::Missing),
             Entry::None => {
-                if target::stat(ctx, path).is_none() {
+                if target::stat(ctx, &task, path, write && root)?.is_none() {
                     self.current(depth, &format!("{label} · not on the system"));
                 } else {
                     let text = format!(
@@ -911,7 +921,7 @@ impl<'r> TaskRun<'r> {
                 }
             },
             Some(Previous::File { mode, owner, .. }) => {
-                let current = target::stat(ctx, path);
+                let current = target::stat(ctx, &task, path, write && root)?;
                 if current
                     .as_ref()
                     .is_some_and(|(m, o)| *m == mode && (!root || *o == owner))
@@ -1247,9 +1257,11 @@ impl<'r> TaskRun<'r> {
         content: &str,
     ) -> Result<()> {
         let ctx = &self.runner.file.ctx;
-        let (mode, owner) = from
-            .and_then(|p| target::stat(ctx, p))
-            .ok_or_else(|| anyhow!("can't stat {}", path.display()))?;
+        let (mode, owner) = match from {
+            Some(p) => target::stat(ctx, &self.task.name, p, step.sudo)?,
+            None => None,
+        }
+        .ok_or_else(|| anyhow!("can't stat {}", path.display()))?;
         // Written as root, `install` would make root the owner.
         let owner = step.sudo.then_some(owner.as_str());
         target::write(
@@ -1407,6 +1419,7 @@ impl<'r> TaskRun<'r> {
         file: &FileStep,
         path: &Path,
         existing: Option<Vec<u8>>,
+        missing: bool,
         stat: Option<(u32, String)>,
         has_owner: bool,
     ) -> Result<()> {
@@ -1419,7 +1432,7 @@ impl<'r> TaskRun<'r> {
                 mode,
                 owner,
             },
-            (None, None) => Previous::Missing,
+            (None, None) if missing => Previous::Missing,
             // Not readable as the user: as root, if the step writes as root.
             (None, Some((mode, owner))) if root => match target::read(ctx, task, path, true)? {
                 Current::Content(content) => Previous::File {
@@ -1843,7 +1856,7 @@ impl<'r> TaskRun<'r> {
             Entry::Unreadable => None,
             Entry::None if file.new => Some(Previous::Missing),
             Entry::None => {
-                if target::stat(ctx, path).is_none() {
+                if target::stat(ctx, &task, path, write && root)?.is_none() {
                     self.current(depth, &format!("{label} · not on the system"));
                 } else {
                     let text = format!(
@@ -1854,11 +1867,14 @@ impl<'r> TaskRun<'r> {
                 return Ok(());
             }
         };
-        let current = match target::read(ctx, &task, path, write && root)? {
+        let current = target::read(ctx, &task, path, write && root)?;
+        // Not seen (in a directory only root can enter) isn't gone.
+        let missing = current == Current::Missing;
+        let current = match current {
             Current::Content(bytes) => Some(bytes),
             Current::Missing | Current::Unreadable => None,
         };
-        let stat = target::stat(ctx, path);
+        let stat = target::stat(ctx, &task, path, write && root)?;
         let forget = |runner: &Runner| -> Result<()> {
             if write && recorded {
                 journal::remove(&runner.file.ctx, &task, path, root)?;
@@ -1866,7 +1882,7 @@ impl<'r> TaskRun<'r> {
             Ok(())
         };
         match &previous {
-            Some(Previous::Missing) if stat.is_none() => {
+            Some(Previous::Missing) if missing && stat.is_none() => {
                 self.current(depth, &format!("{label} · already gone"));
                 return forget(self.runner);
             }
@@ -2030,7 +2046,7 @@ impl<'r> TaskRun<'r> {
                 ),
             }
         }
-        if let Some((current, current_owner)) = target::stat(ctx, path) {
+        if let Some((current, current_owner)) = target::stat(ctx, &self.task.name, path, as_root)? {
             if current != mode {
                 match &file.origin.mode {
                     Some(span) => edits.push(replace(file, span, &format!("{current:o}"))),

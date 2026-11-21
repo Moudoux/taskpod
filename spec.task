@@ -195,7 +195,11 @@ task setup {
     #   owner user:group   checked and set, writes with sudo
     #   encoding utf-16le  utf-8 (default), utf-8-bom, utf-16le, utf-16be, latin1 or ascii
     #   sudo               write as root, renaming a new file over the old one, so
-    #                      programs watching the directory never see it go missing
+    #                      programs watching the directory never see it go missing.
+    #                      Running, it also reads and checks the file as root when
+    #                      the user can't (in a directory only root can enter, like
+    #                      /var/lib/x of mode 750); -d and -D never use sudo, so
+    #                      they say they can't read it rather than call it new
     #   new                taskpod created it: --undo deletes it (see Undo below)
     #   keep               --undo leaves it as it is
     # Content is a string, a """ block, `from "path"` (relative to this file,

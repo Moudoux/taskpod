@@ -17,63 +17,96 @@ pub enum Current {
     Content(Vec<u8>),
 }
 
-/// Read a file. With `sudo`, a file the user can't read is read as root.
+/// Whether an error says there's nothing at the path: it, or a directory
+/// on the way to it, is missing. Anything else (permissions, like a
+/// directory on the way that the user can't enter) means there may be.
+fn gone(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
+}
+
+/// A shell function for a path the scripts below didn't find: `absent "$1"`
+/// returns 2 when nothing is there, or 3 when a directory on the way can't
+/// be searched (`/var/lib/x` of mode 750), so there may be. It looks for the
+/// nearest directory above it that can be seen.
+macro_rules! absent {
+    () => {
+        r#"absent() {
+  p=$1
+  while d=$(dirname -- "$p"); do
+    if [ -d "$d" ]; then
+      if [ -x "$d" ]; then return 2; fi
+      return 3
+    fi
+    if [ "$d" = "$p" ]; then return 2; fi
+    p=$d
+  done
+  return 2
+}
+"#
+    };
+}
+
+/// Prints `$1`, or exits with 2 if there's nothing there, 3 if it can't be read.
+const READ: &str = concat!(
+    absent!(),
+    r#"if [ -f "$1" ]; then cat -- "$1" 2>/dev/null || exit 3
+elif [ -e "$1" ] || [ -L "$1" ]; then exit 3
+else absent "$1"; fi"#
+);
+
+/// Read a file. With `sudo`, a file the user can't read, or can't see (in
+/// a directory only root can enter), is read as root.
 pub fn read(ctx: &Ctx, task: &str, path: &Path, sudo: bool) -> Result<Current> {
     let current = match &ctx.remote {
-        Some(remote) => read_remote(remote, path, false)?,
+        Some(_) => read_script(ctx, path, false)?,
         None => match std::fs::read(path) {
             Ok(bytes) => Current::Content(bytes),
-            Err(_) if path.exists() => Current::Unreadable,
-            Err(_) => Current::Missing,
+            Err(e) if gone(&e) => Current::Missing,
+            Err(_) => Current::Unreadable,
         },
     };
     if current != Current::Unreadable || !sudo || path.is_dir() && ctx.remote.is_none() {
         return Ok(current);
     }
     sudo::ensure(task, ctx)?;
-    match &ctx.remote {
-        Some(remote) => read_remote(remote, path, true),
-        None => {
-            let output = crate::tty::output(
-                std::process::Command::new("sudo")
-                    .arg("cat")
-                    .arg("--")
-                    .arg(path),
-            )
-            .context("failed to run sudo")?;
-            Ok(if output.status.success() {
-                Current::Content(output.stdout)
-            } else {
-                Current::Unreadable
-            })
-        }
-    }
+    read_script(ctx, path, true)
 }
 
-fn read_remote(remote: &Remote, path: &Path, sudo: bool) -> Result<Current> {
-    let p = quote(&path.to_string_lossy());
-    let cat = if sudo { "sudo cat" } else { "cat" };
-    let script = format!(
-        "if [ -f {p} ]; then {cat} -- {p} 2>/dev/null || exit 3; \
-         elif [ -e {p} ] || [ -L {p} ]; then exit 3; else exit 2; fi"
-    );
-    let output = remote.output(&script, &[])?;
+/// [`READ`] on the machine being configured, as root with `sudo`.
+fn read_script(ctx: &Ctx, path: &Path, sudo: bool) -> Result<Current> {
+    let output = script_output(ctx, READ, &[arg(path)], sudo)?;
     Ok(match output.status.code() {
         Some(0) => Current::Content(output.stdout),
         Some(2) => Current::Missing,
         Some(3) => Current::Unreadable,
         _ => bail!(
-            "couldn't read {} on {}: {}",
+            "couldn't read {}{}: {}",
             path.display(),
-            remote.host,
+            match &ctx.remote {
+                Some(remote) => format!(" on {}", remote.host),
+                None => String::new(),
+            },
             String::from_utf8_lossy(&output.stderr).trim()
         ),
     })
 }
 
+/// Lists the files right in each directory after `$1` (relative to it),
+/// through symlinks. Exits with 1 when it can't, and with nothing when
+/// there's no directory `$1`.
+const LIST: &str = concat!(
+    absent!(),
+    r#"if [ ! -d "$1" ]; then absent "$1"; [ $? = 2 ] && exit 0; exit 1; fi
+cd -- "$1" && shift
+for d; do
+  if [ -d "$d" ]; then find -L "$d" -mindepth 1 -maxdepth 1 -type f || exit 1; fi
+done"#
+);
+
 /// The files under a directory (through symlinks), as paths relative to it
 /// joined with `/`, sorted; empty if there's no directory. With `sudo`, a
-/// directory the user can't list is listed as root.
+/// directory the user can't list (or see) is listed as root.
 pub fn list(
     ctx: &Ctx,
     task: &str,
@@ -83,36 +116,13 @@ pub fn list(
 ) -> Result<Vec<String>> {
     // Only the files right in each subdirectory: not what's in others, like
     // an app's data next to its config.
-    let script = "[ -d \"$1\" ] || exit 0\ncd -- \"$1\" && shift\nfor d; do\n  if [ -d \"$d\" ]; then find -L \"$d\" -mindepth 1 -maxdepth 1 -type f || exit 1; fi\ndone";
-    let subdirs: Vec<&str> = subdirs
-        .iter()
-        .map(|d| if d.is_empty() { "." } else { d.as_str() })
-        .collect();
-    let run = |root: bool| -> Result<std::process::Output> {
-        let dir = arg(dir);
-        match &ctx.remote {
-            Some(remote) => {
-                let sh = if root { "sudo sh" } else { "sh" };
-                let mut script = format!("{sh} -c {} sh {}", quote(script), quote(&dir));
-                for d in &subdirs {
-                    script.push(' ');
-                    script.push_str(&quote(d));
-                }
-                remote.output(&script, &[])
-            }
-            None => {
-                let mut command = if root {
-                    let mut c = std::process::Command::new("sudo");
-                    c.arg("sh");
-                    c
-                } else {
-                    std::process::Command::new("sh")
-                };
-                command.args(["-c", script, "sh"]).arg(dir).args(&subdirs);
-                crate::tty::output(&mut command).context("failed to list files")
-            }
-        }
-    };
+    let mut args = vec![arg(dir)];
+    args.extend(
+        subdirs
+            .iter()
+            .map(|d| if d.is_empty() { "." } else { d.as_str() }.to_string()),
+    );
+    let run = |root: bool| script_output(ctx, LIST, &args, root).context("failed to list files");
     let mut output = run(false)?;
     if !output.status.success() && sudo {
         sudo::ensure(task, ctx)?;
@@ -132,11 +142,16 @@ pub fn list(
 
 /// Prints the octal mode and `user:group` of `$1`, with GNU (Linux, busybox)
 /// or BSD (macOS) `stat`. Through symlinks, since writes go through them too.
-const STAT: &str = r#"if stat -c %a / >/dev/null 2>&1; then
+/// Exits with 2 if there's nothing there, 3 if it can't be seen.
+const STAT: &str = concat!(
+    absent!(),
+    r#"if [ ! -e "$1" ]; then absent "$1"; exit; fi
+if stat -c %a / >/dev/null 2>&1; then
   stat -L -c '%a %U:%G' -- "$1"
 else
   stat -L -f '%Mp%Lp %Su:%Sg' -- "$1"
-fi"#;
+fi"#
+);
 
 /// Run as root: writes stdin to `$1` with mode `$2`, passing the remaining
 /// arguments (`-o user -g group`) to `install`, after creating parent
@@ -188,45 +203,65 @@ fn owner_args(owner: Option<&str>) -> Vec<String> {
     args
 }
 
-/// Permission bits and `user:group` of a file, if it exists.
-pub fn stat(ctx: &Ctx, path: &Path) -> Option<(u32, String)> {
-    let output = match &ctx.remote {
-        Some(remote) => {
-            let script = format!("set -- {}\n{STAT}", quote(&arg(path)));
-            remote.output(&script, &[]).ok()?
-        }
+/// What [`stat`] found.
+enum Stat {
+    Found((u32, String)),
+    Missing,
+    /// Not seen: in a directory the user can't enter.
+    Unseen,
+}
+
+/// Permission bits and `user:group` of a file, if it exists. With `sudo`,
+/// one the user can't see (in a directory only root can enter) is looked at
+/// as root.
+pub fn stat(ctx: &Ctx, task: &str, path: &Path, sudo: bool) -> Result<Option<(u32, String)>> {
+    let seen = match &ctx.remote {
         #[cfg(unix)]
-        None => return stat_local(path),
-        #[cfg(not(unix))]
-        None => {
-            if !path.exists() {
-                return None;
-            }
-            crate::tty::output(
-                std::process::Command::new("sh")
-                    .args(["-c", STAT, "sh"])
-                    .arg(arg(path)),
-            )
-            .ok()?
-        }
+        None => match stat_local(path) {
+            Ok(found) => Stat::Found(found),
+            Err(e) if gone(&e) => Stat::Missing,
+            Err(_) => Stat::Unseen,
+        },
+        _ => stat_script(ctx, path, false)?,
     };
-    if !output.status.success() {
-        return None;
+    Ok(match seen {
+        Stat::Found(found) => Some(found),
+        Stat::Unseen if sudo => {
+            sudo::ensure(task, ctx)?;
+            match stat_script(ctx, path, true)? {
+                Stat::Found(found) => Some(found),
+                _ => None,
+            }
+        }
+        Stat::Missing | Stat::Unseen => None,
+    })
+}
+
+/// [`STAT`] on the machine being configured, as root with `sudo`.
+fn stat_script(ctx: &Ctx, path: &Path, sudo: bool) -> Result<Stat> {
+    let output = script_output(ctx, STAT, &[arg(path)], sudo)?;
+    if output.status.code() == Some(3) {
+        return Ok(Stat::Unseen);
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let (mode, owner) = text.trim().split_once(' ')?;
-    Some((u32::from_str_radix(mode, 8).ok()?, owner.to_string()))
+    let found = output
+        .status
+        .success()
+        .then(|| text.trim().split_once(' '))
+        .flatten()
+        .and_then(|(mode, owner)| Some((u32::from_str_radix(mode, 8).ok()?, owner.to_string())));
+    Ok(found.map_or(Stat::Missing, Stat::Found))
 }
 
 /// [`stat`] on this machine, without starting `stat` for every file: the
 /// same permission bits and `user:group` (ids for unknown ones), through symlinks.
 #[cfg(unix)]
-fn stat_local(path: &Path) -> Option<(u32, String)> {
+fn stat_local(path: &Path) -> std::io::Result<(u32, String)> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path).ok()?;
+    let meta = std::fs::metadata(path)?;
     let user = id_name(meta.uid(), libc::getpwuid_r, |p| p.pw_name);
     let group = id_name(meta.gid(), libc::getgrgid_r, |g| g.gr_name);
-    Some((meta.mode() & 0o7777, format!("{user}:{group}")))
+    Ok((meta.mode() & 0o7777, format!("{user}:{group}")))
 }
 
 /// The name of a user or group id, with `getpwuid_r` or `getgrgid_r`; the
@@ -463,12 +498,18 @@ pub enum DirState {
     Unlistable,
 }
 
-/// `$1`'s state, through symlinks like `stat`.
-const DIR_STATE: &str = r#"if [ ! -e "$1" ]; then echo missing
+/// `$1`'s state, through symlinks like `stat`. One in a directory that
+/// can't be searched is unlistable.
+const DIR_STATE: &str = concat!(
+    absent!(),
+    r#"if [ ! -e "$1" ]; then
+  absent "$1"
+  if [ $? = 3 ]; then echo unlistable; else echo missing; fi
 elif [ ! -d "$1" ]; then echo not-dir
 elif [ ! -r "$1" ] || [ ! -x "$1" ]; then echo unlistable
 elif [ -n "$(ls -A -- "$1")" ]; then echo not-empty
-else echo empty; fi"#;
+else echo empty; fi"#
+);
 
 /// Run a script with arguments on the machine being configured, as root
 /// with `sudo`.
@@ -705,6 +746,78 @@ mod tests {
     }
 
     #[test]
+    fn files_the_user_cant_see_arent_missing() {
+        use super::{Current, DirState, READ};
+        use std::os::unix::fs::PermissionsExt;
+        // Root can enter any directory.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::vars::Ctx::new(dir.path().to_path_buf());
+        let locked = dir.path().join("locked");
+        std::fs::create_dir_all(locked.join("sub")).unwrap();
+        std::fs::write(locked.join("f"), "x").unwrap();
+        std::fs::write(dir.path().join("plain"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // The scripts remote machines (and root reads) use, and this machine's own reads.
+        let script = |p: &Path| {
+            let output = Command::new("sh")
+                .args(["-c", READ, "sh"])
+                .arg(p)
+                .output()
+                .unwrap();
+            match output.status.code() {
+                Some(0) => Current::Content(output.stdout),
+                Some(2) => Current::Missing,
+                Some(3) => Current::Unreadable,
+                code => panic!("{code:?}"),
+            }
+        };
+        let missing = [
+            dir.path().join("none"),
+            dir.path().join("no/such/dir/f"),
+            dir.path().join("plain/under-a-file"),
+        ];
+        for path in &missing {
+            assert_eq!(
+                super::read(&ctx, "t", path, false).unwrap(),
+                Current::Missing
+            );
+            assert_eq!(script(path), Current::Missing, "{}", path.display());
+            assert_eq!(super::stat(&ctx, "t", path, false).unwrap(), None);
+        }
+        for path in [
+            locked.join("f"),
+            locked.join("none"),
+            locked.join("sub/deeper/f"),
+        ] {
+            assert_eq!(
+                super::read(&ctx, "t", &path, false).unwrap(),
+                Current::Unreadable
+            );
+            assert_eq!(script(&path), Current::Unreadable, "{}", path.display());
+            assert!(super::stat_local(&path).is_err_and(|e| !super::gone(&e)));
+            assert_eq!(
+                super::dir_state(&ctx, "t", &path, false).unwrap(),
+                DirState::Unlistable
+            );
+            // Listing it needs root: it's not an empty listing.
+            assert!(super::list(&ctx, "t", &path, &[String::new()], false).is_err());
+        }
+        assert_eq!(
+            super::dir_state(&ctx, "t", &dir.path().join("none"), false).unwrap(),
+            DirState::Missing
+        );
+        assert!(
+            super::list(&ctx, "t", &dir.path().join("none"), &[String::new()], false)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
     fn local_stat_matches_the_stat_command() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -723,12 +836,12 @@ mod tests {
             let (mode, owner) = text.trim().split_once(' ').unwrap();
             let expected = (u32::from_str_radix(mode, 8).unwrap(), owner.to_string());
             assert_eq!(
-                super::stat_local(path),
+                super::stat_local(path).ok(),
                 Some(expected),
                 "{}",
                 path.display()
             );
         }
-        assert_eq!(super::stat_local(&dir.path().join("missing")), None);
+        assert!(super::stat_local(&dir.path().join("missing")).is_err());
     }
 }
