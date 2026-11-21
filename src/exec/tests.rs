@@ -11,6 +11,7 @@ fn options(jobs: usize) -> Options {
         pull: false,
         yes: false,
         undo: false,
+        root: false,
     }
 }
 
@@ -604,6 +605,83 @@ fn files_in_directories_only_root_can_enter_are_read_as_root() {
 
 #[cfg(unix)]
 #[test]
+fn root_journal_needs_root_and_undo_puts_times_back() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let (remote, home) = fake_remote(dir.path());
+    let db = dir.path().join(".taskpod-journal/root.db");
+    // A fake sudo that can read the root journal, by opening it for the command.
+    crate::test_util::write_script(
+        &dir.path().join("bin/sudo"),
+        &format!(
+            "#!/bin/sh\n[ \"$1\" = -n ] && shift\nchmod 600 '{db}' 2>/dev/null\n\"$@\"\ns=$?\nchmod 000 '{db}' 2>/dev/null\nexit $s\n",
+            db = db.display()
+        ),
+    );
+    let conf = home.join("conf.txt");
+    std::fs::write(&conf, "old\n").unwrap();
+    let touched = std::process::Command::new("touch")
+        .args(["-m", "-d", "@1600000000.5"])
+        .arg(&conf)
+        .status()
+        .unwrap();
+    assert!(touched.success());
+    let source = "task t {\n file \"~/conf.txt\" sudo \"new\\n\"\n}\n";
+    let (outcome, _) = remote_labels(source, dir.path(), &remote, &options(1));
+    assert_eq!(outcome, Outcome::Ran);
+    assert_eq!(read(&home, "conf.txt"), "new\n");
+    // Only the database, which only root can read.
+    let names: Vec<String> = std::fs::read_dir(db.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["root.db"]);
+    let mode = std::fs::metadata(&db).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o000);
+
+    let mut check = options(1);
+    check.mode = Mode::Diff;
+    check.undo = true;
+    // A check doesn't use sudo, so it can't tell what the journal has.
+    let (outcome, labels) = remote_labels(source, dir.path(), &remote, &check);
+    assert_eq!(outcome, Outcome::Ran);
+    assert!(labels[0].ends_with(UNREAD_JOURNAL_TEST), "{labels:?}");
+    // With --root it can.
+    check.root = true;
+    let (outcome, labels) = remote_labels(source, dir.path(), &remote, &check);
+    assert_eq!(outcome, Outcome::Ran);
+    assert!(
+        labels[0].ends_with("put back what was there before taskpod (mode 644)"),
+        "{labels:?}"
+    );
+    assert_eq!(read(&home, "conf.txt"), "new\n");
+
+    let mut undo = options(1);
+    undo.undo = true;
+    let (outcome, labels) = remote_labels(source, dir.path(), &remote, &undo);
+    assert_eq!(outcome, Outcome::Ran, "{labels:?}");
+    assert_eq!(read(&home, "conf.txt"), "old\n");
+    // Its modification time is back too.
+    let meta = std::fs::metadata(&conf).unwrap();
+    assert_eq!(
+        (meta.mtime(), meta.mtime_nsec()),
+        (1_600_000_000, 500_000_000)
+    );
+    // And it's gone from the journal.
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let journal = rusqlite::Connection::open(&db).unwrap();
+    let left: i64 = journal
+        .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
+/// The note on root journal entries a check couldn't read.
+#[cfg(unix)]
+const UNREAD_JOURNAL_TEST: &str = ", if the journal has it (--root reads it)";
+
+#[cfg(unix)]
+#[test]
 fn pulls_system_changes_back() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
@@ -1082,6 +1160,12 @@ fn undo_puts_files_back() {
     let path = |n: &str| dir.path().join(n);
     std::fs::write(path("existing"), "before\n").unwrap();
     std::fs::set_permissions(path("existing"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let touched = std::process::Command::new("touch")
+        .args(["-m", "-d", "@1600000000.25"])
+        .arg(path("existing"))
+        .status()
+        .unwrap();
+    assert!(touched.success());
     std::fs::write(path("unrecorded"), "theirs\n").unwrap();
     std::fs::write(path("kept"), "mine\n").unwrap();
     let source = r#"
@@ -1099,13 +1183,14 @@ fn undo_puts_files_back() {
     assert_eq!(read(dir.path(), "existing"), "managed\n");
     // As if these were written before the journal existed: `new` says
     // taskpod created it, and nothing is known about the other one.
-    for entry in std::fs::read_dir(path(".taskpod-journal/user")).unwrap() {
-        let entry = entry.unwrap().path();
-        let name = entry.file_name().unwrap().to_string_lossy().to_string();
-        if name.ends_with("unrecorded") || name.ends_with("marked") {
-            std::fs::remove_file(entry).unwrap();
-        }
-    }
+    let journal = rusqlite::Connection::open(path(".taskpod-journal/user.db")).unwrap();
+    journal
+        .execute(
+            "DELETE FROM files WHERE path LIKE '%/unrecorded' OR path LIKE '%/marked'",
+            [],
+        )
+        .unwrap();
+    drop(journal);
     let source = source.to_string();
 
     // A preview shows what would happen and changes nothing.
@@ -1148,20 +1233,29 @@ fn undo_puts_files_back() {
         Outcome::Ran
     );
     assert_eq!(read(dir.path(), "existing"), "before\n");
-    let mode = std::fs::metadata(path("existing"))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o600);
+    let meta = std::fs::metadata(path("existing")).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            (meta.mtime(), meta.mtime_nsec()),
+            (1_600_000_000, 250_000_000)
+        );
+    }
     assert!(!path("marked").exists());
     assert_eq!(read(dir.path(), "unrecorded"), "managed\n");
     assert_eq!(read(dir.path(), "kept"), "managed\n");
     // Undone files leave the journal (`kept` was never written: it stays
     // recorded); doing it again finds nothing to do.
-    let left: Vec<String> = std::fs::read_dir(path(".taskpod-journal/user"))
+    let journal = rusqlite::Connection::open(path(".taskpod-journal/user.db")).unwrap();
+    let left: Vec<String> = journal
+        .prepare("SELECT path FROM files")
         .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-        .collect();
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    drop(journal);
     assert!(left.iter().all(|n| n.ends_with("kept")), "{left:?}");
     assert_eq!(
         undo(&source, dir.path(), Mode::Run, &[])["files"],

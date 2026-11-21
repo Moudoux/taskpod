@@ -265,10 +265,13 @@ task setup {
 # and its subtasks, not what it needs; a task others still need isn't undone
 # unless they're in -r too. Dependents go first, subtasks before
 # their parent, and in a task the steps run last first:
-# - Files go back to what they were before taskpod first wrote them, from a
-#   journal on the machine (~/.local/state/taskpod, /var/lib/taskpod for root
-#   files). A file without a record is deleted if it says `new`, otherwise
-#   reported. One changed since taskpod wrote it is asked about (--yes: undone).
+# - Files go back to what they were before taskpod first wrote them (content,
+#   mode, owner and modification time), from a journal on the machine: SQLite
+#   databases at ~/.local/state/taskpod/journal.db, and
+#   /var/lib/taskpod/journal.db (root only) for what's written as root. A file
+#   without a record is deleted if it says `new`, otherwise reported. One
+#   changed since taskpod wrote it is asked about (--yes: undone). Checks read
+#   root's journal, and files only root can read, only with --root.
 # - Commands can't be undone by themselves: `undo` gives the command that
 #   does, like `run`, and runs where it stands. A block with commands but no
 #   `undo` is reported, unless it says `keep`: leave it as it is, or it's a

@@ -5,7 +5,7 @@
 # would be the project's own src/.
 
 pkgname=taskpod
-pkgver=0.18.1
+pkgver=0.19.0
 pkgrel=1
 pkgdesc="Declarative task runner: tasks declare dependencies and run in parallel"
 arch=(x86_64 aarch64)
@@ -19,6 +19,10 @@ optdepends=(
   'age: age-key, with the age plugin it names if any'
 )
 makedepends=(cargo)
+# makepkg's LTO adds -flto to CFLAGS, so the bundled SQLite would be compiled
+# to GCC LTO bytecode that Rust's linker can't read (undefined sqlite3_*
+# symbols). Cargo's own LTO (Cargo.toml) still applies.
+options=(!lto)
 
 _root="$startdir/../.."
 

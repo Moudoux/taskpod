@@ -79,6 +79,11 @@ pub struct Args {
     #[arg(short, long, conflicts_with = "pull")]
     pub undo: bool,
 
+    /// Let dry runs, diffs and pulls read as root, asking for sudo once: files only root
+    /// can read or see, and the undo journal of root's files. They still change nothing
+    #[arg(long, conflicts_with = "json")]
+    pub root: bool,
+
     /// Configure another machine over SSH (user@host or a Host from ~/.ssh/config).
     /// taskpod doesn't need to be installed there
     #[arg(short = 'H', long, value_name = "HOST")]
@@ -296,6 +301,7 @@ fn run(mut args: Args) -> Result<bool> {
         pull: args.pull,
         yes: args.yes,
         undo: args.undo,
+        root: args.root,
     };
     let order = if args.undo {
         taskpod::exec::select_undo(&file, &args.run)?

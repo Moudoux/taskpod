@@ -168,6 +168,8 @@ pub struct Ctx {
     pub remote: Option<Arc<crate::remote::Remote>>,
     /// Where `--undo`'s journal lives instead of the usual places, for tests.
     pub journal: Option<PathBuf>,
+    /// The journal's databases, read once per run and shared by every task.
+    pub journals: Arc<crate::exec::journal::Journal>,
 }
 
 /// A command ready to start, with what to write to its stdin.
@@ -202,6 +204,7 @@ impl Ctx {
             remote: None,
             // Tests never touch the real journal.
             journal: cfg!(test).then(|| dir.join(".taskpod-journal")),
+            journals: Default::default(),
             dir,
         }
     }

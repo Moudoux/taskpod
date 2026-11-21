@@ -49,6 +49,7 @@ taskpod FILE -v            # stream every command and its output
 taskpod FILE --plain       # no live display, output prefixed by task
 taskpod FILE -D --json     # the diff as JSON, for editors
 taskpod FILE -D --no-secrets  # don't decrypt: steps that need secrets show as not checked
+taskpod FILE -D --root     # let the diff read as root (asks for sudo once), still changing nothing
 ```
 
 Diffs and dry runs run the `if` and `unless` checks (which shouldn't change
@@ -59,7 +60,11 @@ differs instead: the encoding or byte order mark, line endings, or the final new
 on stdout, with plain text and secrets hidden, instead of the usual output;
 it never asks anything. `--no-secrets` keeps a check from decrypting secrets
 (no PIN or key touch): a step that needs one is reported as not checked, and
-so is a task whose `if`, `unless` or variables need one.
+so is a task whose `if`, `unless` or variables need one. Checks never use
+sudo on their own, so a `sudo` step's file that only root can read (or one in a
+directory only root can enter) shows as unreadable; `--root` asks for sudo once
+and reads those as root, along with root's undo journal. The `if` and
+`unless` checks still run as you, and nothing is written.
 
 While running, each task gets a live spinner showing its latest output above
 an overall progress bar; a failed task prints its last output. Questions
@@ -110,13 +115,24 @@ show what it would do. Tasks that need another go first, subtasks before their
 parent, and inside a task the steps run last first.
 
 - **Files** go back to what they were before taskpod first wrote them. Before
-  each first write, taskpod records the old content, mode and owner (or that
-  there was no file) in a journal on the machine it configures:
-  `~/.local/state/taskpod/journal`, and `/var/lib/taskpod/journal`, readable by
-  root only, for files written as root. Files written before the journal
-  existed have no record: mark the ones taskpod created `new` and undo deletes
-  them, otherwise undo reports them. A file changed since taskpod wrote it is
-  asked about (`--yes` undoes it anyway).
+  each first write, taskpod records the old file in a journal on the machine
+  it configures: its content (with its sha256 and size), mode, owner (names and
+  ids) and modification, change and creation times, or that there was no file.
+  Undo puts back the content, mode, owner and modification time; whether a file
+  is already as it was depends on its content, mode and owner, never its times.
+  Files written before the journal existed have no record: mark the ones
+  taskpod created `new` and undo deletes them, otherwise undo reports them. A
+  file changed since taskpod wrote it is asked about (`--yes` undoes it anyway).
+- **The journal** is two SQLite databases (SQLite is built into taskpod, nothing
+  needs installing): `~/.local/state/taskpod/journal.db` for what taskpod
+  changed as you, and `/var/lib/taskpod/journal.db`, mode 600 and owned by root,
+  for what it changed as root (`sudo` steps and ones with an `owner`), since old
+  root files may hold anything. Settings go in yours. taskpod reads a database
+  as a file (through sudo or SSH like any other), works on it in memory, and
+  writes the whole file back beside it and renames it over, so nothing else is
+  left on the machine. Two taskpod runs on the same machine at once can lose
+  each other's records. Without `--root`, a check can't read root's journal, so
+  it says what undo would do if the journal has a record.
 - **Commands** can't be undone by themselves. `undo` says how, like `run`:
 
   ```

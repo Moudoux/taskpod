@@ -29,10 +29,14 @@ idempotent. Its main use is setting up an Arch system from
   reactions (`Block::is_reaction`) run again after the file/line/setting steps before them.
   With `--pull` (`Options::pull`, combined with the Run/DryRun/Diff mode) file steps are compared the
   other way and queue edits on `Runner::edits`, which `main` applies at the end.
-- `src/exec/journal.rs`: `--undo`'s record of each file before taskpod first wrote it (and each `setting`'s
-  value, keyed by its `get` command), on the target
-  machine (`~/.local/state/taskpod`, root files in `/var/lib/taskpod`); `Ctx::journal` overrides the
-  place, and test builds always use the task file's directory. Undo itself (`undo_task`, `undo_block`,
+- `src/exec/journal.rs`: `--undo`'s record of each file before taskpod first wrote it (content and
+  everything `target::details` stats), lines, and each `setting`'s value, keyed by its `get` command.
+  Two SQLite databases (bundled `rusqlite`) on the target machine: `~/.local/state/taskpod/journal.db`,
+  and `/var/lib/taskpod/journal.db` (root only) for root writes. Each is read through `target::read`
+  once per run into an in-memory connection (`Ctx::journals`) and written back whole after each change
+  (`target::replace` for the user's, the root `INSTALL` for root's). `Ctx::journal` overrides the place
+  (`user.db`, `root.db`), and test builds always use the task file's directory. Checks read as root
+  only with `--root` (`Options::root`, `TaskRun::reads_as_root`). Undo itself (`undo_task`, `undo_block`,
   `undo_file`) is in `src/exec/step.rs`; `Runner::run` reverses dependencies when `Options::undo`.
 - `src/exec/graph.rs`: `--graph` (tree, dot, mermaid) of the tasks `select` picks, from the file alone.
 - `src/exec/sources.rs`: `--sources`, a tree of the files a task file reads, by the file naming them:

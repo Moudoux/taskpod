@@ -46,6 +46,9 @@ pub struct Options {
     /// Undo the tasks instead, in reverse order; `mode` says whether to do it
     /// (`Run`) or only show it.
     pub undo: bool,
+    /// Let checks read as root (asking for sudo once): files only root can
+    /// read or see, and the root undo journal. They still change nothing.
+    pub root: bool,
 }
 
 impl Options {

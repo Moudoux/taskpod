@@ -204,8 +204,8 @@ fn owner_args(owner: Option<&str>) -> Vec<String> {
 }
 
 /// What [`stat`] found.
-enum Stat {
-    Found((u32, String)),
+enum Stat<T = (u32, String)> {
+    Found(T),
     Missing,
     /// Not seen: in a directory the user can't enter.
     Unseen,
@@ -299,6 +299,202 @@ fn id_name<T>(
                 .into_owned();
         }
     }
+}
+
+/// Everything else `stat` knows about a file, for the undo journal.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Details {
+    pub dir: bool,
+    pub size: u64,
+    pub uid: u32,
+    pub gid: u32,
+    /// Nanoseconds since the epoch; `btime` (creation) isn't always known.
+    pub mtime: Option<i64>,
+    pub ctime: Option<i64>,
+    pub btime: Option<i64>,
+}
+
+/// Prints `d` or `f`, then the size, uid, gid and the modification, change
+/// and creation times (seconds, with a fraction where `stat` gives one) of
+/// `$1`, through symlinks, with GNU, busybox or BSD `stat`. Exits with 2 if
+/// there's nothing there, 3 if it can't be seen.
+const DETAILS: &str = concat!(
+    absent!(),
+    r#"if [ ! -e "$1" ]; then absent "$1"; exit; fi
+if [ -d "$1" ]; then printf 'd '; else printf 'f '; fi
+if stat -c %a / >/dev/null 2>&1; then
+  stat -L -c '%s %u %g %.9Y %.9Z %.9W' -- "$1" 2>/dev/null ||
+    stat -L -c '%s %u %g %Y %Z 0' -- "$1"
+else
+  stat -L -f '%z %u %g %Fm %Fc %FB' -- "$1"
+fi"#
+);
+
+/// `seconds[.fraction]` as nanoseconds; `None` for 0 or `-` (unknown).
+fn parse_time(text: &str) -> Option<i64> {
+    let (secs, frac) = text.split_once('.').unwrap_or((text, ""));
+    let secs: i64 = secs.parse().ok()?;
+    let digits: String = frac.chars().take(9).collect();
+    let nanos: i64 = if digits.is_empty() {
+        0
+    } else {
+        format!("{digits:0<9}").parse().ok()?
+    };
+    let time = secs.checked_mul(1_000_000_000)?.checked_add(nanos)?;
+    (time != 0).then_some(time)
+}
+
+fn parse_details(text: &str) -> Option<Details> {
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    let [kind, size, uid, gid, mtime, ctime, btime] = fields[..] else {
+        return None;
+    };
+    Some(Details {
+        dir: kind == "d",
+        size: size.parse().ok()?,
+        uid: uid.parse().ok()?,
+        gid: gid.parse().ok()?,
+        mtime: parse_time(mtime),
+        ctime: parse_time(ctime),
+        btime: parse_time(btime),
+    })
+}
+
+/// [`Details`] of a file, if it exists. With `sudo`, one the user can't see
+/// is looked at as root.
+pub fn details(ctx: &Ctx, task: &str, path: &Path, sudo: bool) -> Result<Option<Details>> {
+    let run = |root: bool| -> Result<Stat<Details>> {
+        let output = script_output(ctx, DETAILS, &[arg(path)], root)?;
+        if output.status.code() == Some(3) {
+            return Ok(Stat::Unseen);
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let found = output.status.success().then(|| parse_details(&text));
+        Ok(found.flatten().map_or(Stat::Missing, Stat::Found))
+    };
+    let seen = match &ctx.remote {
+        #[cfg(unix)]
+        None => match details_local(path) {
+            Ok(found) => Stat::Found(found),
+            Err(e) if gone(&e) => Stat::Missing,
+            Err(_) => Stat::Unseen,
+        },
+        _ => run(false)?,
+    };
+    Ok(match seen {
+        Stat::Found(found) => Some(found),
+        Stat::Unseen if sudo => {
+            sudo::ensure(task, ctx)?;
+            match run(true)? {
+                Stat::Found(found) => Some(found),
+                _ => None,
+            }
+        }
+        Stat::Missing | Stat::Unseen => None,
+    })
+}
+
+/// [`details`] on this machine, without starting `stat`.
+#[cfg(unix)]
+fn details_local(path: &Path) -> std::io::Result<Details> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)?;
+    let time = |secs: i64, nanos: i64| {
+        let time = secs.checked_mul(1_000_000_000)?.checked_add(nanos)?;
+        (time != 0).then_some(time)
+    };
+    let btime = meta.created().ok().and_then(|t| {
+        let since = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+        i64::try_from(since.as_nanos()).ok()
+    });
+    Ok(Details {
+        dir: meta.is_dir(),
+        size: meta.size(),
+        uid: meta.uid(),
+        gid: meta.gid(),
+        mtime: time(meta.mtime(), meta.mtime_nsec()),
+        ctime: time(meta.ctime(), meta.ctime_nsec()),
+        btime,
+    })
+}
+
+/// Set a file's modification time (nanoseconds since the epoch), as root with `sudo`.
+pub fn set_mtime(ctx: &Ctx, task: &str, path: &Path, mtime: i64, sudo: bool) -> Result<()> {
+    #[cfg(unix)]
+    if ctx.remote.is_none() && !sudo {
+        let time = std::time::UNIX_EPOCH
+            + std::time::Duration::new(
+                u64::try_from(mtime.div_euclid(1_000_000_000)).unwrap_or(0),
+                u32::try_from(mtime.rem_euclid(1_000_000_000)).unwrap_or(0),
+            );
+        return std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(time))
+            .with_context(|| format!("failed to set the modification time of {}", path.display()));
+    }
+    if sudo {
+        sudo::ensure(task, ctx)?;
+    }
+    // GNU and busybox `touch` take `@seconds`, BSD's a date.
+    let script = r#"touch -m -d "@$2" -- "$1" 2>/dev/null ||
+  touch -m -t "$(date -r "${2%.*}" +%Y%m%d%H%M.%S)" -- "$1""#;
+    let secs = mtime.div_euclid(1_000_000_000);
+    let nanos = mtime.rem_euclid(1_000_000_000);
+    let args = [arg(path), format!("{secs}.{nanos:09}")];
+    let output = script_output(ctx, script, &args, sudo)?;
+    if !output.status.success() {
+        bail!(
+            "setting the modification time of {} exited with {}: {}",
+            path.display(),
+            describe(output.status),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Replace a file the user owns with `content` and `mode`, never leaving it
+/// half written: it's written beside the file, then renamed over it.
+pub fn replace(ctx: &Ctx, path: &Path, content: &[u8], mode: u32) -> Result<()> {
+    if let Some(remote) = &ctx.remote {
+        let script = format!("sh -c {} sh {} {mode:o}", quote(INSTALL), quote(&arg(path)));
+        let output = remote.output(&script, content)?;
+        if !output.status.success() {
+            bail!(
+                "exited with {}: {}",
+                describe(output.status),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        return Ok(());
+    }
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp = parent.join(format!(".{name}.taskpod-{}", std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        options.open(&temp)?.write_all(content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))?;
+        }
+        std::fs::rename(&temp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    Ok(written?)
 }
 
 /// Whether there's something at `path`. With `sudo`, a path the user can't
@@ -815,6 +1011,27 @@ mod tests {
                 .is_empty()
         );
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn local_details_match_the_stat_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "content").unwrap();
+        for path in [file.as_path(), dir.path()] {
+            let output = Command::new("sh")
+                .args(["-c", super::DETAILS, "sh"])
+                .arg(path)
+                .output()
+                .unwrap();
+            let text = String::from_utf8(output.stdout).unwrap();
+            let script = super::parse_details(&text).unwrap();
+            let local = super::details_local(path).unwrap();
+            assert_eq!(script, local, "{text}");
+        }
+        assert_eq!(super::parse_time("12.5"), Some(12_500_000_000));
+        assert_eq!(super::parse_time("0"), None);
+        assert_eq!(super::parse_time("-"), None);
     }
 
     #[test]

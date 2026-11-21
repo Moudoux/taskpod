@@ -100,6 +100,12 @@ impl<'r> TaskRun<'r> {
         self.runner.opts.checking()
     }
 
+    /// Whether reads may go through sudo: when running for real, and in
+    /// checks with `--root`. Steps that don't write as root never need it.
+    fn reads_as_root(&self) -> bool {
+        self.mode() == Mode::Run || self.runner.opts.root
+    }
+
     pub fn run(&mut self) -> Result<Outcome> {
         if !self.checking() {
             self.line = Some(ui().task(&self.task.name));
@@ -121,10 +127,10 @@ impl<'r> TaskRun<'r> {
     /// Remove a `{{ tmp }}` directory once what used it is done. Failing to
     /// is said, but the result of what used it matters more.
     fn remove_tmp<T>(&mut self, tmp: &Vars, result: Result<T>) -> Result<T> {
-        if let Err(e) = crate::vars::remove_tmp(tmp, &self.runner.file.ctx) {
-            if result.is_ok() {
-                self.push(0, style(format!("{e:#}")).dim().to_string());
-            }
+        if let Err(e) = crate::vars::remove_tmp(tmp, &self.runner.file.ctx)
+            && result.is_ok()
+        {
+            self.push(0, style(format!("{e:#}")).dim().to_string());
         }
         result
     }
@@ -626,7 +632,7 @@ impl<'r> TaskRun<'r> {
         let owner = file.owner.as_deref().map(|o| scope.expand(o)).transpose()?;
         // A step that writes as root reads as root too, when running for
         // real: a file only root can read is otherwise rewritten every run.
-        let as_root = self.mode() == Mode::Run && (file.sudo || owner.is_some());
+        let as_root = self.reads_as_root() && (file.sudo || owner.is_some());
         // What's on the system, when it was already read to check a download.
         let mut read = None;
         let content = match &file.source {
@@ -786,7 +792,7 @@ impl<'r> TaskRun<'r> {
         if state == DirState::NotDir {
             bail!("{} exists and isn't a directory", path.display());
         }
-        let as_root = self.mode() == Mode::Run && root;
+        let as_root = self.reads_as_root() && root;
         let stat = target::stat(ctx, &task, &path, as_root)?.filter(|_| state != DirState::Missing);
         // Not seen, in a directory only root can enter: it may be there.
         let unseen = stat.is_none() && state == DirState::Unlistable;
@@ -820,6 +826,7 @@ impl<'r> TaskRun<'r> {
                 content: Vec::new(),
                 mode,
                 owner,
+                mtime: None,
             }),
         };
         if let Some(previous) = &previous {
@@ -840,14 +847,14 @@ impl<'r> TaskRun<'r> {
             return Ok(());
         }
         let write = !self.checking();
-        let entry = journal::read(ctx, &task, path, root, write && root)?;
+        let entry = journal::read(ctx, &task, path, root, self.reads_as_root() && root)?;
         let recorded = entry != Entry::None;
         let previous = match entry {
             Entry::Some(previous) => Some(previous),
             Entry::Unreadable => None,
             Entry::None if file.new => Some(Previous::Missing),
             Entry::None => {
-                if target::stat(ctx, &task, path, write && root)?.is_none() {
+                if target::stat(ctx, &task, path, self.reads_as_root() && root)?.is_none() {
                     self.current(depth, &format!("{label} · not on the system"));
                 } else {
                     let text = format!(
@@ -864,12 +871,12 @@ impl<'r> TaskRun<'r> {
             }
             Ok(())
         };
-        let state = target::dir_state(ctx, &task, path, write && root)?;
+        let state = target::dir_state(ctx, &task, path, self.reads_as_root() && root)?;
         match previous {
             None => {
                 self.change(
                     depth,
-                    &format!("{label} · put back what was there before taskpod"),
+                    &format!("{label} · put back what was there before taskpod{UNREAD_JOURNAL}"),
                 );
                 if write {
                     bail!("can't read the undo journal's entry for {}", path.display());
@@ -921,7 +928,7 @@ impl<'r> TaskRun<'r> {
                 }
             },
             Some(Previous::File { mode, owner, .. }) => {
-                let current = target::stat(ctx, &task, path, write && root)?;
+                let current = target::stat(ctx, &task, path, self.reads_as_root() && root)?;
                 if current
                     .as_ref()
                     .is_some_and(|(m, o)| *m == mode && (!root || *o == owner))
@@ -1026,7 +1033,7 @@ impl<'r> TaskRun<'r> {
             &self.runner.root_scope().child(&self.task.vars),
             &mut written,
         );
-        let as_root = self.mode() == Mode::Run && file.sudo;
+        let as_root = self.reads_as_root() && file.sudo;
         // The source's own directories: the top, and every one on the way
         // to one of its files.
         let mut subdirs = vec![String::new()];
@@ -1115,7 +1122,8 @@ impl<'r> TaskRun<'r> {
             }
             return self.undo_line_step(step, &line, depth, &label);
         }
-        let as_root = step.sudo && self.mode() == Mode::Run && !self.runner.opts.pull;
+        let as_root = step.sudo
+            && (self.mode() == Mode::Run && !self.runner.opts.pull || self.runner.opts.root);
         let Some((existing, base)) = self.read_line_files(step, &line, as_root, depth, &label)?
         else {
             return Ok(());
@@ -1299,7 +1307,7 @@ impl<'r> TaskRun<'r> {
         let root = step.sudo;
         let write = !self.checking();
         let Some((existing, base)) =
-            self.read_line_files(step, line, write && root, depth, label)?
+            self.read_line_files(step, line, self.reads_as_root() && root, depth, label)?
         else {
             return Ok(());
         };
@@ -1307,7 +1315,8 @@ impl<'r> TaskRun<'r> {
             self.current(depth, &format!("{label} · no file, nothing to undo"));
             return Ok(());
         };
-        let journal = journal::read_lines(ctx, &task, &line.path, root, write && root)?;
+        let journal =
+            journal::read_lines(ctx, &task, &line.path, root, self.reads_as_root() && root)?;
         let key = line.key();
         let found = journal.as_ref().and_then(|j| j.get(&key)).cloned();
         let record = match found {
@@ -1431,6 +1440,7 @@ impl<'r> TaskRun<'r> {
                 content,
                 mode,
                 owner,
+                mtime: None,
             },
             (None, None) if missing => Previous::Missing,
             // Not readable as the user: as root, if the step writes as root.
@@ -1439,6 +1449,7 @@ impl<'r> TaskRun<'r> {
                     content,
                     mode,
                     owner,
+                    mtime: None,
                 },
                 _ => return Ok(()),
             },
@@ -1848,7 +1859,7 @@ impl<'r> TaskRun<'r> {
         }
         let root = file.sudo || owner.is_some();
         let write = !self.checking();
-        let entry = journal::read(ctx, &task, path, root, write && root)?;
+        let entry = journal::read(ctx, &task, path, root, self.reads_as_root() && root)?;
         let recorded = entry != Entry::None;
         let previous = match entry {
             Entry::Some(previous) => Some(previous),
@@ -1856,7 +1867,7 @@ impl<'r> TaskRun<'r> {
             Entry::Unreadable => None,
             Entry::None if file.new => Some(Previous::Missing),
             Entry::None => {
-                if target::stat(ctx, &task, path, write && root)?.is_none() {
+                if target::stat(ctx, &task, path, self.reads_as_root() && root)?.is_none() {
                     self.current(depth, &format!("{label} · not on the system"));
                 } else {
                     let text = format!(
@@ -1867,14 +1878,14 @@ impl<'r> TaskRun<'r> {
                 return Ok(());
             }
         };
-        let current = target::read(ctx, &task, path, write && root)?;
+        let current = target::read(ctx, &task, path, self.reads_as_root() && root)?;
         // Not seen (in a directory only root can enter) isn't gone.
         let missing = current == Current::Missing;
         let current = match current {
             Current::Content(bytes) => Some(bytes),
             Current::Missing | Current::Unreadable => None,
         };
-        let stat = target::stat(ctx, &task, path, write && root)?;
+        let stat = target::stat(ctx, &task, path, self.reads_as_root() && root)?;
         let forget = |runner: &Runner| -> Result<()> {
             if write && recorded {
                 journal::remove(&runner.file.ctx, &task, path, root)?;
@@ -1890,6 +1901,7 @@ impl<'r> TaskRun<'r> {
                 content: old,
                 mode,
                 owner: old_owner,
+                ..
             }) if current.as_ref() == Some(old)
                 && stat
                     .as_ref()
@@ -1906,7 +1918,7 @@ impl<'r> TaskRun<'r> {
             Some(Previous::File { mode, .. }) => {
                 format!("put back what was there before taskpod (mode {mode:o})")
             }
-            None => "put back what was there before taskpod".to_string(),
+            None => format!("put back what was there before taskpod{UNREAD_JOURNAL}"),
         };
         let edited_note = if edited {
             " · changed since taskpod wrote it"
@@ -1957,6 +1969,7 @@ impl<'r> TaskRun<'r> {
                 content,
                 mode,
                 owner,
+                mtime,
             } => target::write(
                 ctx,
                 &task,
@@ -1965,7 +1978,12 @@ impl<'r> TaskRun<'r> {
                 mode,
                 root.then_some(owner.as_str()),
                 file.sudo,
-            ),
+            )
+            .and_then(|()| match mtime {
+                // Put back when it was last changed too, as it was before taskpod.
+                Some(mtime) => target::set_mtime(ctx, &task, path, mtime, root),
+                None => Ok(()),
+            }),
         }
         .with_context(|| format!("failed to undo {}", path.display()))?;
         forget(self.runner)
@@ -1986,8 +2004,7 @@ impl<'r> TaskRun<'r> {
     ) -> Result<()> {
         let ctx = &self.runner.file.ctx;
         let label = format!("file {}", path.display());
-        let write = self.mode() == Mode::Run;
-        let as_root = write && (file.sudo || owner.is_some());
+        let as_root = self.reads_as_root() && (file.sudo || owner.is_some());
         let system = match target::read(ctx, &self.task.name, path, as_root)? {
             Current::Content(bytes) => bytes,
             Current::Missing => {
@@ -2680,7 +2697,10 @@ fn file_content(file: &FileStep, scope: &Scope, dir: &Path) -> Result<Vec<u8>> {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Said of a root journal entry a check couldn't read.
+const UNREAD_JOURNAL: &str = ", if the journal has it (--root reads it)";
+
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes)
         .iter()
