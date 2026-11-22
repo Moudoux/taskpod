@@ -44,7 +44,7 @@ taskpod FILE --sources     # every file it reads (includes, env, secrets, `from`
 taskpod FILE --check       # check the file for errors
 taskpod FILE --secrets s.yaml  # secrets for {{ secrets.name }}, see below
 taskpod FILE -s a          # skip task a
-taskpod FILE -j 4          # at most 4 tasks at once (default: one per CPU)
+taskpod FILE -j 4          # at most 4 tasks at once (default: one per CPU, at most 6 with -H)
 taskpod FILE -v            # stream every command and its output
 taskpod FILE --plain       # no live display, output prefixed by task
 taskpod FILE -D --json     # the diff as JSON, for editors

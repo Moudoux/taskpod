@@ -122,9 +122,9 @@ pub struct Args {
     #[arg(long)]
     pub ignore_conditions: bool,
 
-    /// How many tasks to run at once
-    #[arg(short, long, default_value_t = default_jobs())]
-    pub jobs: usize,
+    /// How many tasks to run at once [default: one per CPU, at most 6 with --host]
+    #[arg(short, long)]
+    pub jobs: Option<usize>,
 
     /// Stream every command and its output
     #[arg(short, long)]
@@ -142,8 +142,15 @@ pub enum GraphFormat {
     Mermaid,
 }
 
-fn default_jobs() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get())
+/// Tasks running at once on a --host by default. Each holds a session on the
+/// one ssh connection, which also has the master's, and sshd refuses more than
+/// `MaxSessions` (10 by default): ssh then opens a new connection, asking for
+/// credentials again.
+const HOST_JOBS: usize = 6;
+
+fn default_jobs(host: bool) -> usize {
+    let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    if host { cpus.min(HOST_JOBS) } else { cpus }
 }
 
 fn main() -> ExitCode {
@@ -302,7 +309,10 @@ fn run(mut args: Args) -> Result<bool> {
     let opts = Options {
         mode,
         ignore_guards: args.ignore_conditions,
-        jobs: args.jobs.max(1),
+        jobs: args
+            .jobs
+            .unwrap_or_else(|| default_jobs(args.host.is_some()))
+            .max(1),
         skip: args.skip.into_iter().collect::<HashSet<_>>(),
         pull: args.pull,
         yes: args.yes,
@@ -365,4 +375,16 @@ fn run(mut args: Args) -> Result<bool> {
         ui().line(format!("{} {problem}", style("✗").red()));
     }
     Ok(ok && applied.problems.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_runs_fewer_tasks_at_once() {
+        assert!(default_jobs(true) <= HOST_JOBS);
+        assert!(default_jobs(true) <= default_jobs(false));
+        assert!(default_jobs(true) >= 1);
+    }
 }
