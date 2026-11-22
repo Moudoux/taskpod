@@ -150,7 +150,8 @@ subtask world of hello {
 # the template, {{ args }} is all of them and {{ 1 }}, {{ 2 }}, ... each one.
 # Name them after the template's name, `name="default"` for optional ones
 # (last): calls with too few or too many words are an error. A default can
-# use variables. Without names, a template takes any number of words.
+# use variables and the template's other parameters (`pkg="{{ repo }}"`).
+# Without names, a template takes any number of words.
 # A template's guards only apply to that call, so a task can mix calls that
 # are already done with ones that still need to run. A template's own
 # `let $( )` or question that uses {{ }} is worked out again for each call.

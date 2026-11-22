@@ -214,6 +214,15 @@ test("template parameters are the template's variables", () => {
   expect(resolveVar(index, "repo", 1)?.owner).toBe("github");
 });
 
+test("a template parameter's default can use its other parameters", () => {
+  const index = parse(`template github repo pkg="{{ repo }}" {
+    run echo {{ pkg }}
+}
+`);
+  expect(index.lines[0]).toMatchObject({ owner: "github", ownerKind: "template" });
+  expect(resolveVar(index, "repo", 0)?.owner).toBe("github");
+});
+
 test("definition headers hold flags, needs and locks", () => {
   const index = parse(`sudo template github repo path="." needs yay lock pacman {
     run echo {{ repo }}

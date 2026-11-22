@@ -206,6 +206,8 @@ export function parse(text: string): Index {
         template = { ...span, name, params: [], needs: [], endLine: number };
         index.templates.push(template);
         stack.push({ kind: "template", owner: name, ownerKind: "template", template });
+        // Defaults can use the template's parameters, so its header is inside it.
+        index.lines[number] = { ...index.lines[number], owner: name, ownerKind: "template" };
       } else {
         task = {
           ...span,
