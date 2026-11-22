@@ -234,7 +234,9 @@ task setup {
     # the first other line starting with `before`, after the last starting
     # with `after`, or at the end; on the wrong side of it, it's moved. With
     # `match "start"`, a line starting with that is this step's line, and is
-    # replaced rather than added again. One on the right side of `before` or
+    # replaced rather than added again. So is the line taskpod last wrote for
+    # the step (from the journal), which a `match "#Option"` for a commented-out
+    # default no longer finds once it's replaced. One on the right side of `before` or
     # `after` counts first, so the same line can be elsewhere too (an
     # `Include` in each of pacman.conf's sections); when several are on the
     # wrong side and none on the right, they stay and it's added. The file

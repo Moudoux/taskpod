@@ -1749,6 +1749,43 @@ fn matched_lines_are_replaced_and_put_back() {
     );
 }
 
+/// A `match` for a commented-out default only finds it once: the journal's
+/// record of what taskpod wrote finds the line after that, so a new text
+/// replaces it rather than adding a copy at the end (in another section).
+#[cfg(unix)]
+#[test]
+fn a_replaced_default_is_found_again_when_the_text_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |n: &str| dir.path().join(n);
+    let before = "[options]\n#IgnorePkg   =\nColor\n\n[multilib]\nInclude = x\n";
+    std::fs::write(path("pacman.conf"), before).unwrap();
+    let step = |pkgs: &str| {
+        format!(
+            "task t {{\n line \"pacman.conf\" match \"#IgnorePkg\" \"IgnorePkg = {pkgs}\"\n}}\n"
+        )
+    };
+    let after =
+        |pkgs: &str| format!("[options]\nIgnorePkg = {pkgs}\nColor\n\n[multilib]\nInclude = x\n");
+    run(&step("a"), dir.path(), &options(1), &[]);
+    assert_eq!(read(dir.path(), "pacman.conf"), after("a"));
+    run(&step("a b"), dir.path(), &options(1), &[]);
+    assert_eq!(read(dir.path(), "pacman.conf"), after("a b"));
+    // Undo still puts back the commented-out default.
+    undo(&step("a b"), dir.path(), Mode::Run, &[]);
+    assert_eq!(read(dir.path(), "pacman.conf"), before);
+
+    // Edited by hand to the step's next text: in the file, and recorded as
+    // that, so the change after it is found too.
+    run(&step("a"), dir.path(), &options(1), &[]);
+    std::fs::write(path("pacman.conf"), after("a b")).unwrap();
+    run(&step("a b"), dir.path(), &options(1), &[]);
+    assert_eq!(read(dir.path(), "pacman.conf"), after("a b"));
+    run(&step("a b c"), dir.path(), &options(1), &[]);
+    assert_eq!(read(dir.path(), "pacman.conf"), after("a b c"));
+    undo(&step("a b c"), dir.path(), Mode::Run, &[]);
+    assert_eq!(read(dir.path(), "pacman.conf"), before);
+}
+
 #[cfg(unix)]
 #[test]
 fn lines_move_to_their_place() {

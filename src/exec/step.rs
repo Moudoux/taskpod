@@ -1141,9 +1141,41 @@ impl<'r> TaskRun<'r> {
             },
         };
         let text = &line.text;
-        let Some((new, change)) =
-            ensure_line(&old, text, line.matcher.as_deref(), line.place.as_ref())?
+        // The line taskpod last wrote for this step: after a `match` replaced a
+        // commented-out default, the match no longer finds it, but this does.
+        // `None` in a check that can't read the root journal, or when the file
+        // is gone (its records are stale).
+        let ctx = &self.runner.file.ctx;
+        let task = self.task.name.clone();
+        let key = line.key();
+        let journal = match existing {
+            Some(_) => journal::read_lines(ctx, &task, &line.path, step.sudo, as_root)?,
+            None => None,
+        };
+        let previous = journal
+            .as_ref()
+            .and_then(|j| j.get(&key))
+            .map(|r| r.text.clone());
+        let Some((new, change)) = ensure_line(
+            &old,
+            text,
+            line.matcher.as_deref(),
+            previous.as_deref(),
+            line.place.as_ref(),
+        )?
         else {
+            // In the file, but recorded as an older text (edited to this one):
+            // record this text, so the line is still found once it changes.
+            if self.mode() == Mode::Run
+                && !self.runner.opts.pull
+                && previous.as_ref().is_some_and(|p| p != text)
+                && let Some(mut lines) = journal
+            {
+                for record in lines.lines.iter_mut().filter(|r| r.key == key) {
+                    record.text = text.clone();
+                }
+                journal::write_lines(ctx, &task, &line.path, step.sudo, &lines)?;
+            }
             self.current(depth, &format!("{label} · in the file"));
             return Ok(());
         };
@@ -1332,6 +1364,7 @@ impl<'r> TaskRun<'r> {
                     &split_lines(&old).0,
                     &line.text,
                     line.matcher.as_deref(),
+                    None,
                     line.place.as_ref(),
                 )
                 .is_some()
@@ -2517,7 +2550,9 @@ fn ending_of(line: &str) -> &'static str {
 }
 
 /// The index of the step's line: one that's `text`, or else one starting with
-/// `matcher`, with whether it's exactly the text. One on the right side of
+/// `matcher` or that's `previous` (the line taskpod last wrote for the step,
+/// which a `match` for a commented-out default no longer finds), with whether
+/// it's exactly the text. One on the right side of
 /// `place` comes first, so the same line can be elsewhere in the file too
 /// (pacman.conf's `Include` line in each repository's section). Only when
 /// none is, a single one on the wrong side is the step's (to be moved); with
@@ -2526,10 +2561,13 @@ fn find_line(
     lines: &[String],
     text: &str,
     matcher: Option<&str>,
+    previous: Option<&str>,
     place: Option<&LinePlace>,
 ) -> Option<(usize, bool)> {
     let exact = |l: &String| same_line(l, text);
-    let matched = |l: &String| matcher.is_some_and(|m| starts_with(l, m));
+    let matched = |l: &String| {
+        matcher.is_some_and(|m| starts_with(l, m)) || previous.is_some_and(|p| same_line(l, p))
+    };
     let placed = |is: &dyn Fn(&String) -> bool| {
         (0..lines.len()).find(|&i| is(&lines[i]) && !misplaced(lines, place, i))
     };
@@ -2586,16 +2624,18 @@ fn insert_line(lines: &mut Vec<String>, at: usize, line: String, ending: &str) {
 }
 
 /// `old` with the step's line where it should be, and what changed; `None`
-/// if it's there already.
+/// if it's there already. `previous` is the line taskpod last wrote for the
+/// step, from the journal.
 fn ensure_line(
     old: &str,
     text: &str,
     matcher: Option<&str>,
+    previous: Option<&str>,
     place: Option<&LinePlace>,
 ) -> Result<Option<(String, LineChange)>> {
     let (mut lines, ending) = split_lines(old);
     let mut change = None;
-    match find_line(&lines, text, matcher, place) {
+    match find_line(&lines, text, matcher, previous, place) {
         Some((i, exact)) => {
             if !exact {
                 let was = lines[i].trim_end_matches(['\r', '\n']).to_string();
@@ -2636,7 +2676,7 @@ fn undo_line(
     replaced: Option<&str>,
 ) -> Option<(String, bool)> {
     let (mut lines, _) = split_lines(old);
-    let (i, exact) = find_line(&lines, written, matcher, place)?;
+    let (i, exact) = find_line(&lines, written, matcher, None, place)?;
     match replaced {
         Some(was) => lines[i] = format!("{was}{}", ending_of(&lines[i])),
         None => {
@@ -2908,6 +2948,7 @@ mod tests {
             old,
             new,
             Some("auth sufficient pam_u2f.so"),
+            None,
             Some(&LinePlace::Before("auth".into())),
         )
         .unwrap()
@@ -2928,7 +2969,7 @@ mod tests {
         let place = LinePlace::After("[multilib]".into());
         let repos = format!("[core]\n{include}\n\n[extra]\n{include}\n\n[multilib]\n");
         let old = format!("{repos}#{include}\n");
-        let (text, change) = ensure_line(&old, include, Some("#Include"), Some(&place))
+        let (text, change) = ensure_line(&old, include, Some("#Include"), None, Some(&place))
             .unwrap()
             .unwrap();
         let new = format!("{repos}{include}\n");
@@ -2936,7 +2977,7 @@ mod tests {
         assert_eq!(change, LineChange::Replaced(format!("#{include}")));
         // Found under [multilib] from then on, and put back from there.
         assert!(
-            ensure_line(&new, include, Some("#Include"), Some(&place))
+            ensure_line(&new, include, Some("#Include"), None, Some(&place))
                 .unwrap()
                 .is_none()
         );
@@ -2949,7 +2990,7 @@ mod tests {
         );
         assert_eq!(undone, Some((old, false)));
         // Missing, it's added: the ones in [core] and [extra] stay put.
-        let (text, change) = ensure_line(&repos, include, None, Some(&place))
+        let (text, change) = ensure_line(&repos, include, None, None, Some(&place))
             .unwrap()
             .unwrap();
         assert_eq!(text, new);

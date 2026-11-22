@@ -292,7 +292,7 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   match: {
     places: ["line"],
     summary:
-      "A line starting with this (ignoring indentation) is this step's line: it's replaced with the step's text instead of a second line being added, and `--undo` puts back what it replaced.",
+      "A line starting with this (ignoring indentation) is this step's line: it's replaced with the step's text instead of a second line being added, and `--undo` puts back what it replaced. The line taskpod last wrote for the step counts too, so `match \"#Option\"` still finds a commented-out default after replacing it.",
     syntax: 'match "auth sufficient pam_u2f.so"',
     snippet: 'match "${1:start}"',
   },
