@@ -1,5 +1,8 @@
 import { expect, test } from "bun:test";
-import { secretKeys } from "./secrets";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { globFiles, secretKeys } from "./secrets";
 
 const names = (text: string, file: string) => secretKeys(text, file).map((k) => `${k.name}${k.leaf ? "" : "/"}@${k.line}:${k.start}`);
 
@@ -57,4 +60,21 @@ test("json", () => {
 test("dotenv and ini", () => {
   expect(names("A=ENC[x]\nexport B = ENC[y]\nsops_mac=ENC[m]\n# C=no\n", "secrets.env")).toEqual(["A@0:0", "B@1:7"]);
   expect(names("[db]\npass = ENC[x]\n[sops]\nmac = m\n", "s.ini")).toEqual(["db/@0:1", "db.pass@1:0"]);
+});
+
+test("globs a secrets file name like taskpod", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "taskpod-glob-"));
+  try {
+    for (const f of ["b.yaml", "a.yaml", ".hidden.yaml", "c.json", "d.yaml.bak"]) fs.writeFileSync(path.join(dir, f), "");
+    fs.mkdirSync(path.join(dir, "sub.yaml"));
+    const names = (p: string) => globFiles(path.join(dir, p)).map((f) => path.basename(f));
+    expect(names("*.yaml")).toEqual(["a.yaml", "b.yaml"]);
+    expect(names("?.json")).toEqual(["c.json"]);
+    expect(names("*.toml")).toEqual([]);
+    // Without a pattern, the path itself, existing or not.
+    expect(names("missing.yaml")).toEqual(["missing.yaml"]);
+    expect(globFiles(path.join(dir, "nope", "*.yaml"))).toEqual([]);
+  } finally {
+    fs.rmSync(dir, { recursive: true });
+  }
 });

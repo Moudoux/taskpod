@@ -8,7 +8,7 @@ import { LiveChecks, REPORT_SCHEME } from "./checks";
 import { type Index, type RefKind, parse, resolveVar, symbolAt } from "./index";
 import { hoverMarkdown, title } from "./live";
 import { IncludeGraph } from "./project";
-import { type SecretKey, secretKeys } from "./secrets";
+import { type SecretKey, globFiles, secretKeys } from "./secrets";
 
 const LANGUAGE = "taskpod";
 const SELECTOR: vscode.DocumentSelector = { language: LANGUAGE };
@@ -115,6 +115,9 @@ function resolvePath(p: string, from: vscode.Uri): string {
   return path.isAbsolute(expanded) ? expanded : path.join(path.dirname(from.fsPath), expanded);
 }
 
+/** A `secrets` path with `*` or `?` in its file name, which taskpod globs. */
+const isGlob = (p: { kind: string; path: string }) => p.kind === "secrets" && /[*?]/.test(path.basename(p.path));
+
 // ---- Secrets -----------------------------------------------------------------
 
 const SECRETS = "secrets.";
@@ -148,11 +151,12 @@ function secretFiles(files: FileIndex[]): SecretFile[] {
   for (const { uri, index } of files) {
     for (const p of index.paths) {
       if (p.kind !== "secrets" || p.path.includes("{{")) continue;
-      const target = resolvePath(p.path, uri);
-      if (seen.has(target)) continue;
-      seen.add(target);
-      const keys = readSecretKeys(target);
-      if (keys) found.push({ uri: vscode.Uri.file(target), keys });
+      for (const target of globFiles(resolvePath(p.path, uri))) {
+        if (seen.has(target)) continue;
+        seen.add(target);
+        const keys = readSecretKeys(target);
+        if (keys) found.push({ uri: vscode.Uri.file(target), keys });
+      }
     }
   }
   return found;
@@ -262,8 +266,13 @@ class Provider
     const pathRef = index.paths.find((p) => p.line === position.line && position.character >= p.start && position.character <= p.end);
     if (pathRef && !pathRef.path.includes("{{")) {
       const target = pathRef.kind === "target" ? expandHome(pathRef.path) : resolvePath(pathRef.path, document.uri);
-      const exists = fs.existsSync(target);
       const what = pathRef.kind === "target" ? "Writes" : "Reads";
+      if (isGlob(pathRef)) {
+        const found = globFiles(target);
+        const list = found.map((f) => `- \`${path.basename(f)}\``).join("\n");
+        return new vscode.Hover(new vscode.MarkdownString(`${what} \`${target}\`${found.length ? `:\n\n${list}` : " _(no files match)_"}`));
+      }
+      const exists = fs.existsSync(target);
       return new vscode.Hover(new vscode.MarkdownString(`${what} \`${target}\`${exists ? "" : " _(doesn't exist yet)_"}`));
     }
     const word = document.getWordRangeAtPosition(position);
@@ -279,6 +288,7 @@ class Provider
     const pathRef = files[0].index.paths.find((p) => p.line === position.line && position.character >= p.start && position.character <= p.end);
     if (pathRef && !pathRef.path.includes("{{")) {
       const target = pathRef.kind === "target" ? expandHome(pathRef.path) : resolvePath(pathRef.path, document.uri);
+      if (isGlob(pathRef)) return globFiles(target).map((f) => new vscode.Location(vscode.Uri.file(f), new vscode.Position(0, 0)));
       if (isFile(target)) return new vscode.Location(vscode.Uri.file(target), new vscode.Position(0, 0));
     }
     return undefined;
@@ -506,7 +516,10 @@ function lint(document: vscode.TextDocument): vscode.Diagnostic[] {
   }
   for (const p of index.paths) {
     if (p.kind === "target" || p.path.includes("{{")) continue;
-    if (!fs.existsSync(resolvePath(p.path, document.uri))) add(p, `${resolvePath(p.path, document.uri)} doesn't exist`);
+    const target = resolvePath(p.path, document.uri);
+    if (isGlob(p)) {
+      if (!globFiles(target).length) add(p, `no files match ${target}`);
+    } else if (!fs.existsSync(target)) add(p, `${target} doesn't exist`);
   }
   return diagnostics;
 }

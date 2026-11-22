@@ -3,6 +3,8 @@
 // Names match taskpod's: nested keys joined with dots, list items numbered from 0.
 // Values are never read.
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { Span } from "./index";
 
 export interface SecretKey extends Span {
@@ -19,6 +21,27 @@ export function secretKeys(text: string, fileName: string): SecretKey[] {
   return keys
     .filter((k) => k.name !== "sops" && !k.name.startsWith("sops.") && !(ext === "env" && k.name.startsWith("sops_")))
     .map((k) => ({ ...k, leaf: ![...names].some((n) => n.startsWith(`${k.name}.`)) }));
+}
+
+/**
+ * The files a `secrets` path names: like taskpod's parser, `*` and `?` in the
+ * file name (not the directory) match files there, sorted, and `*` doesn't
+ * match a leading dot. A path without them is itself, whether it exists or not.
+ */
+export function globFiles(file: string): string[] {
+  const name = path.basename(file);
+  if (!/[*?]/.test(name)) return [file];
+  const dir = path.dirname(file);
+  const pattern = new RegExp(`^${name.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`, "s");
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((e) => !e.isDirectory() && !e.name.startsWith(".") && pattern.test(e.name))
+      .map((e) => path.join(dir, e.name))
+      .sort();
+  } catch {
+    return [];
+  }
 }
 
 type Key = Omit<SecretKey, "leaf">;
