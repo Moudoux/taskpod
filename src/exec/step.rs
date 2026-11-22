@@ -1,11 +1,13 @@
 //! Running the steps of one task.
 
+mod adopt;
+
 use super::journal::{self, Entry, Previous};
 use super::target::{self, Current, DirState, describe};
 use super::{Mode, Outcome, Runner, StepKind, StepRecord, TaskReport, pull, sudo};
 use crate::ast::{
-    Block, Encoding, FileSource, FileStep, Guard, LinePlace, LineStep, SettingStep, Step, Task,
-    Template, WaitStep,
+    Block, CallArgs, Encoding, FileSource, FileStep, Guard, LinePlace, LineStep, SettingStep, Step,
+    Task, Template, WaitStep,
 };
 use crate::parser::{check_passes, guard_passes};
 use crate::ui::{self, TaskLine, ui};
@@ -141,6 +143,9 @@ impl<'r> TaskRun<'r> {
         self.status("checking");
         if self.runner.opts.undo {
             return self.undo_task(&scope);
+        }
+        if self.runner.opts.adopt {
+            return self.adopt_task(&scope);
         }
         if let Some(guard) = self
             .runner
@@ -335,11 +340,7 @@ impl<'r> TaskRun<'r> {
             Step::File(file) => self.file(file, scope, depth),
             Step::Line(line) => self.line(line, scope, depth),
             Step::Call { template, args } => {
-                let args = scope.expand(args)?;
-                let call = Call::new(&self.runner.file.templates[template], &args);
-                call.template
-                    .check_arity(args.split_whitespace().count())
-                    .map_err(|e| anyhow!("`{}`: {e}", call.label))?;
+                let call = Call::new(&self.runner.file.templates[template], args, scope)?;
                 let call_scope = scope.child(&call.args);
                 let inner = call_scope.child(&call.vars);
                 let tmp = crate::vars::tmp_vars(&inner, self.checking());
@@ -1000,10 +1001,10 @@ impl<'r> TaskRun<'r> {
                     }
                 }
                 Step::Call { template, args } => {
-                    let Ok(args) = scope.expand(args) else {
+                    let Ok(call) = Call::new(&self.runner.file.templates[template], args, scope)
+                    else {
                         continue;
                     };
-                    let call = Call::new(&self.runner.file.templates[template], &args);
                     let call_scope = scope.child(&call.args);
                     self.written_paths(&call.template.body, &call_scope.child(&call.vars), out);
                 }
@@ -1620,7 +1621,7 @@ impl<'r> TaskRun<'r> {
                     label,
                     args,
                     vars,
-                } = Call::new(&self.runner.file.templates[template], &scope.expand(args)?);
+                } = Call::new(&self.runner.file.templates[template], args, scope)?;
                 (&template.body, label, args, vars)
             }
             _ => unreachable!("only blocks and calls are reactions"),
@@ -1669,7 +1670,10 @@ impl<'r> TaskRun<'r> {
         }
         let wanted = scope.expand(&setting.value)?;
         let get = scope.expand(&setting.get)?;
-        let label = format!("setting {}", first_line(&get));
+        let label = match &setting.name {
+            Some(name) => format!("setting {}", scope.expand(name)?),
+            None => format!("setting {}", first_line(&get)),
+        };
         if self.runner.opts.undo {
             return self.undo_setting(setting, scope, depth, &label, &get, &wanted);
         }
@@ -2224,13 +2228,21 @@ struct Call<'t> {
 }
 
 impl<'t> Call<'t> {
-    fn new(template: &'t Template, args: &str) -> Self {
-        Call {
+    /// A call of `template` with `args` as written, filled in from `scope`.
+    fn new(template: &'t Template, args: &str, scope: &Scope) -> Result<Self> {
+        let args = CallArgs::new(template, args, |s| scope.expand(s))?;
+        let label = format!("{} {}", template.name, args.text)
+            .trim()
+            .to_string();
+        template
+            .check_call(&args)
+            .map_err(|e| anyhow!("`{label}`: {e}"))?;
+        Ok(Call {
             template,
-            label: format!("{} {args}", template.name).trim().to_string(),
-            args: template.arg_vars(args),
+            label,
+            args: template.arg_vars(&args),
             vars: template.vars.for_call(),
-        }
+        })
     }
 }
 

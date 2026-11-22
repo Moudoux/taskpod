@@ -11,6 +11,7 @@ fn options(jobs: usize) -> Options {
         pull: false,
         yes: false,
         undo: false,
+        adopt: false,
         root: false,
     }
 }
@@ -2386,22 +2387,36 @@ fn templates_name_their_parameters() {
     let dir = tempfile::tempdir().unwrap();
     let source = r#"
         let default = "hello"
-        template greet who greeting="{{ default }}" {
+        template greet(who, greeting="{{ default }}") {
             run echo {{ greeting }} {{ who }} >> log
         }
+        template words {
+            run printf '[%s]' {{ args }} "{{ 1 }}" >> words
+        }
+        let place = "the world"
         task greetings {
             greet world
             greet you hi
+            greet greeting=hey them
+            greet "two words" greeting='and more'
+            greet {{ place }}
+            greet "{{ place }}"
+            words a=b 'c d'
         }
     "#;
     run(source, dir.path(), &options(1), &[]);
-    assert_eq!(read(dir.path(), "log"), "hello world\nhi you\n");
+    assert_eq!(
+        read(dir.path(), "log"),
+        "hello world\nhi you\nhey them\nand more two words\nworld the\nhello the world\n"
+    );
+    // Without named parameters `a=b` is a word, and {{ args }} is as written.
+    assert_eq!(read(dir.path(), "words"), "[a=b][c d][a=b]");
 
     let parse = |source: &str| parse_str(source, Path::new("/tmp")).map(|_| ());
-    let template = "template greet who greeting=\"hi\" {\n run true\n}\n";
+    let template = "template greet(who, greeting=\"hi\") {\n run true\n}\n";
     let err = parse(&format!("{template}task a {{\n greet\n}}\n")).unwrap_err();
     assert!(
-        format!("{err:#}").contains("needs 1 argument: greet who [greeting]"),
+        format!("{err:#}").contains("needs 1 argument (who missing): greet who [greeting]"),
         "{err:#}"
     );
     let err = parse(&format!("{template}task a {{\n greet a b c\n}}\n")).unwrap_err();
@@ -2409,16 +2424,32 @@ fn templates_name_their_parameters() {
         format!("{err:#}").contains("takes at most 2 arguments"),
         "{err:#}"
     );
-    let err = parse("template t a=1 b {\n run true\n}\n").unwrap_err();
+    let err = parse("template t(a=1, b) {\n run true\n}\n").unwrap_err();
     assert!(
         format!("{err:#}").contains("needs a default too"),
         "{err:#}"
     );
-    let err = parse("template t args {\n run true\n}\n").unwrap_err();
+    let err = parse("template t(args) {\n run true\n}\n").unwrap_err();
     assert!(
         format!("{err:#}").contains("can't be a parameter name"),
         "{err:#}"
     );
+    let err = parse(&format!("{template}task a {{\n greet a who=b\n}}\n")).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("given by position and as `who=`"),
+        "{err:#}"
+    );
+    let err = parse(&format!("{template}task a {{\n greet greeting=x\n}}\n")).unwrap_err();
+    assert!(format!("{err:#}").contains("who missing"), "{err:#}");
+    let err = parse("template t a b {\n run true\n}\n").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("parameters go in parentheses"),
+        "{err:#}"
+    );
+    let err = parse("template t() {\n run true\n}\ntask a {\n t x\n}\n").unwrap_err();
+    assert!(format!("{err:#}").contains("takes at most 0"), "{err:#}");
+    let err = parse("template t(a) {\n run true\n}\ntask a {\n t 'x\n}\n").unwrap_err();
+    assert!(format!("{err:#}").contains("unclosed quote"), "{err:#}");
 }
 
 #[cfg(unix)]
@@ -2465,7 +2496,7 @@ fn workdir_in_templates_and_blocks() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("c/a/b")).unwrap();
     let source = r#"
-        template here name {
+        template here(name) {
             workdir "{{ name }}"
             unless exists "{{ name }}/done"
             run pwd > done
@@ -2677,7 +2708,7 @@ fn tmp_and_settings_over_ssh() {
 #[test]
 fn definitions_take_flags_needs_and_locks_in_their_header() {
     let source = r#"
-        sudo template pkg names="x" needs base lock pacman {
+        sudo template pkg(names="x") needs base lock pacman {
             run true
         }
         task base {
@@ -2706,7 +2737,7 @@ fn definitions_take_flags_needs_and_locks_in_their_header() {
     let file = parse_str(source, Path::new("/tmp")).unwrap_or_else(|e| panic!("{e:#}"));
     let pkg = &file.templates["pkg"];
     assert!(pkg.body.sudo);
-    assert_eq!(pkg.params.len(), 1);
+    assert_eq!(pkg.params.as_ref().map(Vec::len), Some(1));
     assert_eq!(pkg.needs, ["base"]);
     assert_eq!(pkg.body.locks, ["pacman"]);
     let app = &file.tasks["app"];
@@ -2775,4 +2806,67 @@ fn templated_sources_are_relative_to_their_file() {
     assert_eq!(outcomes["t"], Outcome::Ran, "{outcomes:?}");
     assert_eq!(read(root, "plain"), "from sub\n");
     assert_eq!(read(root, "templated"), "from sub\n");
+}
+
+fn adopt(source: &str, dir: &Path, mode: Mode) -> Outcome {
+    let file = parse_str(source, dir).unwrap_or_else(|e| panic!("{e:#}"));
+    let mut opts = options(1);
+    opts.mode = mode;
+    opts.adopt = true;
+    let order = select(&file, &[]).unwrap();
+    let outcomes: HashMap<_, _> = Runner::new(&file, &opts).run(&order).into_iter().collect();
+    outcomes["t"].clone()
+}
+
+#[cfg(unix)]
+#[test]
+fn adopt_records_what_new_says() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |n: &str| dir.path().join(n);
+    std::fs::write(path("rc"), "a\n").unwrap();
+    std::fs::write(path("vendor"), "v\n").unwrap();
+    std::fs::create_dir(path("src")).unwrap();
+    std::fs::write(path("src/one"), "1\n").unwrap();
+    let with_new = r#"
+        template made(name) {
+            file "{{ name }}" new "x\n"
+        }
+        task t {
+            made made
+            file "gone" new "y\n"
+            file "theirs" "z\n"
+            directory "copied" new from "src"
+            directory "empty" new
+            line "rc" new ". f.sh"
+            line "conf" new base "vendor" "extra"
+            if false {
+                file "elsewhere" new "w\n"
+            }
+        }
+    "#;
+    assert_eq!(
+        run(with_new, dir.path(), &options(1), &[])["t"],
+        Outcome::Ran
+    );
+    std::fs::remove_file(path("gone")).unwrap();
+    std::fs::write(path("elsewhere"), "w\n").unwrap();
+    // As if all of it was written before taskpod kept a journal.
+    std::fs::remove_dir_all(path(".taskpod-journal")).unwrap();
+
+    // A preview records nothing.
+    assert_eq!(adopt(with_new, dir.path(), Mode::Diff), Outcome::Ran);
+    assert!(!path(".taskpod-journal/user.db").exists());
+    assert_eq!(adopt(with_new, dir.path(), Mode::Run), Outcome::Ran);
+    assert_eq!(adopt(with_new, dir.path(), Mode::Run), Outcome::UpToDate);
+
+    // Without `new`, undo now does what it said.
+    let without = with_new.replace(" new ", " ");
+    undo(&without, dir.path(), Mode::Run, &[]);
+    for gone in ["made", "copied/one", "empty", "conf"] {
+        assert!(!path(gone).exists(), "{gone}");
+    }
+    assert_eq!(read(dir.path(), "rc"), "a\n");
+    // Not `new`, or where the task doesn't apply: left alone.
+    assert_eq!(read(dir.path(), "theirs"), "z\n");
+    assert_eq!(read(dir.path(), "elsewhere"), "w\n");
 }

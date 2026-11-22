@@ -10,12 +10,16 @@ idempotent. Its main use is setting up an Arch system from
 ## Layout
 
 - `src/parser.rs`: line-based parser (statements end at the line end, `\` continues).
-  Definitions take flags before `task`/`template` and `needs`/`lock` after the name
-  (`Parser::definition`); the same directives in the body still work and add up.
+  Definitions take flags before `task`/`template`, a template's `(params)` or a task's description
+  string after the name, then `needs`/`lock` (`Parser::definition`); the same directives in the body
+  still work and add up. A template call ending in `{` and a `lines "path" {` block are expanded
+  here into one `Step::Call` / `Step::Line` per line. `secrets` globs its file name (`glob`).
   `run` lines and `run { }` blocks are raw shell; brace matching in blocks skips quotes and comments.
   Checks (`if`/`unless`/`wait until`, `Parser::check`) are shell unless the whole check is a built-in
   (`CheckKind`: `exists`, `which`, `$( )` comparisons), run by `parser::check_passes`.
 - `src/ast.rs`: the parsed file, `link()` checks references and hoists template `needs` into tasks.
+  Call arguments are split as written (`split_call`: quotes, `{{ }}`, `name=` for a parameter's name),
+  then filled in by `CallArgs::new`; `Template::check_call` checks them.
   File encodings live here too.
 - `src/vars.rs`: `{{ name }}` templating, scopes, lazy `$( )` and prompt variables, how commands are spawned.
 - `src/secrets.rs`: `{{ secrets.name }}` from sops files, decrypted on first use; `ui::redact`
@@ -29,6 +33,9 @@ idempotent. Its main use is setting up an Arch system from
   reactions (`Block::is_reaction`) run again after the file/line/setting steps before them.
   With `--pull` (`Options::pull`, combined with the Run/DryRun/Diff mode) file steps are compared the
   other way and queue edits on `Runner::edits`, which `main` applies at the end.
+- `src/exec/step/adopt.rs`: `--adopt` (`Options::adopt`), a walk like undo's (`undo_guard`) that
+  records in the journal what `new` file, directory and line steps say, for what was written
+  before the journal; writes only in `Mode::Run`.
 - `src/exec/journal.rs`: `--undo`'s record of each file before taskpod first wrote it (content and
   everything `target::details` stats), lines, and each `setting`'s value, keyed by its `get` command.
   Two SQLite databases (bundled `rusqlite`) on the target machine: `~/.local/state/taskpod/journal.db`,

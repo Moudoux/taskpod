@@ -170,7 +170,7 @@ test("highlights notice as a keyword with a string", async () => {
 });
 
 test("highlights else, settings, downloads, parameters and changed run", async () => {
-  const tokens = (await tokenizer())(`template github repo path="." {
+  const tokens = (await tokenizer())(`template github(repo, path=".") {
     run echo {{ repo }}
 }
 task t {
@@ -203,7 +203,7 @@ test("highlights flags, needs and locks in definition headers", async () => {
         base lock pacman {
     run true
 }
-sudo template pkg names needs yay {
+sudo template pkg(names) needs yay {
 }`);
   expect(scopeOf(tokens, "sudo interactive ")).toContain("storage.modifier");
   expect(scopeOf(tokens, "task")).toContain("storage.type.task");
@@ -275,4 +275,21 @@ test("highlights built-in checks and waits", async () => {
   expect(scopeOf(tokens, "after")).toContain("entity.name.function.call");
   const last = tokens.filter(([t]) => t === "}").pop()!;
   expect(last[1]).not.toContain("meta.");
+});
+
+test("highlights call blocks and lines blocks", async () => {
+  const tokens = (await tokenizer())(`task t "Does t" {
+    display {{ oled }} {
+        mode 2560x1440@280
+    }
+    lines "/etc/pacman.conf" sudo {
+        match "#Color" "Color"
+    }
+    run true
+}`);
+  expect(scopeOf(tokens, "display")).toContain("entity.name.function.call");
+  expect(scopeOf(tokens, "        mode 2560x1440@280")).not.toContain("entity.name.function.call");
+  expect(scopeOf(tokens, "lines")).toContain("support.type.step");
+  expect(scopeOf(tokens, "match")).toContain("entity.other.attribute-name");
+  expect(scopeOf(tokens, " true")).toContain("meta.embedded.line.shell");
 });

@@ -142,12 +142,12 @@ impl Vars {
     }
 
     /// Variables for a template call: `args` is the whole argument string,
-    /// `1`, `2`, ... are its whitespace separated words.
-    pub fn for_args(args: &str) -> Self {
+    /// `1`, `2`, ... are its words.
+    pub fn for_args(args: &str, words: &[String]) -> Self {
         let mut vars = Vars::default();
         vars.literal("args", args);
-        for (i, word) in args.split_whitespace().enumerate() {
-            vars.literal((i + 1).to_string(), word);
+        for (i, word) in words.iter().enumerate() {
+            vars.literal((i + 1).to_string(), word.as_str());
         }
         vars
     }
@@ -726,7 +726,7 @@ mod tests {
     #[test]
     fn template_args() {
         let ctx = ctx();
-        let vars = Vars::for_args("one  two");
+        let vars = Vars::for_args("one  two", &["one".into(), "two".into()]);
         let scope = Scope::root(&vars, &ctx);
         assert_eq!(
             scope.expand("{{ args }}|{{ 1 }}|{{ 2 }}").unwrap(),
@@ -743,7 +743,7 @@ mod tests {
         template.set("fixed", Var::Shell("echo same".into(), Cache::default()));
         let mut seen = Vec::new();
         for arg in ["a", "b"] {
-            let args = Vars::for_args(arg);
+            let args = Vars::for_args(arg, &[arg.to_string()]);
             let root = Scope::root(&args, &ctx);
             let call = template.for_call();
             seen.push(root.child(&call).expand("{{ up }} {{ fixed }}").unwrap());

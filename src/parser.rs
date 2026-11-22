@@ -115,8 +115,10 @@ impl<'s> Parser<'s> {
                     let path = self.string()?;
                     self.end_of_line()?;
                     let path = self.resolve(&path);
-                    self.declare(file, start, DeclarationKind::Secrets, &path);
-                    file.ctx.secrets.add(path);
+                    for path in glob(&path).map_err(|e| self.error_at(start, e))? {
+                        self.declare(file, start, DeclarationKind::Secrets, &path);
+                        file.ctx.secrets.add(path);
+                    }
                 }
                 "age-key" => {
                     let path = self.string()?;
@@ -367,6 +369,11 @@ impl<'s> Parser<'s> {
                     let line = self.line_step()?;
                     body.block.steps.push(Step::Line(Box::new(line)));
                 }
+                "lines" => {
+                    for line in self.lines_block(start)? {
+                        body.block.steps.push(Step::Line(Box::new(line)));
+                    }
+                }
                 "file" | "directory" => {
                     let file = self.file_step(keyword == "directory")?;
                     body.block.steps.push(Step::File(Box::new(file)));
@@ -374,12 +381,49 @@ impl<'s> Parser<'s> {
                 _ => {
                     let line = self.rest_of_line();
                     // Template arguments aren't shell, so strip trailing comments.
-                    let args = strip_comment(&line).trim_end().to_string();
-                    body.block.steps.push(Step::Call {
-                        template: keyword,
-                        args,
-                    });
+                    let args = strip_comment(&line).trim_end();
+                    let head = args
+                        .strip_suffix('{')
+                        .filter(|h| h.is_empty() || h.ends_with([' ', '\t']));
+                    let Some(head) = head.map(str::trim_end) else {
+                        body.block.steps.push(Step::Call {
+                            template: keyword,
+                            args: args.to_string(),
+                        });
+                        self.end_of_line()?;
+                        continue;
+                    };
+                    // `name a {` with lines of more words: a call for each line.
+                    let head = head.to_string();
                     self.end_of_line()?;
+                    let mut calls = 0;
+                    loop {
+                        self.skip_trivia();
+                        if self.eof() {
+                            return Err(self.error_at(start, "missing closing '}'"));
+                        }
+                        if self.peek() == Some('}') {
+                            self.bump();
+                            self.end_of_line()?;
+                            break;
+                        }
+                        let line = self.rest_of_line();
+                        let more = strip_comment(&line).trim_end();
+                        body.block.steps.push(Step::Call {
+                            template: keyword.clone(),
+                            args: format!("{head} {more}").trim().to_string(),
+                        });
+                        calls += 1;
+                        self.end_of_line()?;
+                    }
+                    if calls == 0 {
+                        return Err(self.error_at(
+                            start,
+                            format!(
+                                "`{keyword} {{` has no lines: each line is a call of '{keyword}'"
+                            ),
+                        ));
+                    }
                 }
             }
         }
@@ -633,7 +677,17 @@ impl<'s> Parser<'s> {
             None
         };
         let origin = self.origin(start);
-        let params = if template { self.params()? } else { Vec::new() };
+        let params = if template { self.params()? } else { None };
+        // `task name "what it does"`: its description.
+        self.skip_inline_ws();
+        let header_desc = if matches!(self.peek(), Some('"' | '\'')) {
+            if template {
+                return Err(self.error("a template has no description, only tasks do"));
+            }
+            Some(self.string()?)
+        } else {
+            None
+        };
         let (header_needs, header_locks) = self.header_clauses()?;
         self.open_brace()?;
         let kind = if template {
@@ -676,9 +730,15 @@ impl<'s> Parser<'s> {
             if file.tasks.contains_key(&name) {
                 return Err(self.error_at(start, format!("task '{name}' is defined twice")));
             }
+            if header_desc.is_some() && body.desc.is_some() {
+                return Err(self.error_at(
+                    start,
+                    format!("task '{name}' has a description in its header and a `desc`"),
+                ));
+            }
             let task = Task {
                 name: name.clone(),
-                desc: body.desc,
+                desc: header_desc.or(body.desc),
                 needs,
                 parent,
                 manual: body.manual,
@@ -733,21 +793,32 @@ impl<'s> Parser<'s> {
         }
     }
 
-    /// Named template parameters before the `{`, or a `needs` or `lock` clause:
-    /// `a b c="default"`.
-    fn params(&mut self) -> Result<Vec<Param>> {
+    /// A template's named parameters, in parentheses right after its name:
+    /// `(a, b, c="default")`. Without them, calls take any words.
+    fn params(&mut self) -> Result<Option<Vec<Param>>> {
+        if self.peek() != Some('(') {
+            self.skip_inline_ws();
+            let save = self.pos;
+            let word = self.word("").ok();
+            self.pos = save;
+            if let Some(word) = word.filter(|w| w != "needs" && w != "lock") {
+                return Err(self.error(format!(
+                    "unexpected '{word}': a template's parameters go in parentheses, \
+                     like `template name(a, b=\"default\") {{`"
+                )));
+            }
+            return Ok(None);
+        }
+        self.bump();
         let mut params: Vec<Param> = Vec::new();
         loop {
             self.skip_inline_ws();
-            if self.peek() == Some('{') || self.at_line_end() {
-                return Ok(params);
+            if self.peek() == Some(')') {
+                self.bump();
+                return Ok(Some(params));
             }
             let start = self.pos;
-            let name = self.word("a parameter name or '{'")?;
-            if name == "needs" || name == "lock" {
-                self.pos = start;
-                return Ok(params);
-            }
+            let name = self.word("a parameter name or ')'")?;
             if !name.chars().all(crate::vars::is_var_char)
                 || name.chars().all(|c| c.is_ascii_digit())
                 || matches!(name.as_str(), "args" | "tmp" | "value")
@@ -775,16 +846,36 @@ impl<'s> Parser<'s> {
                 None
             };
             params.push(Param { name, default });
+            self.skip_inline_ws();
+            match self.peek() {
+                Some(',') => self.bump(),
+                Some(')') => {}
+                _ => return Err(self.error("expected ',' or ')' after a parameter")),
+            }
         }
     }
 
-    /// `setting "value" {` with a `get` and a `set` line (or `{` blocks), and maybe `keep`.
+    /// `setting [name =] "value" {` with a `get` and a `set` line (or `{`
+    /// blocks), and maybe `default` or `keep`.
     fn setting(&mut self, start: usize) -> Result<SettingStep> {
         self.skip_inline_ws();
-        let value = match self.peek() {
+        let mut value = match self.peek() {
             Some('"' | '\'') => self.string()?,
             _ => self.word("the value it should have")?,
         };
+        self.skip_inline_ws();
+        let mut name = None;
+        if self.peek() == Some('=') {
+            self.bump();
+            self.skip_inline_ws();
+            name = Some(std::mem::replace(
+                &mut value,
+                match self.peek() {
+                    Some('"' | '\'') => self.string()?,
+                    _ => self.word("the value it should have, after `=`")?,
+                },
+            ));
+        }
         self.open_brace()?;
         let (mut get, mut set, mut default, mut keep) = (None, None, None, false);
         loop {
@@ -828,6 +919,7 @@ impl<'s> Parser<'s> {
         }
         match (get, set) {
             (Some(get), Some(set)) => Ok(SettingStep {
+                name,
                 value,
                 get,
                 set,
@@ -1114,7 +1206,7 @@ impl<'s> Parser<'s> {
     /// `line "path" [sudo] [new] [keep] [base "path"] [match "start"] [before "start" | after "start"] "text"`
     fn line_step(&mut self) -> Result<LineStep> {
         let path = self.string()?;
-        let mut step = LineStep {
+        let step = LineStep {
             path,
             text: String::new(),
             place: None,
@@ -1124,10 +1216,66 @@ impl<'s> Parser<'s> {
             sudo: false,
             keep: false,
         };
+        let (step, block) = self.line_options(step, false)?;
+        debug_assert!(!block);
+        Ok(step)
+    }
+
+    /// `lines "path" [options] {` with a line of `[options] "text"` for each
+    /// line step in that file: its options are each line's, which add to them.
+    fn lines_block(&mut self, start: usize) -> Result<Vec<LineStep>> {
+        let path = self.string()?;
+        let header = LineStep {
+            path,
+            text: String::new(),
+            place: None,
+            base: None,
+            matcher: None,
+            new: false,
+            sudo: false,
+            keep: false,
+        };
+        let (header, _) = self.line_options(header, true)?;
+        let mut steps = Vec::new();
+        loop {
+            self.skip_trivia();
+            if self.eof() {
+                return Err(self.error_at(start, "missing closing '}'"));
+            }
+            if self.peek() == Some('}') {
+                self.bump();
+                self.end_of_line()?;
+                break;
+            }
+            let (step, _) = self.line_options(header.clone(), false)?;
+            steps.push(step);
+        }
+        if steps.is_empty() {
+            return Err(self.error_at(start, "`lines` has no lines in it"));
+        }
+        Ok(steps)
+    }
+
+    /// A line step's options and then its text, to the end of the line. In a
+    /// `lines` header (`header`), the options end with `{` instead, which
+    /// returns true.
+    fn line_options(&mut self, mut step: LineStep, header: bool) -> Result<(LineStep, bool)> {
+        let mut own_place = false;
         loop {
             self.skip_inline_ws();
+            if header && self.peek() == Some('{') {
+                self.bump();
+                self.end_of_line()?;
+                return Ok((step, true));
+            }
             if let Some('"' | '\'') = self.peek() {
                 let start = self.pos;
+                if header {
+                    return Err(self.error_at(
+                        start,
+                        "the lines go inside `lines \"path\" {`, one on each line",
+                    ));
+                }
                 step.text = self.string()?;
                 if step.text.contains('\n') {
                     return Err(self.error_at(start, "a line can't have a newline in it"));
@@ -1138,14 +1286,19 @@ impl<'s> Parser<'s> {
                 break;
             }
             let start = self.pos;
-            match self
-                .word("the line, 'before', 'after', 'match', 'base', 'sudo', 'new' or 'keep'")?
-                .as_str()
-            {
+            let expected = if header {
+                "'{', 'before', 'after', 'base', 'sudo', 'new' or 'keep'"
+            } else {
+                "the line, 'before', 'after', 'match', 'base', 'sudo', 'new' or 'keep'"
+            };
+            match self.word(expected)?.as_str() {
                 "sudo" => step.sudo = true,
                 "keep" => step.keep = true,
                 "base" => step.base = Some(self.string()?),
                 "new" => step.new = true,
+                "match" if header => {
+                    return Err(self.error_at(start, "'match' is for each line, not all of them"));
+                }
                 "match" => {
                     let prefix = self.string()?;
                     if prefix.trim().is_empty() {
@@ -1154,10 +1307,12 @@ impl<'s> Parser<'s> {
                     step.matcher = Some(prefix);
                 }
                 word @ ("before" | "after") => {
-                    if step.place.is_some() {
+                    let prefix = self.string()?;
+                    // A line's own `before`/`after` replaces its header's.
+                    if own_place {
                         return Err(self.error_at(start, "only one of 'before' or 'after'"));
                     }
-                    let prefix = self.string()?;
+                    own_place = true;
                     step.place = Some(if word == "before" {
                         LinePlace::Before(prefix)
                     } else {
@@ -1170,7 +1325,7 @@ impl<'s> Parser<'s> {
             }
         }
         self.end_of_line()?;
-        Ok(step)
+        Ok((step, false))
     }
 
     /// The source from `start` to here.
@@ -1489,6 +1644,53 @@ impl<'s> Parser<'s> {
     }
 }
 
+/// The files a path names: itself, or with `*` or `?` in its file name
+/// (not its directories), the files in its directory that match, sorted.
+fn glob(path: &Path) -> std::result::Result<Vec<PathBuf>, String> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir = path.parent().unwrap_or(Path::new("."));
+    if dir.to_string_lossy().contains(['*', '?']) {
+        return Err(format!(
+            "{}: only the file name can have `*` or `?`",
+            path.display()
+        ));
+    }
+    if !name.contains(['*', '?']) {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("can't list {}: {e}", dir.display()))?;
+    let pattern: Vec<char> = name.chars().collect();
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| !t.is_dir()))
+        .filter(|e| {
+            let name: Vec<char> = e.file_name().to_string_lossy().chars().collect();
+            // Like the shell, `*` doesn't match a leading dot.
+            name.first() != Some(&'.') && glob_matches(&pattern, &name)
+        })
+        .map(|e| e.path())
+        .collect();
+    if found.is_empty() {
+        return Err(format!("no files match {}", path.display()));
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Whether `name` matches `pattern`, where `*` is any run of characters and `?` one.
+fn glob_matches(pattern: &[char], name: &[char]) -> bool {
+    match pattern.split_first() {
+        None => name.is_empty(),
+        Some(('*', rest)) => (0..=name.len()).any(|i| glob_matches(rest, &name[i..])),
+        Some(('?', rest)) => !name.is_empty() && glob_matches(rest, &name[1..]),
+        Some((c, rest)) => name.first() == Some(c) && glob_matches(rest, &name[1..]),
+    }
+}
+
 /// Flags that can come before `task`, `subtask` or `template`.
 fn is_header_flag(word: &str) -> bool {
     matches!(
@@ -1524,6 +1726,7 @@ fn is_keyword(word: &str) -> bool {
             | "file"
             | "directory"
             | "line"
+            | "lines"
             | "setting"
             | "wait"
             | "else"
@@ -1697,6 +1900,118 @@ mod tests {
         assert!(format!("{:?}", file.ctx.secrets).contains("age_plugin: None"));
         assert!(parse_err("age-key \"k.age\" plugin\n").contains("expected an age plugin name"));
         assert!(parse_err("age-key \"k.age\" yubikey\n").contains("expected the end of the line"));
+    }
+
+    #[test]
+    fn descriptions_go_in_the_header() {
+        let file =
+            parse("task t \"Does t\" needs u {\n run true\n}\ntask u {\n desc \"Does u\"\n}\n");
+        assert_eq!(file.tasks["t"].desc.as_deref(), Some("Does t"));
+        assert_eq!(file.tasks["t"].needs, ["u"]);
+        assert_eq!(file.tasks["u"].desc.as_deref(), Some("Does u"));
+        let file = parse("task p {\n run true\n}\nsubtask s of p 'After p' {\n run true\n}\n");
+        assert_eq!(file.tasks["s"].desc.as_deref(), Some("After p"));
+        assert!(parse_err("task t \"a\" {\n desc \"b\"\n}\n").contains("and a `desc`"));
+        assert!(parse_err("template x \"a\" {\n run true\n}\n").contains("no description"));
+    }
+
+    #[test]
+    fn call_blocks_call_once_per_line() {
+        let file = parse(
+            "template d {\n run true\n}\ntask t {\n d one {  # why\n  a 1\n\n  # skipped\n  b \"2 3\"\n }\n d {\n  x\n }\n}\n",
+        );
+        let calls: Vec<&str> = file.tasks["t"]
+            .body
+            .steps
+            .iter()
+            .map(|s| match s {
+                Step::Call { args, .. } => args.as_str(),
+                _ => panic!("{s:?}"),
+            })
+            .collect();
+        assert_eq!(calls, ["one a 1", "one b \"2 3\"", "x"]);
+        assert!(
+            parse_err("template d {\n run true\n}\ntask t {\n d {\n }\n}\n")
+                .contains("has no lines")
+        );
+        assert!(
+            parse_err("template d {\n run true\n}\ntask t {\n d {\n  a\n")
+                .contains("missing closing")
+        );
+    }
+
+    #[test]
+    fn lines_blocks_share_a_file_and_options() {
+        let file = parse(
+            "task t {\n lines \"/etc/x\" sudo after \"[a]\" {\n  match \"#A\" \"A\"\n  keep before \"[b]\" \"B\"  # why\n }\n}\n",
+        );
+        let lines: Vec<&LineStep> = file.tasks["t"]
+            .body
+            .steps
+            .iter()
+            .map(|s| match s {
+                Step::Line(l) => l.as_ref(),
+                _ => panic!("{s:?}"),
+            })
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|l| l.path == "/etc/x" && l.sudo));
+        assert_eq!(lines[0].matcher.as_deref(), Some("#A"));
+        assert!(matches!(&lines[0].place, Some(LinePlace::After(a)) if a == "[a]"));
+        assert!(!lines[0].keep && lines[1].keep);
+        assert!(matches!(&lines[1].place, Some(LinePlace::Before(b)) if b == "[b]"));
+        assert!(parse_err("task t {\n lines \"x\" \"A\"\n}\n").contains("go inside"));
+        assert!(parse_err("task t {\n lines \"x\" match \"a\" {\n}\n").contains("for each line"));
+        assert!(parse_err("task t {\n lines \"x\" {\n }\n}\n").contains("no lines"));
+    }
+
+    #[test]
+    fn settings_can_have_a_name() {
+        let source = "task t {\n setting shields-up = true {\n  get a\n  set b\n }\n setting \"x y\" {\n  get a\n  set b\n }\n}\n";
+        let file = parse(source);
+        let settings: Vec<&SettingStep> = file.tasks["t"]
+            .body
+            .steps
+            .iter()
+            .map(|s| match s {
+                Step::Setting(s) => s.as_ref(),
+                _ => panic!("{s:?}"),
+            })
+            .collect();
+        assert_eq!(settings[0].name.as_deref(), Some("shields-up"));
+        assert_eq!(settings[0].value, "true");
+        assert_eq!(
+            (settings[1].name.as_deref(), settings[1].value.as_str()),
+            (None, "x y")
+        );
+        assert_eq!(
+            file.tasks["t"].body.steps[0].describe(),
+            "setting shields-up"
+        );
+    }
+
+    #[test]
+    fn secrets_take_a_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["b.yaml", "a.yaml", ".hidden.yaml", "c.json"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        std::fs::create_dir(dir.path().join("d.yaml")).unwrap();
+        let file = parse_str("secrets \"*.yaml\"\n", dir.path()).unwrap();
+        let names: Vec<String> = file
+            .declarations
+            .iter()
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.yaml", "b.yaml"]);
+        let err = parse_str("secrets \"*.toml\"\n", dir.path()).err().unwrap();
+        assert!(format!("{err:#}").contains("no files match"), "{err:#}");
+        let err = parse_str("secrets \"*/x.yaml\"\n", dir.path())
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("only the file name"), "{err:#}");
+        assert!(glob_matches(&['a', '?', '*'], &['a', 'b']));
+        assert!(!glob_matches(&['a', '?'], &['a']));
     }
 
     #[test]

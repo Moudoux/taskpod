@@ -61,9 +61,9 @@ pub struct Task {
 #[derive(Debug)]
 pub struct Template {
     pub name: String,
-    /// Named parameters, `template name a b c="default" {`. Without any,
-    /// calls take any arguments, as `{{ args }}` and `{{ 1 }}`, `{{ 2 }}`, ...
-    pub params: Vec<Param>,
+    /// Named parameters, `template name(a, b, c="default") {`. Without
+    /// parentheses, calls take any words, as `{{ args }}` and `{{ 1 }}`, `{{ 2 }}`, ...
+    pub params: Option<Vec<Param>>,
     pub needs: Vec<String>,
     pub vars: Vars,
     pub body: Block,
@@ -77,50 +77,200 @@ pub struct Param {
     pub default: Option<String>,
 }
 
-impl Template {
-    /// Check the number of words a call gives, if the template names its
-    /// parameters. Optional ones come last.
-    pub fn check_arity(&self, words: usize) -> std::result::Result<(), String> {
-        if self.params.is_empty() {
-            return Ok(());
+/// One word of a template call, as written: `{{ }}` and quotes keep spaces
+/// in it, and `name=value` sets a named parameter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallWord {
+    /// The parameter it names, for `name=value`.
+    pub name: Option<String>,
+    /// The value, without its quotes.
+    pub value: String,
+    /// Quoted (all of it, or the value after `name=`): it stays one word
+    /// once its variables are filled in.
+    pub quoted: bool,
+}
+
+/// Split a template call's arguments into words, as written (before
+/// variables are filled in). `'...'` and `"..."` quote, with `\"` and
+/// `\\` in double quotes, and `{{ ... }}` is part of the word it's in.
+/// `name=` is only taken for a parameter's name when `params` has it, so a
+/// template without named parameters gets `x=y` as a word.
+pub fn split_call(
+    args: &str,
+    params: Option<&[Param]>,
+) -> std::result::Result<Vec<CallWord>, String> {
+    let mut words = Vec::new();
+    let mut chars = args.char_indices().peekable();
+    while let Some(&(start, c)) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
         }
-        let required = self.params.iter().filter(|p| p.default.is_none()).count();
-        let names: Vec<String> = self
-            .params
+        let mut value = String::new();
+        let mut quoted = false;
+        let mut name = None;
+        while let Some(&(i, c)) = chars.peek() {
+            if c.is_whitespace() {
+                break;
+            }
+            chars.next();
+            match c {
+                '\'' | '"' => {
+                    quoted = true;
+                    let mut closed = false;
+                    while let Some((_, d)) = chars.next() {
+                        if d == c {
+                            closed = true;
+                            break;
+                        }
+                        if c == '"' && d == '\\' {
+                            match chars.peek() {
+                                Some(&(_, e @ ('"' | '\\'))) => {
+                                    chars.next();
+                                    value.push(e);
+                                }
+                                _ => value.push(d),
+                            }
+                        } else {
+                            value.push(d);
+                        }
+                    }
+                    if !closed {
+                        return Err(format!("unclosed quote in `{}`", &args[start..]));
+                    }
+                }
+                '{' if args[i..].starts_with("{{") => {
+                    let Some(len) = args[i..].find("}}") else {
+                        return Err(format!("missing '}}}}' in `{}`", &args[start..]));
+                    };
+                    value.push_str(&args[i..i + len + 2]);
+                    while chars.peek().is_some_and(|&(j, _)| j < i + len + 2) {
+                        chars.next();
+                    }
+                }
+                '=' if name.is_none() && !quoted && value.chars().all(crate::vars::is_var_char) => {
+                    if params.is_some_and(|ps| ps.iter().any(|p| p.name == value)) {
+                        name = Some(std::mem::take(&mut value));
+                    } else {
+                        value.push(c);
+                    }
+                }
+                c => value.push(c),
+            }
+        }
+        words.push(CallWord {
+            name,
+            value,
+            quoted,
+        });
+    }
+    Ok(words)
+}
+
+/// A call's arguments with their variables filled in.
+#[derive(Debug, Default)]
+pub struct CallArgs {
+    /// `{{ args }}`: all of them, as written, filled in.
+    pub text: String,
+    /// The words given by position: `{{ 1 }}`, `{{ 2 }}`, ...
+    pub words: Vec<String>,
+    /// `name=value`s.
+    pub named: Vec<(String, String)>,
+}
+
+impl CallArgs {
+    /// Fill in `raw`'s variables with `expand`. An unquoted word whose
+    /// variables hold spaces becomes several words, as it always has.
+    pub fn new(
+        template: &Template,
+        raw: &str,
+        expand: impl Fn(&str) -> Result<String>,
+    ) -> Result<Self> {
+        let mut args = CallArgs {
+            text: expand(raw)?,
+            ..CallArgs::default()
+        };
+        let words = split_call(raw, template.params.as_deref())
+            .map_err(|e| anyhow::anyhow!("`{} {raw}`: {e}", template.name))?;
+        for word in words {
+            let value = expand(&word.value)?;
+            match word.name {
+                Some(name) => args.named.push((name, value)),
+                None if word.quoted => args.words.push(value),
+                None => args
+                    .words
+                    .extend(value.split_whitespace().map(String::from)),
+            }
+        }
+        Ok(args)
+    }
+}
+
+impl Template {
+    /// The usage line: `name a [b]`.
+    fn usage(&self, params: &[Param]) -> String {
+        let names: Vec<String> = params
             .iter()
             .map(|p| match &p.default {
                 Some(_) => format!("[{}]", p.name),
                 None => p.name.clone(),
             })
             .collect();
-        let usage = format!("{} {}", self.name, names.join(" "));
-        if words < required {
-            return Err(format!(
-                "template '{}' needs {}: {usage}",
-                self.name,
-                plural(required, "argument")
-            ));
-        }
-        if words > self.params.len() {
+        format!("{} {}", self.name, names.join(" "))
+    }
+
+    /// Check that a call gives each required parameter once, if the template
+    /// names its parameters. Optional ones come last.
+    pub fn check_call(&self, args: &CallArgs) -> std::result::Result<(), String> {
+        let Some(params) = &self.params else {
+            return Ok(());
+        };
+        let usage = self.usage(params);
+        if args.words.len() > params.len() {
             return Err(format!(
                 "template '{}' takes at most {}: {usage}",
                 self.name,
-                plural(self.params.len(), "argument")
+                plural(params.len(), "argument")
+            ));
+        }
+        for (i, (name, _)) in args.named.iter().enumerate() {
+            if args.named[..i].iter().any(|(n, _)| n == name) {
+                return Err(format!("`{name}=` is given twice"));
+            }
+            if params.iter().position(|p| &p.name == name) < Some(args.words.len()) {
+                return Err(format!("`{name}` is given by position and as `{name}=`"));
+            }
+        }
+        let missing: Vec<&str> = params
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| {
+                p.default.is_none()
+                    && *i >= args.words.len()
+                    && !args.named.iter().any(|(n, _)| n == &p.name)
+            })
+            .map(|(_, p)| p.name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            let required = params.iter().filter(|p| p.default.is_none()).count();
+            return Err(format!(
+                "template '{}' needs {} ({} missing): {usage}",
+                self.name,
+                plural(required, "argument"),
+                missing.join(", ")
             ));
         }
         Ok(())
     }
-}
 
-impl Template {
     /// Variables for one call: `{{ args }}`, `{{ 1 }}`, `{{ 2 }}`, ... and
     /// each named parameter, with its default when the call leaves it out.
-    pub fn arg_vars(&self, args: &str) -> Vars {
-        let mut vars = Vars::for_args(args);
-        let words: Vec<&str> = args.split_whitespace().collect();
-        for (i, param) in self.params.iter().enumerate() {
-            match (words.get(i), &param.default) {
-                (Some(word), _) => vars.literal(param.name.clone(), *word),
+    pub fn arg_vars(&self, args: &CallArgs) -> Vars {
+        let mut vars = Vars::for_args(&args.text, &args.words);
+        for (i, param) in self.params.iter().flatten().enumerate() {
+            let named = args.named.iter().find(|(n, _)| n == &param.name);
+            match (args.words.get(i).or(named.map(|(_, v)| v)), &param.default) {
+                (Some(word), _) => vars.literal(param.name.clone(), word.as_str()),
                 (None, Some(default)) => vars.set(
                     param.name.clone(),
                     crate::vars::Var::Template(default.clone()),
@@ -237,6 +387,8 @@ impl WaitStep {
 /// value from before taskpod first set it, so `--undo` sets that again.
 #[derive(Debug, Clone)]
 pub struct SettingStep {
+    /// `setting name = value {`: what it's called in the output.
+    pub name: Option<String>,
     pub value: String,
     pub get: String,
     pub set: String,
@@ -556,7 +708,10 @@ impl Step {
             Step::Undo(script) => format!("undo {script}"),
             Step::Notice(text) => format!("notice {text}"),
             Step::Wait(wait) => wait.label(),
-            Step::Setting(setting) => format!("setting {}", setting.get),
+            Step::Setting(setting) => match &setting.name {
+                Some(name) => format!("setting {name}"),
+                None => format!("setting {}", setting.get),
+            },
             Step::File(file) if file.dir => format!("directory {}", file.path),
             Step::File(file) => format!("file {}", file.path),
             Step::Line(line) => format!("line {}", line.path),
@@ -636,10 +791,14 @@ impl TaskFile {
                     bail!("{origin}: unknown directive or template '{template}'");
                 };
                 // Arguments with variables are checked once they're worked out.
-                if !args.contains("{{")
-                    && let Err(e) = called.check_arity(args.split_whitespace().count())
-                {
-                    bail!("{origin}: `{}`: {e}", format!("{template} {args}").trim());
+                if !args.contains("{{") {
+                    let call = format!("{template} {args}");
+                    let checked = CallArgs::new(called, args, |s| Ok(s.to_string()))
+                        .map_err(|e| e.to_string())
+                        .and_then(|a| called.check_call(&a));
+                    if let Err(e) = checked {
+                        bail!("{origin}: `{}`: {e}", call.trim());
+                    }
                 }
                 if stack.contains(&template.as_str()) {
                     bail!("{origin}: template '{template}' calls itself");

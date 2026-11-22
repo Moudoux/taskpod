@@ -34,10 +34,16 @@
       "include": "#lock"
     },
     {
+      "include": "#lines-block"
+    },
+    {
       "include": "#file"
     },
     {
       "include": "#directive"
+    },
+    {
+      "include": "#call-block"
     },
     {
       "include": "#call"
@@ -115,6 +121,10 @@
         },
         {
           "include": "#strings"
+        },
+        {
+          "match": "[(),]",
+          "name": "punctuation.separator.parameters.taskpod"
         },
         {
           "match": "([\\p{L}\\p{N}_.+-]+)(=)?",
@@ -445,7 +455,7 @@
       ]
     },
     "call": {
-      "begin": "^\\s+(?!(?:desc|needs|lock|if|unless|ask|changed|sudo|terminal|manual|interactive|workdir|keep|notice|let|run|undo|file|directory|line|setting|wait|get|set|else)\\b)([\\p{L}\\p{N}_.+-]+)(?=\\s|$)",
+      "begin": "^\\s+(?!(?:desc|needs|lock|if|unless|ask|changed|sudo|terminal|manual|interactive|workdir|keep|notice|let|run|undo|file|directory|line|lines|setting|wait|get|set|else)\\b)([\\p{L}\\p{N}_.+-]+)(?=\\s|$)",
       "beginCaptures": {
         "1": {
           "name": "entity.name.function.call.taskpod"
@@ -646,6 +656,90 @@
               "name": "constant.numeric.taskpod"
             }
           }
+        }
+      ]
+    },
+    "call-block": {
+      "begin": "^\\s+(?!(?:desc|needs|lock|if|unless|ask|changed|sudo|terminal|manual|interactive|workdir|keep|notice|let|run|undo|file|directory|line|lines|setting|wait|get|set|else)\\b)([\\p{L}\\p{N}_.+-]+)(?=(?:\\s[^#]*)?\\s\\{\\s*(?:#.*)?$|\\s*\\{\\s*(?:#.*)?$)",
+      "beginCaptures": {
+        "1": {
+          "name": "entity.name.function.call.taskpod"
+        }
+      },
+      "end": "^\\s*(\\})",
+      "endCaptures": {
+        "1": {
+          "name": "punctuation.section.block.end.taskpod"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#comment"
+        },
+        {
+          "include": "#strings"
+        },
+        {
+          "include": "#interpolation"
+        }
+      ]
+    },
+    "lines-block": {
+      "begin": "^\\s*(lines)\\b",
+      "beginCaptures": {
+        "1": {
+          "name": "support.type.step.taskpod"
+        }
+      },
+      "end": "^\\s*(\\})",
+      "endCaptures": {
+        "1": {
+          "name": "punctuation.section.block.end.taskpod"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#strings"
+        },
+        {
+          "match": "\\b(mode)\\s+([0-7]{3,4})\\b",
+          "captures": {
+            "1": {
+              "name": "entity.other.attribute-name.taskpod"
+            },
+            "2": {
+              "name": "constant.numeric.octal.taskpod"
+            }
+          }
+        },
+        {
+          "match": "\\b(encoding)\\s+([\\w-]+)",
+          "captures": {
+            "1": {
+              "name": "entity.other.attribute-name.taskpod"
+            },
+            "2": {
+              "name": "constant.language.encoding.taskpod"
+            }
+          }
+        },
+        {
+          "match": "\\b(owner)\\s+([\\w.-]+(?::[\\w.-]+)?)",
+          "captures": {
+            "1": {
+              "name": "entity.other.attribute-name.taskpod"
+            },
+            "2": {
+              "name": "variable.other.constant.owner.taskpod"
+            }
+          }
+        },
+        {
+          "match": "\\b(sudo|from|url|sha256|new|keep|before|after|base|match)\\b",
+          "name": "entity.other.attribute-name.taskpod"
+        },
+        {
+          "include": "#comment"
         }
       ]
     }

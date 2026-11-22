@@ -12,7 +12,7 @@
       <option name="HAS_STRING_ESCAPES" value="true" />
     </options>
     <keywords keywords="age-key;env;include;let;of;secrets;shell;subtask;task;template" ignore_case="false" />
-    <keywords2 keywords="after;base;before;desc;directory;encoding;file;from;get;interactive;keep;line;lock;manual;match;mode;needs;new;notice;owner;plugin;run;set;setting;sha256;sudo;terminal;timeout;undo;url;wait;workdir" />
+    <keywords2 keywords="after;base;before;desc;directory;encoding;file;from;get;interactive;keep;line;lines;lock;manual;match;mode;needs;new;notice;owner;plugin;run;set;setting;sha256;sudo;terminal;timeout;undo;url;wait;workdir" />
     <keywords3 keywords="ask;changed;choose;confirm;contains;else;exists;has-line;if;input;unless;until;which" />
   </highlighting>
   <extensionMap>

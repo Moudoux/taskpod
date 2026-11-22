@@ -46,6 +46,9 @@ pub struct Options {
     /// Undo the tasks instead, in reverse order; `mode` says whether to do it
     /// (`Run`) or only show it.
     pub undo: bool,
+    /// Record in the journal what `new` steps say, for files and lines taskpod
+    /// wrote before it kept one; `mode` says whether to write it (`Run`).
+    pub adopt: bool,
     /// Let checks read as root (asking for sudo once): files only root can
     /// read or see, and the root undo journal. They still change nothing.
     pub root: bool,
@@ -54,7 +57,7 @@ pub struct Options {
 impl Options {
     /// Whether tasks are only looked at, one at a time: checks and pulls.
     pub fn checking(&self) -> bool {
-        self.mode != Mode::Run || self.pull
+        self.mode != Mode::Run || self.pull || self.adopt
     }
 }
 

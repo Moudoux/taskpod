@@ -9,6 +9,8 @@
 #   taskpod spec.task -H host  run on another machine over SSH, nothing to install there
 #   taskpod spec.task -r hello run one task, and the tasks it needs
 #   taskpod spec.task -u       undo every task (see Undo below), -D or -d only show it
+#   taskpod spec.task --adopt  record what `new` steps say in the undo journal,
+#                              so `new` can come out (see Undo), -D or -d only show it
 #   taskpod spec.task -l       list tasks
 #   taskpod spec.task -g       the task graph: each task with what runs before it
 #                              (-g dot for Graphviz, -g mermaid)
@@ -41,8 +43,11 @@ let today = $(date +%A)        # shell output, run once when first used
 # {{ secrets.name }}; nested keys join with dots: {{ secrets.wifi.password }}.
 # Decrypted with `sops` the first time a secret is used, so runs that don't
 # use one need no key. Values are hidden from output (shown as ••••), and
-# `taskpod FILE --secrets other.yaml` adds files from the command line:
+# `taskpod FILE --secrets other.yaml` adds files from the command line.
+# A `*` or `?` in the file name (not its directories) names every file there
+# that matches, in order:
 #   secrets "secrets.yaml"
+#   secrets "secrets/*.yaml"
 # Each file is unlocked on its own, so with a security key, several files
 # mean several PINs and touches. An age identity encrypted to the key, that
 # the files are also encrypted to, is decrypted once and unlocks them all
@@ -59,8 +64,9 @@ let today = $(date +%A)        # shell output, run once when first used
 # Commands run with `sh -ec` by default, change it with:
 #   shell "bash -eo pipefail -c"
 
-task main {
-    desc "{{ greeting }} on a {{ today }}"   # shown when the task runs
+# A string after the name is the task's description, shown when it runs
+# (or `desc "..."` in the body).
+task main "{{ greeting }} on a {{ today }}" {
     # Each `run` is a shell command, passed to the shell as written.
     run echo "Hello main!"
     # A block runs as one script, so `cd` and shell variables carry over.
@@ -147,11 +153,18 @@ subtask world of hello {
 }
 
 # Templates are reusable steps. Call one with words after its name: inside
-# the template, {{ args }} is all of them and {{ 1 }}, {{ 2 }}, ... each one.
-# Name them after the template's name, `name="default"` for optional ones
-# (last): calls with too few or too many words are an error. A default can
-# use variables and the template's other parameters (`pkg="{{ repo }}"`).
-# Without names, a template takes any number of words.
+# the template, {{ args }} is all of them as written and {{ 1 }}, {{ 2 }},
+# ... each one. A word is split on spaces once its variables are filled in,
+# unless it's quoted: "two words" or 'two words' is one.
+# Name the parameters in parentheses after the template's name,
+# `name="default"` for optional ones (last): a call that leaves out a
+# required one, or gives too many words, is an error, and `()` takes none.
+# A default can use variables and the template's other parameters
+# (`pkg="{{ repo }}"`). Without parentheses, a template takes any number of words.
+# A call can give a parameter by name, `greeting=hi`, anywhere among its
+# words (the others fill the parameters in order), which also skips optional
+# ones before it. Only a parameter's name counts: other `x=y` words are
+# words, like in a template without parameters.
 # A template's guards only apply to that call, so a task can mix calls that
 # are already done with ones that still need to run. A template's own
 # `let $( )` or question that uses {{ }} is worked out again for each call.
@@ -165,14 +178,14 @@ task notes {
     note second
 }
 
-template greet who greeting="hello" {
+template greet(who, greeting="hello") {
     run echo "{{ greeting }}, {{ who }}"
 }
 
 # `workdir` in a template or an inline block is where its steps run, relative
 # to the directory around it. Its own guards are checked outside it: they say
 # whether to go in. Each call gets its own {{ tmp }}, so a template can build in it:
-template build-from repo {
+template build-from(repo) {
     run git clone -q {{ repo }} {{ tmp }}
     if exists "{{ tmp }}/Makefile" {
         workdir "{{ tmp }}"
@@ -181,8 +194,15 @@ template build-from repo {
 }
 
 task greetings {
-    greet world        # hello, world
-    greet you hi       # hi, you
+    greet world                  # hello, world
+    greet you hi                 # hi, you
+    greet greeting=hey "you two" # hey, you two
+    # A call that ends in `{` calls the template once for each line, with the
+    # line's words after the ones before the `{`:
+    greet everyone {
+        hi                       # hi, everyone
+        greeting=welcome         # welcome, everyone
+    }
 }
 
 task setup {
@@ -250,6 +270,14 @@ task setup {
     #   line "~/.bashrc" ". ~/.scripts/functions.sh"
     #   line "/etc/pam.d/kde" sudo base "/usr/lib/pam.d/kde" match "auth sufficient pam_u2f.so" \
     #       before "auth" "auth sufficient pam_u2f.so cue"
+    # Several lines in one file: `lines "path" [options] {` with a line of
+    # `[options] "text"` for each, like a `line` step each. The options before
+    # the `{` (not `match`) are every line's; a line's own add to them, and
+    # its `before` or `after` replaces theirs.
+    #   lines "/etc/pacman.conf" sudo {
+    #       match "#Color" "Color"
+    #       match "#ParallelDownloads" "ParallelDownloads = 10"
+    #   }
     run /tmp/taskpod-example/hello.sh
     # A `setting` is a value that commands read and write. `get` prints it
     # (compared trimmed); when that's not the value, `set` runs with it as
@@ -257,8 +285,9 @@ task setup {
     # value. The journal keeps what `get` printed before taskpod first set
     # it, so --undo sets that again (`keep`: undo leaves it). `default "x"` is
     # what undo sets without a record, like for a value set before taskpod
-    # kept one. `get` and `set` can be `{` blocks like `run`.
-    setting "org.kde.dolphin.desktop" {
+    # kept one. `get` and `set` can be `{` blocks like `run`. `setting name =
+    # "value" {` names it in the output, instead of its `get` command.
+    setting file-manager = "org.kde.dolphin.desktop" {
         get xdg-mime query default inode/directory
         set xdg-mime default {{ value }} inode/directory
     }
@@ -272,7 +301,11 @@ task setup {
 #   mode, owner and modification time), from a journal on the machine: SQLite
 #   databases at ~/.local/state/taskpod/journal.db, and
 #   /var/lib/taskpod/journal.db (root only) for what's written as root. A file
-#   without a record is deleted if it says `new`, otherwise reported. One
+#   without a record is deleted if it says `new`, otherwise reported. A file
+#   taskpod writes now is in the journal from the start; `new` is for one
+#   written before taskpod kept a journal. `taskpod FILE --adopt` records what
+#   each `new` step says for the files and lines on the system (taskpod
+#   created the file, or added the line), after which `new` can come out. One
 #   changed since taskpod wrote it is asked about (--yes: undone). Checks read
 #   root's journal, and files only root can read, only with --root.
 # - Commands can't be undone by themselves: `undo` gives the command that

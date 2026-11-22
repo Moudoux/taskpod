@@ -16,8 +16,8 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   task: {
     places: ["top"],
     summary:
-      "Defines a task. Tasks run in parallel unless `needs` orders them. Flags (`sudo`, `terminal`, `keep`, `manual`, `interactive`) can go before `task`, and `needs` and `lock` after the name, or all of them in the body.",
-    syntax: 'task name {\n    desc "What it does"\n    run command\n}\n\nsudo interactive task update-aur needs yay lock pacman {\n    run yay -Sua\n}',
+      "Defines a task. Tasks run in parallel unless `needs` orders them. A string after the name is its description (or `desc` in the body). Flags (`sudo`, `terminal`, `keep`, `manual`, `interactive`) can go before `task`, and `needs` and `lock` after the name, or all of them in the body.",
+    syntax: 'task name "What it does" {\n    run command\n}\n\nsudo interactive task update-aur needs yay lock pacman {\n    run yay -Sua\n}',
     snippet: "task ${1:name} {\n\t$0\n}",
   },
   subtask: {
@@ -30,8 +30,8 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   template: {
     places: ["top"],
     summary:
-      "Reusable steps, called by name inside tasks: `name words...`. Inside, `{{ args }}` is all the words and `{{ 1 }}`, `{{ 2 }}`... each one. Name the words after the template's name (`name=\"default\"` for optional ones, last), and calls with too few or too many are an error. A template's guards only apply to that call. Flags can go before `template`, and `needs` and `lock` after the parameters.",
-    syntax: 'template pkg {\n    unless pacman -Q {{ args }}\n    run yay -S --needed {{ args }}\n}\n\ntemplate greet who greeting="hello" {\n    run echo "{{ greeting }}, {{ who }}"\n}',
+      "Reusable steps, called by name inside tasks: `name words...`. Inside, `{{ args }}` is all the words as written and `{{ 1 }}`, `{{ 2 }}`... each one; a quoted word (`\"two words\"`) stays one. Name the parameters in parentheses after the template's name (`name=\"default\"` for optional ones, last), and calls that leave out a required one or give too many words are an error. A call can name a parameter, `greeting=hi`, anywhere among its words. A call ending in `{` calls the template once per line, with the line's words added. A template's guards only apply to that call. Flags can go before `template`, and `needs` and `lock` after the parameters.",
+    syntax: 'template pkg {\n    unless pacman -Q {{ args }}\n    run yay -S --needed {{ args }}\n}\n\ntemplate greet(who, greeting="hello") {\n    run echo "{{ greeting }}, {{ who }}"\n}\n\ngreet you greeting=hi\ngreet everyone {\n    hi\n    greeting=welcome\n}',
     snippet: "template ${1:name} {\n\t$0\n}",
   },
   let: {
@@ -52,8 +52,8 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   secrets: {
     places: ["top"],
     summary:
-      "Reads secrets from a sops-encrypted file (YAML, JSON, .env or INI), used as `{{ secrets.name }}`; nested keys join with dots: `{{ secrets.wifi.password }}`. Decrypted with `sops` when a secret is first used, and hidden from output. `taskpod --secrets FILE` adds files too.",
-    syntax: 'secrets "secrets.yaml"',
+      "Reads secrets from a sops-encrypted file (YAML, JSON, .env or INI), used as `{{ secrets.name }}`; nested keys join with dots: `{{ secrets.wifi.password }}`. Decrypted with `sops` when a secret is first used, and hidden from output. `taskpod --secrets FILE` adds files too. A `*` or `?` in the file name names every file that matches.",
+    syntax: 'secrets "secrets.yaml"\nsecrets "secrets/*.yaml"',
     snippet: 'secrets "${1:secrets.yaml}"',
   },
   "age-key": {
@@ -126,8 +126,8 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   setting: {
     places: ["body"],
     summary:
-      "A value commands read and write. `get` prints it (compared trimmed); when it's not the value, `set` runs with it as `{{ value }}`, and then `get` must print it. Diffs show the old and new value, and `--undo` sets the value from before taskpod first set it, from the journal (`keep`: undo leaves it). `default \"x\"` is what undo sets when the journal has no record.",
-    syntax: 'setting "org.kde.dolphin.desktop" {\n    get xdg-mime query default inode/directory\n    set xdg-mime default {{ value }} inode/directory\n}',
+      "A value commands read and write. `get` prints it (compared trimmed); when it's not the value, `set` runs with it as `{{ value }}`, and then `get` must print it. Diffs show the old and new value, and `--undo` sets the value from before taskpod first set it, from the journal (`keep`: undo leaves it). `default \"x\"` is what undo sets when the journal has no record. `setting name = \"value\" {` names it in the output.",
+    syntax: 'setting file-manager = "org.kde.dolphin.desktop" {\n    get xdg-mime query default inode/directory\n    set xdg-mime default {{ value }} inode/directory\n}',
     snippet: 'setting "${1:value}" {\n\tget ${2:command}\n\tset ${3:command {{ value \\}\\}}}\n}',
   },
   default: {
@@ -256,7 +256,7 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   new: {
     places: ["file", "line"],
     summary:
-      "The file didn't exist before taskpod, so `--undo` deletes it; on a `line`, taskpod added the line. Only needed for what taskpod wrote before it kept an undo journal: since then, undo knows what was there.",
+      "The file didn't exist before taskpod, so `--undo` deletes it; on a `line`, taskpod added the line. Only needed for what taskpod wrote before it kept an undo journal: since then, undo knows what was there. `taskpod FILE --adopt` records what `new` says in the journal, after which it can come out.",
     syntax: 'file "~/.config/app.conf" new from "files/app.conf"',
     snippet: "new",
   },
@@ -281,6 +281,13 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
       "Makes sure a file has this line, leaving the rest of it, its mode and owner as they are: for files a package or you own, like PAM configs or `~/.bashrc`. Missing, the line goes before the first other line starting with `before`, after the last starting with `after` (both ignoring indentation), or at the end, and on the wrong side it's moved. One on the right side counts first, so the same line can be elsewhere too (an `Include` in each of pacman.conf's sections); several on the wrong side stay, and it's added. Lines are compared ignoring spacing; with `match`, a line starting with that is replaced. The file must exist, unless a `base` says what to start from. The journal records what taskpod added or replaced, so `--undo` puts back only that; a line with no record is left, unless the step says `new`.",
     syntax: 'line "/etc/pam.d/sudo" sudo before "auth" "auth sufficient pam_u2f.so cue"\nline "~/.bashrc" ". ~/.scripts/functions.sh"',
     snippet: 'line "${1:path}" "${2:text}"',
+  },
+  lines: {
+    places: ["body"],
+    summary:
+      "Several `line` steps in one file: each line inside is `[options] \"text\"`, like a `line` step's. The options before the `{` (not `match`) are every line's; a line's own add to them, and its `before` or `after` replaces theirs.",
+    syntax: 'lines "/etc/pacman.conf" sudo {\n    match "#Color" "Color"\n    match "#ParallelDownloads" "ParallelDownloads = 10"\n}',
+    snippet: 'lines "${1:path}" {\n\t"${2:text}"\n}',
   },
   base: {
     places: ["line"],

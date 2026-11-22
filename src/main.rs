@@ -79,6 +79,12 @@ pub struct Args {
     #[arg(short, long, conflicts_with = "pull")]
     pub undo: bool,
 
+    /// Record in the undo journal what each `new` step says, for files and lines taskpod
+    /// wrote before it kept a journal: those on the system are recorded as taskpod's, so
+    /// `new` can come out of the task file. Changes nothing else. With -d or -D, only shows it
+    #[arg(long, conflicts_with_all = ["pull", "undo", "json"])]
+    pub adopt: bool,
+
     /// Let dry runs, diffs and pulls read as root, asking for sudo once: files only root
     /// can read or see, and the undo journal of root's files. They still change nothing
     #[arg(long, conflicts_with = "json")]
@@ -301,6 +307,7 @@ fn run(mut args: Args) -> Result<bool> {
         pull: args.pull,
         yes: args.yes,
         undo: args.undo,
+        adopt: args.adopt,
         root: args.root,
     };
     let order = if args.undo {

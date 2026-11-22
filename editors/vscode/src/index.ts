@@ -22,7 +22,7 @@ export interface TaskDef extends Span {
 
 export interface TemplateDef extends Span {
   name: string;
-  /** Named parameters, `template name a b="default" {`. */
+  /** Named parameters, `template name(a, b="default") {`. */
   params: string[];
   needs: string[];
   endLine: number;
@@ -80,7 +80,8 @@ const INTERPOLATION = /(?<!\\)\{\{\s*([\p{L}\p{N}_.\-/]+)\s*\}\}/gu;
 const STRING = /"((?:[^"\\]|\\.)*)"|'([^']*)'/g;
 
 interface Frame {
-  kind: "task" | "template" | "block";
+  /** `args`: a call block or `lines` block, whose lines are a call's words or line steps. */
+  kind: "task" | "template" | "block" | "args";
   owner?: string;
   ownerKind?: "task" | "template";
   task?: TaskDef;
@@ -102,6 +103,36 @@ function stripComment(line: string): string {
     }
   }
   return line;
+}
+
+/** A template's `(a, b="default")` from `start` (its `(`), up to the `)`. */
+function parseParams(text: string, start: number): { params: { name: string; value?: string; start: number }[]; end: number } | undefined {
+  const params: { name: string; value?: string; start: number }[] = [];
+  let i = start + 1;
+  let item = "";
+  let itemStart = i;
+  let quote: string | undefined;
+  const push = () => {
+    const lead = item.length - item.trimStart().length;
+    const param = item.trim().match(new RegExp(`^(${NAME})(?:\\s*=\\s*(.*))?$`, "u"));
+    if (param) params.push({ name: param[1], value: param[2]?.replace(/^["']|["']$/g, ""), start: itemStart + lead });
+  };
+  for (; i < text.length; i++) {
+    const c = text[i];
+    if (quote) {
+      if (c === quote) quote = undefined;
+    } else if (c === '"' || c === "'") {
+      quote = c;
+    } else if (c === "," || c === ")") {
+      push();
+      item = "";
+      itemStart = i + 1;
+      if (c === ")") return { params, end: i + 1 };
+      continue;
+    }
+    item += c;
+  }
+  return undefined;
 }
 
 /** Strings on a line, with the column of their content. */
@@ -194,6 +225,8 @@ export function parse(text: string): Index {
       if (frame?.template) frame.template.endLine = number;
       return;
     }
+    // A call's words or a line step: nothing to index but variables.
+    if (top()?.kind === "args") return;
 
     const definition = !stack.length && line.match(DEFINITION);
     if (definition) {
@@ -231,6 +264,14 @@ export function parse(text: string): Index {
       let mode: "params" | "needs" | "lock" = "params";
       let at = number;
       let from = whole.length;
+      const parens = template && line[from] === "(" ? parseParams(line, from) : undefined;
+      if (template && parens) {
+        for (const param of parens.params) {
+          template.params.push(param.name);
+          index.vars.push({ name: param.name, value: param.value ?? "(parameter)", line: number, start: param.start, end: param.start + param.name.length, owner: name });
+        }
+        from = parens.end;
+      }
       for (;;) {
         const text = stripComment(lines[at] ?? "");
         const brace = text.indexOf("{", from);
@@ -240,16 +281,12 @@ export function parse(text: string): Index {
           const wordStart = from + m.index!;
           if (word === "needs" || word === "lock") {
             mode = word;
+          } else if (mode === "params" && task && /^["']/.test(word)) {
+            task.desc = word.slice(1, -1);
           } else if (mode === "needs") {
             index.refs.push({ name: word, kind: "task", line: at, start: wordStart, end: wordStart + word.length });
             task?.needs.push(word);
             template?.needs.push(word);
-          } else if (mode === "params" && template) {
-            const param = word.match(new RegExp(`^(${NAME})(?:=(.*))?$`, "u"));
-            if (!param) continue;
-            template.params.push(param[1]);
-            const value = param[2]?.replace(/^["']|["']$/g, "");
-            index.vars.push({ name: param[1], value: value ?? "(parameter)", line: at, start: wordStart, end: wordStart + param[1].length, owner: name });
           }
         }
         if (brace >= 0 || !text.trim().endsWith("\\")) break;
@@ -322,10 +359,12 @@ export function parse(text: string): Index {
         return;
       case "file":
       case "directory":
-      case "line": {
+      case "line":
+      case "lines": {
         const found = strings(line);
         if (found[0]) index.paths.push({ path: found[0].value, kind: "target", line: number, start: found[0].start, end: found[0].end });
-        const base = keyword === "line" && line.match(/\bbase\s+("[^"]*"|'[^']*')/);
+        if (keyword === "lines" && stack.length && /\{\s*$/.test(rest)) stack.push({ kind: "args", owner: frame?.owner, ownerKind: frame?.ownerKind });
+        const base = keyword.startsWith("line") && line.match(/\bbase\s+("[^"]*"|'[^']*')/);
         if (base) {
           const start = base.index! + base[0].indexOf(base[1]) + 1;
           index.paths.push({ path: base[1].slice(1, -1), kind: "target", line: number, start, end: start + base[1].length - 2 });
@@ -341,6 +380,8 @@ export function parse(text: string): Index {
         if (stack.length && keyword && !KEYWORDS[keyword]) {
           const start = line.indexOf(keyword);
           index.refs.push({ name: keyword, kind: "template", line: number, start, end: start + keyword.length });
+          // `name words {`: a call for each line inside.
+          if (/(^|\s)\{$/.test(rest.trim()) || rest.trim() === "{") stack.push({ kind: "args", owner: frame?.owner, ownerKind: frame?.ownerKind });
         }
     }
   });

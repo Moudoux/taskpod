@@ -200,7 +200,7 @@ task after {
 });
 
 test("template parameters are the template's variables", () => {
-  const index = parse(`template github repo version commit path="." {
+  const index = parse(`template github(repo, version, commit, path=".") {
     run cd {{ path }} && echo {{ repo }}
 }
 `);
@@ -215,7 +215,7 @@ test("template parameters are the template's variables", () => {
 });
 
 test("a template parameter's default can use its other parameters", () => {
-  const index = parse(`template github repo pkg="{{ repo }}" {
+  const index = parse(`template github(repo, pkg="{{ repo }}") {
     run echo {{ pkg }}
 }
 `);
@@ -224,7 +224,7 @@ test("a template parameter's default can use its other parameters", () => {
 });
 
 test("definition headers hold flags, needs and locks", () => {
-  const index = parse(`sudo template github repo path="." needs yay lock pacman {
+  const index = parse(`sudo template github(repo, path=".") needs yay lock pacman {
     run echo {{ repo }}
 }
 manual interactive task signing-key needs git \\
@@ -265,4 +265,39 @@ test("waits and built-in checks aren't template calls", () => {
   expect(index.refs.filter((r) => r.kind === "template").map((r) => r.name)).toEqual(["pkg"]);
   expect(index.lines[4]).toMatchObject({ owner: "t" });
   expect(index.lines[7]).toMatchObject({ owner: "t", context: "body" });
+});
+
+test("a task's description can be in its header", () => {
+  const index = parse(`task fw "Inbound firewall" needs base {
+    run true
+}
+task other {
+    desc "In the body"
+}
+`);
+  expect(index.tasks.map((t) => [t.name, t.desc, t.needs])).toEqual([
+    ["fw", "Inbound firewall", ["base"]],
+    ["other", "In the body", []],
+  ]);
+});
+
+test("call blocks and lines blocks hold words, not calls", () => {
+  const index = parse(`template display(edid, key, to) {
+    run true
+}
+task t {
+    display {{ oled }} {
+        mode 2560x1440@280
+        hdr enable
+    }
+    lines "/etc/pacman.conf" sudo {
+        match "#Color" "Color"
+    }
+    other
+}
+`);
+  expect(index.refs.filter((r) => r.kind === "template").map((r) => r.name)).toEqual(["display", "other"]);
+  expect(index.refs.filter((r) => r.kind === "var").map((r) => r.name)).toEqual(["oled"]);
+  expect(index.paths.map((p) => [p.path, p.kind])).toEqual([["/etc/pacman.conf", "target"]]);
+  expect(index.tasks[0].endLine).toBe(12);
 });
