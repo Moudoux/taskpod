@@ -78,6 +78,18 @@ subtask notify of build {
   expect(scopeOf(tokens, "notify")).toContain("entity.name.function");
 });
 
+test("highlights vars files and the template option", async () => {
+  const tokenize = await tokenizer();
+  const tokens = tokenize(`vars "versions.yaml" as versions
+task t {
+    file "/x" template from "files/x"
+}`);
+  expect(scopeOf(tokens, "vars")).toContain("keyword.control.import");
+  expect(scopeOf(tokens, "as")).toContain("entity.other.attribute-name");
+  expect(scopeOf(tokens, "versions")).toContain("variable.other.constant.vars");
+  expect(scopeOf(tokens, "template")).toContain("entity.other.attribute-name");
+});
+
 test("highlights an age-key plugin", async () => {
   const tokenize = await tokenizer();
   const tokens = tokenize(`age-key "k.age" plugin fido2-hmac # comment`);

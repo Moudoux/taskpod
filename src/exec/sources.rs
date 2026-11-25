@@ -110,6 +110,7 @@ impl<'a> Sources<'a> {
                     children: self.file_children(&declaration.path, shown),
                 },
                 DeclarationKind::Env => Node::new(format!("env {shown_path}")),
+                DeclarationKind::Vars => Node::new(format!("vars {shown_path}")),
                 DeclarationKind::Secrets => Node::new(format!(
                     "secrets {shown_path}{}",
                     missing(&declaration.path)
@@ -182,13 +183,19 @@ impl<'a> Sources<'a> {
                         FileSource::Inline(text) => found.scan(text, layers),
                         FileSource::Copy(source) => {
                             found.scan(source, layers);
+                            if file.template {
+                                for text in self.templated(source, file.dir) {
+                                    found.scan(&text, layers);
+                                }
+                            }
                             let label = self.copy(source, file.dir);
                             found
                                 .nodes
                                 .push(Node::new(format!("{label} → {}", file.path)));
                         }
-                        FileSource::Url { url, .. } => {
+                        FileSource::Url { url, sha256 } => {
                             found.scan(url, layers);
+                            found.scan(sha256, layers);
                             found
                                 .nodes
                                 .push(Node::new(format!("{url} → {}", file.path)));
@@ -232,6 +239,26 @@ impl<'a> Sources<'a> {
     }
 
     /// A `from` source, with how many files a directory has.
+    /// The text of the files a `template` copy step fills in, so the secrets
+    /// they use are listed too. Unreadable ones are left out.
+    fn templated(&self, source: &str, dir: bool) -> Vec<String> {
+        if source.contains("{{") {
+            return Vec::new();
+        }
+        let path = self.file.ctx.dir.join(expand_tilde(source));
+        if !dir {
+            return std::fs::read_to_string(&path).into_iter().collect();
+        }
+        let mut names = Vec::new();
+        if super::step::list_files(&path, "", &mut names).is_err() {
+            return Vec::new();
+        }
+        names
+            .iter()
+            .filter_map(|name| std::fs::read_to_string(path.join(name)).ok())
+            .collect()
+    }
+
     fn copy(&self, source: &str, dir: bool) -> String {
         if source.contains("{{") {
             return source.to_string();

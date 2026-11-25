@@ -39,6 +39,12 @@ let today = $(date +%A)        # shell output, run once when first used
 
 # Load KEY=value lines as variables, also exported to every command:
 #   env ".env"
+# Load a YAML (or JSON) file's values as variables, nested keys joined with
+# dots and list items numbered from 0, with `as name` before them: so
+# `uv: {version: 0.13.9}` is {{ versions.uv.version }}. Good for keeping every
+# version and checksum in one file. Values are used as written, not templated,
+# and not exported to commands.
+#   vars "versions.yaml" as versions
 # Secrets from a sops-encrypted file (YAML, JSON, .env or INI), used as
 # {{ secrets.name }}; nested keys join with dots: {{ secrets.wifi.password }}.
 # Decrypted with `sops` the first time a secret is used, so runs that don't
@@ -223,11 +229,13 @@ task setup {
     #                      they say they can't read it rather than call it new
     #   new                taskpod created it: --undo deletes it (see Undo below)
     #   keep               --undo leaves it as it is
+    #   template           fill in {{ }} in a `from` file, like inline content
+    #                      (\{{ is a literal {{); --pull keeps lines with a variable
     # Content is a string, a """ block, `from "path"` (relative to this file,
     # copied byte for byte unless an encoding is given), or `url "..." sha256
     # "..."`: downloaded with curl on this machine and checked against the
-    # sha256, which is required. When the file there already has that sha256,
-    # nothing is downloaded. --pull leaves it alone.
+    # sha256, which is required (it can be a {{ variable }}). When the file
+    # there already has that sha256, nothing is downloaded. --pull leaves it alone.
     #   file "/etc/apt/keyrings/docker.asc" sudo new \
     #       url "https://download.docker.com/linux/debian/gpg" sha256 "<its sha256>"
     file "/tmp/taskpod-example/hello.sh" """
@@ -235,6 +243,7 @@ task setup {
         echo "hello from {{ where }}"
         """
     file "/tmp/taskpod-example/copy.task" mode 600 from "spec.task"
+    #   file "~/app/compose.yml" template from "files/compose.yml"
     file "/tmp/taskpod-example/windows.txt" encoding utf-16le "for notepad\n"
     # `directory` copies every file in a `from` directory (subdirectories
     # included), each like its own file step with the same options. Files

@@ -1,7 +1,7 @@
 // Where each secret's key is in a sops file. sops encrypts values but leaves
 // keys readable, so this works on encrypted files without decrypting them.
 // Names match taskpod's: nested keys joined with dots, list items numbered from 0.
-// Values are never read.
+// Values of secrets are never read; `vars` files use the same key reader.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -17,10 +17,30 @@ export interface SecretKey extends Span {
 export function secretKeys(text: string, fileName: string): SecretKey[] {
   const ext = fileName.toLowerCase().split(".").pop() ?? "";
   const keys = ext === "json" ? json(text) : ext === "env" ? dotenv(text) : ext === "ini" ? ini(text) : yaml(text);
+  return withLeaves(keys.filter((k) => k.name !== "sops" && !k.name.startsWith("sops.") && !(ext === "env" && k.name.startsWith("sops_"))));
+}
+
+/** The keys in a `vars` file: YAML, or JSON (which is YAML too, read as JSON here for exact places). */
+export function varKeys(text: string, fileName: string): SecretKey[] {
+  return withLeaves(fileName.toLowerCase().endsWith(".json") ? json(text) : yaml(text));
+}
+
+function withLeaves(keys: Key[]): SecretKey[] {
   const names = new Set(keys.map((k) => k.name));
-  return keys
-    .filter((k) => k.name !== "sops" && !k.name.startsWith("sops.") && !(ext === "env" && k.name.startsWith("sops_")))
-    .map((k) => ({ ...k, leaf: ![...names].some((n) => n.startsWith(`${k.name}.`)) }));
+  return keys.map((k) => ({ ...k, leaf: ![...names].some((n) => n.startsWith(`${k.name}.`)) }));
+}
+
+/**
+ * The value written after a key on its own line, for hovers: `key: value  # comment`
+ * gives `value`, without quotes. Undefined for a block or nested value.
+ */
+export function valueAfter(text: string, key: SecretKey): string | undefined {
+  const line = text.split(/\r?\n/)[key.line] ?? "";
+  const rest = line.slice(key.end).replace(/^\s*"?\s*:\s*/, "");
+  const m = rest.match(/^("(?:[^"\\]|\\.)*"|'[^']*'|[^#]*?)\s*(?:,?\s*(?:#.*)?)$/);
+  const value = m?.[1].trim();
+  if (!value || /^[|>{[]/.test(value)) return undefined;
+  return /^(["']).*\1$/.test(value) ? value.slice(1, -1) : value;
 }
 
 /**

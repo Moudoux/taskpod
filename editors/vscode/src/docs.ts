@@ -49,6 +49,18 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
     syntax: 'env ".env"',
     snippet: 'env "${1:.env}"',
   },
+  vars: {
+    places: ["top"],
+    summary:
+      "Loads a YAML (or JSON) file's values as variables: nested keys join with dots and list items are numbered from 0, after `as name` when given. So with `vars \"versions.yaml\" as versions`, `uv: {version: 0.13.9}` is `{{ versions.uv.version }}`. For keeping every version and checksum in one file. Values are used as written, not templated, and not exported to commands. Ctrl+click a variable to go to its key.",
+    syntax: 'vars "versions.yaml" as versions',
+    snippet: 'vars "${1:versions.yaml}" as ${2:versions}',
+  },
+  as: {
+    places: [],
+    summary: "Names a `vars` file's variables: `vars \"versions.yaml\" as versions` makes them `{{ versions.key }}`.",
+    syntax: 'vars "versions.yaml" as versions',
+  },
   secrets: {
     places: ["top"],
     summary:
@@ -263,7 +275,7 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   file: {
     places: ["body"],
     summary:
-      "Writes a file, only when its content, mode or owner differs. Content is a string, a `\"\"\"` block, or `from \"path\"` (relative to this task file). Mode defaults to 644, or 755 for content starting with `#!`.",
+      "Writes a file, only when its content, mode or owner differs. Content is a string, a `\"\"\"` block, or `from \"path\"` (relative to this task file; with `template`, its `{{ }}` are filled in). Mode defaults to 644, or 755 for content starting with `#!`.",
     syntax:
       'file "/etc/x.conf" sudo """\n    contents\n    """\nfile "~/.config/y" mode 600 owner me:me encoding utf-16le from "files/y"',
     snippet: 'file "${1:path}" """\n\t$0\n\t"""',
@@ -330,7 +342,7 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   encoding: {
     places: ["file"],
     summary:
-      "How the text is written: `utf-8` (default), `utf-8-bom`, `utf-16le`, `utf-16be` (both with a byte order mark), `latin1` or `ascii`. Files copied with `from` are written byte for byte unless an encoding is given.",
+      "How the text is written: `utf-8` (default), `utf-8-bom`, `utf-16le`, `utf-16be` (both with a byte order mark), `latin1` or `ascii`. Files copied with `from` are written byte for byte unless an encoding or `template` is given.",
     syntax: "encoding utf-16le",
     snippet: "encoding ${1|utf-8,utf-8-bom,utf-16le,utf-16be,latin1,ascii|}",
   },
@@ -343,7 +355,7 @@ export const KEYWORDS: Record<string, KeywordDoc> = {
   },
   sha256: {
     places: [],
-    summary: "The sha256 of a downloaded file, 64 hexadecimal digits. A download with another one fails.",
+    summary: "The sha256 of a downloaded file, 64 hexadecimal digits, or a `{{ variable }}` holding them (from a `vars` file, say). A download with another one fails.",
     syntax: 'url "https://example.com/key.asc" sha256 "..."',
   },
   from: {
@@ -387,8 +399,20 @@ export const BUILTIN_VARS: Record<string, string> = {
 
 export const ENCODINGS = ["utf-8", "utf-8-bom", "utf-16le", "utf-16be", "latin1", "ascii"];
 
-export function keywordMarkdown(word: string): string | undefined {
-  const doc = KEYWORDS[word];
+/** Options of `file` and `directory` steps that are also another keyword elsewhere. */
+export const FILE_OPTIONS: Record<string, KeywordDoc> = {
+  template: {
+    places: ["file"],
+    summary:
+      "Fill in `{{ }}` in a file copied `from` a file (or each file of a `directory`), like inline content; `\\{{` is a literal `{{`. `--pull` maps changed lines back, and keeps the lines with a variable. Good with `vars`, for files that hold versions, like a compose file's image digests.",
+    syntax: 'file "~/app/compose.yml" template from "files/home/app/compose.yml"',
+    snippet: "template",
+  },
+};
+
+/** Docs for a keyword; `place` "file" prefers a `file` step option of the same name. */
+export function keywordMarkdown(word: string, place?: Place): string | undefined {
+  const doc = (place === "file" ? FILE_OPTIONS[word] : undefined) ?? KEYWORDS[word];
   if (!doc) return undefined;
   return `**${word}**: ${doc.summary}\n\n\`\`\`taskpod\n${doc.syntax}\n\`\`\``;
 }

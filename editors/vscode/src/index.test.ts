@@ -126,6 +126,13 @@ test("indexes secrets files and secret references", () => {
   expect(index.refs.map((r) => `${r.kind}:${r.name}`)).toContain("var:secrets.wifi.password");
 });
 
+test("indexes vars files with their name", () => {
+  const index = parse('vars "versions.yaml" as versions # pins\nvars "other.yaml"\ntask t {\n    file "/x" template from "files/x"\n    run echo {{ versions.uv.sha256 }}\n}\n');
+  expect(index.paths.map((p) => `${p.kind}:${p.path}:${p.prefix ?? ""}`)).toEqual(["vars:versions.yaml:versions", "vars:other.yaml:", "target:/x:", "from:files/x:"]);
+  expect(index.paths[0]).toMatchObject({ line: 0, start: 6, end: 19 });
+  expect(index.refs.map((r) => `${r.kind}:${r.name}`)).toEqual(["var:versions.uv.sha256"]);
+});
+
 test("undo blocks are shell, keep and undo aren't template calls", () => {
   const index = parse(`task app {
     keep

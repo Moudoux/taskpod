@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { globFiles, secretKeys } from "./secrets";
+import { globFiles, secretKeys, valueAfter, varKeys } from "./secrets";
 
 const names = (text: string, file: string) => secretKeys(text, file).map((k) => `${k.name}${k.leaf ? "" : "/"}@${k.line}:${k.start}`);
 
@@ -77,4 +77,33 @@ test("globs a secrets file name like taskpod", () => {
   } finally {
     fs.rmSync(dir, { recursive: true });
   }
+});
+
+test("vars files keep every key and read values for hovers", () => {
+  const yaml = `# pins
+uv:
+  version: 0.13.9  # latest
+  sha256: "abc"
+sops: kept
+images:
+  gitea: 'gitea/gitea:1@sha256:x'
+  list: [a, b]
+  block: |
+    text
+`;
+  const keys = varKeys(yaml, "versions.yaml");
+  expect(keys.filter((k) => k.leaf).map((k) => k.name)).toEqual(["uv.version", "uv.sha256", "sops", "images.gitea", "images.list", "images.block"]);
+  const value = (name: string) => valueAfter(yaml, keys.find((k) => k.name === name)!);
+  expect([value("uv.version"), value("uv.sha256"), value("sops"), value("images.gitea"), value("images.list"), value("uv")]).toEqual([
+    "0.13.9",
+    "abc",
+    "kept",
+    "gitea/gitea:1@sha256:x",
+    undefined,
+    undefined,
+  ]);
+  const json = '{\n  "uv": {\n    "version": "1.0",\n    "n": 2\n  }\n}\n';
+  const jsonKeys = varKeys(json, "v.json");
+  expect(jsonKeys.map((k) => k.name)).toEqual(["uv", "uv.version", "uv.n"]);
+  expect(jsonKeys.slice(1).map((k) => valueAfter(json, k))).toEqual(["1.0", "2"]);
 });

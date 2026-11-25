@@ -643,11 +643,15 @@ impl<'r> TaskRun<'r> {
                 return Ok(());
             }
             FileSource::Url { url, sha256 } => {
+                let sha256 = scope.expand(sha256)?.to_ascii_lowercase();
+                if !crate::parser::is_sha256(&sha256) {
+                    bail!("file {shown}: sha256 {sha256:?} isn't 64 hexadecimal digits");
+                }
                 // Already the right file: no need to download it again.
                 let current = target::read(ctx, &self.task.name, &path, as_root)?;
                 let bytes = match &current {
-                    Current::Content(bytes) if sha256_hex(bytes) == *sha256 => bytes.clone(),
-                    _ => download(&scope.expand(url)?, sha256)
+                    Current::Content(bytes) if sha256_hex(bytes) == sha256 => bytes.clone(),
+                    _ => download(&scope.expand(url)?, &sha256)
                         .with_context(|| format!("file {shown}"))?,
                 };
                 read = Some(current);
@@ -2344,6 +2348,28 @@ fn pull_content(
     match &file.source {
         FileSource::Empty => bail!("a directory without `from` has nothing to pull"),
         FileSource::Url { .. } => bail!("a downloaded file has nothing to pull"),
+        FileSource::Copy(source) if file.template => {
+            let source = copy_source(source, scope, dir)?;
+            let template = std::fs::read_to_string(&source)
+                .with_context(|| format!("failed to read {}", source.display()))?;
+            let mapped = pull::map_back(&template, scope, &decode(system)?)
+                .with_context(|| format!("in {}", source.display()))?;
+            if mapped.text == template {
+                return Ok(Pulled {
+                    edit: None,
+                    diff: Vec::new(),
+                    refused: mapped.refused,
+                });
+            }
+            Ok(Pulled {
+                diff: diff_lines(template.as_bytes(), mapped.text.as_bytes(), Encoding::Utf8),
+                edit: Some(pull::Edit::Copy {
+                    file: source,
+                    bytes: mapped.text.into_bytes(),
+                }),
+                refused: mapped.refused,
+            })
+        }
         FileSource::Copy(source) => {
             let source = copy_source(source, scope, dir)?;
             let bytes = if file.raw {
@@ -2740,10 +2766,21 @@ fn file_content(file: &FileStep, scope: &Scope, dir: &Path) -> Result<Vec<u8>> {
             }
             let text = String::from_utf8(bytes).map_err(|_| {
                 anyhow!(
-                    "{} isn't UTF-8, so it can't be re-encoded",
-                    source.display()
+                    "{} isn't UTF-8, so it can't be {}",
+                    source.display(),
+                    if file.template {
+                        "templated"
+                    } else {
+                        "re-encoded"
+                    }
                 )
             })?;
+            if file.template {
+                let text = scope
+                    .expand(&text)
+                    .with_context(|| format!("in {}", source.display()))?;
+                return file.encoding.encode(&text);
+            }
             file.encoding.encode(&text)
         }
     }

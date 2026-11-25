@@ -3,12 +3,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { BUILTIN_VARS, ENCODINGS, KEYWORDS, keywordMarkdown, type Place } from "./docs";
+import { BUILTIN_VARS, ENCODINGS, FILE_OPTIONS, KEYWORDS, keywordMarkdown, type Place } from "./docs";
 import { LiveChecks, REPORT_SCHEME } from "./checks";
 import { type Index, type RefKind, parse, resolveVar, symbolAt } from "./index";
 import { hoverMarkdown, title } from "./live";
 import { IncludeGraph } from "./project";
-import { type SecretKey, globFiles, secretKeys } from "./secrets";
+import { type SecretKey, globFiles, secretKeys, valueAfter, varKeys } from "./secrets";
 
 const LANGUAGE = "taskpod";
 const SELECTOR: vscode.DocumentSelector = { language: LANGUAGE };
@@ -177,6 +177,75 @@ function secretDoc(files: FileIndex[], name: string): string {
   return `**${name}**: secret, from a \`secrets\` file or \`taskpod --secrets FILE\``;
 }
 
+// ---- Vars files ----------------------------------------------------------------
+
+interface VarFile {
+  uri: vscode.Uri;
+  text: string;
+  /** `as name`: the variables are `{{ name.key }}`. */
+  prefix?: string;
+  keys: SecretKey[];
+}
+
+const varCache = new Map<string, { mtime: number; text: string; keys: SecretKey[] }>();
+
+function readVarFile(file: string): { text: string; keys: SecretKey[] } | undefined {
+  try {
+    const mtime = fs.statSync(file).mtimeMs;
+    const cached = varCache.get(file);
+    if (cached?.mtime === mtime) return cached;
+    const text = fs.readFileSync(file, "utf8");
+    const entry = { mtime, text, keys: varKeys(text, file) };
+    varCache.set(file, entry);
+    return entry;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Files from `vars` lines in this file and its includes. */
+function varFiles(files: FileIndex[]): VarFile[] {
+  const found: VarFile[] = [];
+  for (const { uri, index } of files) {
+    for (const p of index.paths) {
+      if (p.kind !== "vars" || p.path.includes("{{")) continue;
+      const target = resolvePath(p.path, uri);
+      const read = readVarFile(target);
+      if (read) found.push({ uri: vscode.Uri.file(target), prefix: p.prefix, ...read });
+    }
+  }
+  return found;
+}
+
+const varName = (file: VarFile, key: SecretKey) => (file.prefix ? `${file.prefix}.${key.name}` : key.name);
+
+/** The keys in `vars` files that are the variable `name`. */
+function fileVars(files: FileIndex[], name: string): { file: VarFile; key: SecretKey }[] {
+  return varFiles(files).flatMap((file) => file.keys.filter((key) => varName(file, key) === name).map((key) => ({ file, key })));
+}
+
+/** The `vars` files whose `as name` the variable starts with, when it's in none of them. */
+function missingFromVarFiles(files: FileIndex[], name: string): VarFile[] {
+  const prefixed = varFiles(files).filter((f) => f.prefix && name.startsWith(`${f.prefix}.`));
+  return prefixed.some((f) => f.keys.some((k) => k.leaf && varName(f, k) === name)) ? [] : prefixed;
+}
+
+function fileVarDoc(files: FileIndex[], name: string): string | undefined {
+  const found = fileVars(files, name);
+  if (found.length) {
+    return found
+      .map(({ file, key }) => {
+        const value = key.leaf ? valueAfter(file.text, key) : undefined;
+        const what = key.leaf ? (value === undefined ? "" : ` = \`${value}\``) : " (holds other values, use one of them)";
+        return `**${name}**${what}\n\n_from ${path.basename(file.uri.fsPath)}_`;
+      })
+      .join("\n\n---\n\n");
+  }
+  const missing = missingFromVarFiles(files, name);
+  if (missing.length) return `**${name}**: not in ${missing.map((f) => `\`${path.basename(f.uri.fsPath)}\``).join(", ")}`;
+  return undefined;
+}
+
 function range(span: { line: number; start: number; end: number }): vscode.Range {
   return new vscode.Range(span.line, span.start, span.line, span.end);
 }
@@ -191,6 +260,7 @@ function definitions(files: FileIndex[], name: string, kind: RefKind, document: 
       if (local) found.push(new vscode.Location(uri, range(local)));
     }
   }
+  if (kind === "var") for (const { file, key } of fileVars(files, name)) found.push(new vscode.Location(file.uri, range(key)));
   return found;
 }
 
@@ -256,6 +326,7 @@ class Provider
         const def = resolveVar(index, symbol.name, position.line) ?? files.slice(1).flatMap((f) => f.index.vars).find((v) => v.name === symbol.name && !v.owner);
         if (def) markdown = `**${symbol.name}** = \`${def.value}\`${def.owner ? `\n\n_in ${def.owner}_` : ""}`;
         else if (isSecret(symbol.name)) markdown = secretDoc(files, symbol.name);
+        else if (fileVarDoc(files, symbol.name)) markdown = fileVarDoc(files, symbol.name);
         else if (BUILTIN_VARS[symbol.name]) markdown = `**${symbol.name}** (built in): ${BUILTIN_VARS[symbol.name]}`;
         else if (/^\d+$/.test(symbol.name)) markdown = `**${symbol.name}**: word ${symbol.name} of the template call's arguments.`;
         else if (process.env[symbol.name] !== undefined) markdown = `**${symbol.name}**: environment variable`;
@@ -276,7 +347,8 @@ class Provider
       return new vscode.Hover(new vscode.MarkdownString(`${what} \`${target}\`${exists ? "" : " _(doesn't exist yet)_"}`));
     }
     const word = document.getWordRangeAtPosition(position);
-    const markdown = word && keywordMarkdown(document.getText(word));
+    const place: Place | undefined = /^\s*(file|directory)\s/.test(document.lineAt(position.line).text) ? "file" : undefined;
+    const markdown = word && keywordMarkdown(document.getText(word), place);
     return markdown ? new vscode.Hover(new vscode.MarkdownString(markdown), word) : undefined;
   }
 
@@ -305,11 +377,15 @@ class Provider
   }
 
   prepareRename(document: vscode.TextDocument, position: vscode.Position): vscode.Range {
-    const index = indexOf(document);
-    const symbol = symbolAt(index, position.line, position.character);
+    const files = project(document);
+    const symbol = symbolAt(files[0].index, position.line, position.character);
     if (!symbol) throw new Error("Only tasks, templates and variables can be renamed");
     // sops ties each value to its key, so renaming a key in the file would break it.
     if (isSecret(symbol.name)) throw new Error("Rename secrets with sops (sops edit), then update the references");
+    // Its key is only the last part of the name, nested in the file.
+    if (symbol.kind === "var" && fileVars(files, symbol.name).length) {
+      throw new Error("Rename the key in its vars file, then update the references");
+    }
     return document.getWordRangeAtPosition(position, /[\p{L}\p{N}_.+\-/]+/u)!;
   }
 
@@ -377,6 +453,13 @@ class Provider
         item.detail = value;
         items.push(item);
       }
+      for (const file of varFiles(files)) {
+        for (const key of file.keys.filter((k) => k.leaf)) {
+          const item = new vscode.CompletionItem(varName(file, key), vscode.CompletionItemKind.Field);
+          item.detail = `${valueAfter(file.text, key) ?? ""} · ${path.basename(file.uri.fsPath)}`;
+          items.push(item);
+        }
+      }
       for (const { uri, keys } of secretFiles(files)) {
         for (const key of keys.filter((k) => k.leaf)) {
           const item = new vscode.CompletionItem(SECRETS + key.name, vscode.CompletionItemKind.Field);
@@ -436,12 +519,13 @@ class Provider
   }
 
   private keywordItems(place: Place): vscode.CompletionItem[] {
-    return Object.entries(KEYWORDS)
+    const options = place === "file" ? Object.entries(FILE_OPTIONS) : [];
+    return [...Object.entries(KEYWORDS), ...options]
       .filter(([, doc]) => doc.places.includes(place))
       .map(([name, doc]) => {
         const item = snippet(name, doc.snippet ?? name, doc.summary);
         item.kind = vscode.CompletionItemKind.Keyword;
-        item.documentation = new vscode.MarkdownString(keywordMarkdown(name));
+        item.documentation = new vscode.MarkdownString(keywordMarkdown(name, place));
         return item;
       });
   }
@@ -487,6 +571,7 @@ function lint(document: vscode.TextDocument): vscode.Diagnostic[] {
   const tasks = new Set(files.flatMap((f) => f.index.tasks.map((t) => t.name)));
   const templates = new Set(files.flatMap((f) => f.index.templates.map((t) => t.name)));
   const globals = new Set(files.flatMap((f) => f.index.vars.filter((v) => !v.owner).map((v) => v.name)));
+  for (const file of varFiles(files)) for (const key of file.keys) if (key.leaf) globals.add(varName(file, key));
   const secrets = secretFiles(files);
   const secretNames = new Set(secrets.flatMap((f) => f.keys.filter((k) => k.leaf).map((k) => SECRETS + k.name)));
   const diagnostics: vscode.Diagnostic[] = [];
@@ -504,7 +589,10 @@ function lint(document: vscode.TextDocument): vscode.Diagnostic[] {
       const owner = index.lines[ref.line]?.owner;
       const local = index.vars.some((v) => v.name === ref.name && v.owner === owner && owner !== undefined);
       const inTemplate = index.lines[ref.line]?.ownerKind === "template" && ref.name === "args";
-      if (!local && !globals.has(ref.name) && !KNOWN_VAR(ref.name) && !inTemplate) {
+      const missing = local || globals.has(ref.name) ? [] : missingFromVarFiles(files, ref.name);
+      if (missing.length) {
+        add(ref, `No '${ref.name}' in ${missing.map((f) => path.basename(f.uri.fsPath)).join(", ")}`, vscode.DiagnosticSeverity.Warning);
+      } else if (!local && !globals.has(ref.name) && !KNOWN_VAR(ref.name) && !inTemplate) {
         add(ref, `Unknown variable '${ref.name}', it isn't defined and isn't an environment variable here`, vscode.DiagnosticSeverity.Warning);
       }
     }

@@ -145,6 +145,11 @@ impl Secrets {
             };
             let parsed: Value = serde_json::from_str(&json)
                 .map_err(|e| format!("{}: sops didn't print JSON: {e}", file.display()))?;
+            let mut parsed = parsed;
+            // sops metadata is removed on decrypt, but skip it just in case.
+            if let Value::Object(map) = &mut parsed {
+                map.remove("sops");
+            }
             flatten("", &parsed, &mut values);
         }
         crate::ui::add_redactions(values.values());
@@ -280,7 +285,8 @@ fn run_prompting(
 }
 
 /// Nested keys are joined with dots, list items are numbered from 0.
-fn flatten(prefix: &str, value: &Value, out: &mut BTreeMap<String, String>) {
+/// Nested keys joined with dots under `prefix`, list items numbered from 0.
+pub(crate) fn flatten(prefix: &str, value: &Value, out: &mut BTreeMap<String, String>) {
     let key = |k: &str| {
         if prefix.is_empty() {
             k.to_string()
@@ -291,10 +297,6 @@ fn flatten(prefix: &str, value: &Value, out: &mut BTreeMap<String, String>) {
     match value {
         Value::Object(map) => {
             for (k, v) in map {
-                // sops metadata is removed on decrypt, but skip it just in case.
-                if prefix.is_empty() && k == "sops" {
-                    continue;
-                }
                 flatten(&key(k), v, out);
             }
         }
@@ -321,10 +323,8 @@ mod tests {
 
     #[test]
     fn flattens_nested_values() {
-        let value: Value = serde_json::from_str(
-            r#"{"a": "x", "b": {"c": 1, "d": [true, null]}, "sops": {"mac": "m"}}"#,
-        )
-        .unwrap();
+        let value: Value =
+            serde_json::from_str(r#"{"a": "x", "b": {"c": 1, "d": [true, null]}}"#).unwrap();
         let mut out = BTreeMap::new();
         flatten("", &value, &mut out);
         let pairs: Vec<(&str, &str)> = out.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();

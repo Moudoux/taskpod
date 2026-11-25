@@ -790,6 +790,61 @@ subtask after of files {{
 
 #[cfg(unix)]
 #[test]
+fn templates_copied_files_from_a_vars_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display().to_string();
+    let main = dir.path().join("main.task");
+    std::fs::write(
+        dir.path().join("versions.yaml"),
+        "app:\n  image: app@sha256:abc # pinned\n  port: 8080\n",
+    )
+    .unwrap();
+    let source = format!(
+        "vars \"versions.yaml\" as versions\ntask t {{\n    file \"{d}/out/compose.yml\" template from \"files/compose.yml\"\n    file \"{d}/out/raw.yml\" from \"files/compose.yml\"\n}}\n"
+    );
+    std::fs::write(&main, &source).unwrap();
+    std::fs::create_dir_all(dir.path().join("files")).unwrap();
+    let template = "image: {{ versions.app.image }}\nport: {{ versions.app.port }}\nplain\n";
+    std::fs::write(dir.path().join("files/compose.yml"), template).unwrap();
+
+    let file = crate::parser::parse_file(&main).unwrap();
+    let order = select(&file, &[]).unwrap();
+    let outcomes: HashMap<_, _> = Runner::new(&file, &options(1))
+        .run(&order)
+        .into_iter()
+        .collect();
+    assert_eq!(outcomes["t"], Outcome::Ran);
+    let out = dir.path().join("out");
+    assert_eq!(
+        read(&out, "compose.yml"),
+        "image: app@sha256:abc\nport: 8080\nplain\n"
+    );
+    // Without `template`, the file is copied as it is.
+    assert_eq!(read(&out, "raw.yml"), template);
+
+    // --pull maps plain lines back and keeps the templated ones.
+    std::fs::write(
+        out.join("compose.yml"),
+        "image: app@sha256:new\nport: 8080\nplain!\nadded {{ x }}\n",
+    )
+    .unwrap();
+    let file = crate::parser::parse_file(&main).unwrap();
+    let mut opts = options(1);
+    opts.pull = true;
+    opts.yes = true;
+    let runner = Runner::new(&file, &opts);
+    runner.run(&select(&file, &[]).unwrap());
+    let edits = std::mem::take(&mut *runner.edits.lock().unwrap());
+    let applied = super::pull::apply(&edits);
+    assert!(applied.problems.is_empty(), "{:?}", applied.problems);
+    assert_eq!(
+        read(dir.path(), "files/compose.yml"),
+        "image: {{ versions.app.image }}\nport: {{ versions.app.port }}\nplain!\nadded \\{{ x }}\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn pull_never_writes_secrets() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path().display().to_string();
@@ -2379,6 +2434,32 @@ fn downloads_are_checked_and_only_fetched_when_needed() {
     .err()
     .unwrap();
     assert!(format!("{err:#}").contains("needs its checksum"), "{err:#}");
+
+    // A sha256 from a variable is checked once it's filled in.
+    let source = format!(
+        r#"
+        let sha = "{}"
+        let bad = "nope"
+        task templated {{
+            file "templated" url "{url}" sha256 "{{{{ sha }}}}"
+        }}
+        task bad {{
+            manual
+            file "bad" url "{url}" sha256 "{{{{ bad }}}}"
+        }}
+    "#,
+        sha.to_ascii_uppercase()
+    );
+    assert_eq!(
+        run(&source, dir.path(), &options(1), &[])["templated"],
+        Outcome::Ran
+    );
+    assert_eq!(read(dir.path(), "templated"), "hello\n");
+    let outcome = &run(&source, dir.path(), &options(1), &["bad"])["bad"];
+    assert!(
+        matches!(outcome, Outcome::Failed(e) if e.contains("isn't 64 hexadecimal digits")),
+        "{outcome:?}"
+    );
 }
 
 #[cfg(unix)]

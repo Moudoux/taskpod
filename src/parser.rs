@@ -111,6 +111,27 @@ impl<'s> Parser<'s> {
                     self.declare(file, start, DeclarationKind::Env, &path);
                     load_env_file(&path, file).map_err(|e| self.error_at(start, e))?;
                 }
+                "vars" => {
+                    let path = self.string()?;
+                    self.skip_inline_ws();
+                    let save = self.pos;
+                    let prefix = if self.word("").ok().as_deref() == Some("as") {
+                        let at = self.pos;
+                        let name = self.word("a name for the variables")?;
+                        if !name.chars().all(crate::vars::is_var_char) || name.contains('.') {
+                            return Err(self.error_at(at, format!("invalid name '{name}'")));
+                        }
+                        Some(name)
+                    } else {
+                        self.pos = save;
+                        None
+                    };
+                    self.end_of_line()?;
+                    let path = self.resolve(&path);
+                    self.declare(file, start, DeclarationKind::Vars, &path);
+                    load_vars_file(&path, prefix.as_deref(), file)
+                        .map_err(|e| self.error_at(start, e))?;
+                }
                 "secrets" => {
                     let path = self.string()?;
                     self.end_of_line()?;
@@ -1061,6 +1082,7 @@ impl<'s> Parser<'s> {
         let mut sudo = false;
         let mut new = false;
         let mut keep = false;
+        let mut template = false;
         let source = loop {
             self.skip_inline_ws();
             if dir && self.at_line_end() {
@@ -1074,7 +1096,7 @@ impl<'s> Parser<'s> {
             }
             let start = self.pos;
             match self
-                .word("file content, 'from', 'url', 'mode', 'owner', 'encoding', 'sudo', 'new' or 'keep'")?
+                .word("file content, 'from', 'url', 'mode', 'owner', 'encoding', 'sudo', 'new', 'keep' or 'template'")?
                 .as_str()
             {
                 "mode" => {
@@ -1124,6 +1146,7 @@ impl<'s> Parser<'s> {
                 "sudo" => sudo = true,
                 "new" => new = true,
                 "keep" => keep = true,
+                "template" => template = true,
                 "url" => {
                     let url = self.string()?;
                     self.skip_inline_ws();
@@ -1135,8 +1158,9 @@ impl<'s> Parser<'s> {
                         ));
                     }
                     let at = self.pos;
-                    let sha256 = self.string()?.to_ascii_lowercase();
-                    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+                    let sha256 = self.string()?;
+                    // One from a variable is checked once it's filled in.
+                    if !sha256.contains("{{") && !is_sha256(&sha256) {
                         return Err(self.error_at(at, "sha256 is 64 hexadecimal digits"));
                     }
                     break FileSource::Url { url, sha256 };
@@ -1176,14 +1200,21 @@ impl<'s> Parser<'s> {
             ));
         }
         self.end_of_line()?;
+        if template && !matches!(source, FileSource::Copy(_)) {
+            return Err(self.error_at(
+                origin.after_path,
+                "`template` is for content copied `from` a file (inline content is always templated)",
+            ));
+        }
         if matches!(source, FileSource::Url { .. }) && encoding.is_some() {
             return Err(self.error_at(
                 origin.after_path,
                 "a downloaded file is written as it is, it has no encoding",
             ));
         }
-        let raw =
-            encoding.is_none() && matches!(source, FileSource::Copy(_) | FileSource::Url { .. });
+        let raw = encoding.is_none()
+            && !template
+            && matches!(source, FileSource::Copy(_) | FileSource::Url { .. });
         Ok(FileStep {
             path,
             dir,
@@ -1196,6 +1227,7 @@ impl<'s> Parser<'s> {
                 encoding.unwrap_or_default()
             },
             raw,
+            template,
             sudo,
             new,
             keep,
@@ -1842,6 +1874,35 @@ pub fn check_passes(check: &Check, scope: &Scope, cwd: &Path) -> Result<bool> {
     }
 }
 
+/// 64 hexadecimal digits, either case.
+pub(crate) fn is_sha256(text: &str) -> bool {
+    text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Load a YAML (or JSON) file's values as variables, nested keys joined with
+/// dots, under `prefix.` when given. They're used as written, not templated.
+fn load_vars_file(path: &Path, prefix: Option<&str>, file: &mut TaskFile) -> Result<()> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read vars file {}", path.display()))?;
+    let value: serde_json::Value = serde_norway::from_str(&contents)
+        .with_context(|| format!("{} isn't valid YAML", path.display()))?;
+    if !value.is_object() {
+        bail!("{} must be a mapping of names to values", path.display());
+    }
+    let mut values = std::collections::BTreeMap::new();
+    crate::secrets::flatten(prefix.unwrap_or(""), &value, &mut values);
+    for (name, value) in values {
+        let valid = !name.is_empty()
+            && name.chars().all(crate::vars::is_var_char)
+            && !name.starts_with(crate::secrets::PREFIX);
+        if !valid {
+            bail!("{}: invalid variable name {name:?}", path.display());
+        }
+        file.vars.literal(name, value);
+    }
+    Ok(())
+}
+
 /// Load `KEY=value` lines. Values become variables and are exported to commands.
 fn load_env_file(path: &Path, file: &mut TaskFile) -> Result<()> {
     let contents = std::fs::read_to_string(path)
@@ -2246,6 +2307,92 @@ mod tests {
         assert!(parse_err("template t {\n  t\n}\ntask a {\n  t\n}\n").contains("calls itself"));
         assert!(parse_err("bogus\n").contains("<string>:1:1: unknown statement 'bogus'"));
         assert!(parse_err("task a {\n  run {\n    echo \"x\n  }\n}\n").contains("unclosed quote"));
+    }
+
+    #[test]
+    fn vars_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("v.yaml"),
+            "# versions\nuv:\n  version: 0.13.9\n  sha256: \"abc\"\nimages: [a, b]\nnone:\n",
+        )
+        .unwrap();
+        let path = dir.path().join("main.task");
+        let parse = |source: &str| {
+            std::fs::write(&path, source).unwrap();
+            parse_file(&path)
+        };
+        let file = parse("vars \"v.yaml\" as versions\n").unwrap();
+        let scope = Scope::root(&file.vars, &file.ctx);
+        assert_eq!(
+            scope
+                .expand("{{ versions.uv.version }}|{{ versions.uv.sha256 }}|{{ versions.images.1 }}|{{ versions.none }}")
+                .unwrap(),
+            "0.13.9|abc|b|"
+        );
+        // Not exported, unlike `env`.
+        assert!(file.ctx.exports.is_empty());
+        let file = parse("vars \"v.yaml\"\n").unwrap();
+        let scope = Scope::root(&file.vars, &file.ctx);
+        assert_eq!(scope.expand("{{ uv.version }}").unwrap(), "0.13.9");
+        // Values are data: `{{` in one isn't expanded.
+        std::fs::write(dir.path().join("v.yaml"), "a: \"{{ b }}\"\n").unwrap();
+        let file = parse("vars \"v.yaml\"\n").unwrap();
+        let scope = Scope::root(&file.vars, &file.ctx);
+        assert_eq!(scope.expand("{{ a }}").unwrap(), "{{ b }}");
+
+        for (yaml, source, error) in [
+            ("a: 1\n", "vars \"v.yaml\" as x.y\n", "invalid name"),
+            ("a: 1\n", "vars \"v.yaml\" as\n", "a name for the variables"),
+            (
+                "a: 1\n",
+                "vars \"v.yaml\" with x\n",
+                "expected the end of the line",
+            ),
+            ("- a\n", "vars \"v.yaml\"\n", "must be a mapping"),
+            ("a: [\n", "vars \"v.yaml\"\n", "isn't valid YAML"),
+            ("\"a b\": 1\n", "vars \"v.yaml\"\n", "invalid variable name"),
+            (
+                "secrets: {a: 1}\n",
+                "vars \"v.yaml\"\n",
+                "invalid variable name",
+            ),
+            (
+                "a: 1\n",
+                "vars \"missing.yaml\"\n",
+                "failed to read vars file",
+            ),
+        ] {
+            std::fs::write(dir.path().join("v.yaml"), yaml).unwrap();
+            let err = format!("{:#}", parse(source).err().unwrap());
+            assert!(err.contains(error), "{source}: {err}");
+        }
+    }
+
+    #[test]
+    fn template_is_only_for_from_files() {
+        let file = parse_str(
+            "task t {\n  file \"/x\" template from \"/y\"\n  directory \"/d\" template from \"/e\"\n}\n",
+            Path::new("/"),
+        )
+        .unwrap();
+        let steps: Vec<_> = file.tasks["t"]
+            .body
+            .steps
+            .iter()
+            .map(|s| match s {
+                Step::File(f) => (f.template, f.raw),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(steps, [(true, false), (true, false)]);
+        for source in [
+            "task t {\n  file \"/x\" template \"inline\"\n}\n",
+            "task t {\n  file \"/x\" template url \"https://x\" sha256 \"0000000000000000000000000000000000000000000000000000000000000000\"\n}\n",
+        ] {
+            let err = format!("{:#}", parse_str(source, Path::new("/")).err().unwrap());
+            assert!(err.contains("`template` is for content copied"), "{err}");
+        }
     }
 
     #[test]

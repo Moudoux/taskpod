@@ -14,6 +14,7 @@ idempotent. Its main use is setting up an Arch system from
   string after the name, then `needs`/`lock` (`Parser::definition`); the same directives in the body
   still work and add up. A template call ending in `{` and a `lines "path" {` block are expanded
   here into one `Step::Call` / `Step::Line` per line. `secrets` globs its file name (`glob`).
+  `vars` loads YAML into literal variables (`load_vars_file`, flattened by `secrets::flatten`).
   `run` lines and `run { }` blocks are raw shell; brace matching in blocks skips quotes and comments.
   Checks (`if`/`unless`/`wait until`, `Parser::check`) are shell unless the whole check is a built-in
   (`CheckKind`: `exists`, `which`, `$( )` comparisons), run by `parser::check_passes`.

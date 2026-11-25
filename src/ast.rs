@@ -36,6 +36,8 @@ pub enum DeclarationKind {
         skipped: Option<String>,
     },
     Env,
+    /// `vars "file.yaml" [as name]`.
+    Vars,
     Secrets,
     AgeKey,
 }
@@ -413,6 +415,8 @@ pub struct FileStep {
     pub encoding: Encoding,
     /// Copy the source's bytes unchanged (a `from` file with no encoding).
     pub raw: bool,
+    /// `template`: `{{ }}` in a `from` file is filled in, like inline content.
+    pub template: bool,
     pub sudo: bool,
     /// `new`: the file didn't exist before taskpod, so `--undo` deletes it
     /// when there's no record of what was there.

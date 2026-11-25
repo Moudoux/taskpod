@@ -212,7 +212,24 @@
           }
         },
         {
-          "match": "^\\s*(include|env|secrets|age-key|shell)\\b",
+          "match": "^\\s*(vars)\\s+(\"[^\"]*\"|'[^']*')\\s+(as)\\s+([\\p{L}\\p{N}_+-]+)",
+          "captures": {
+            "1": {
+              "name": "keyword.control.import.taskpod"
+            },
+            "2": {
+              "name": "string.quoted.taskpod"
+            },
+            "3": {
+              "name": "entity.other.attribute-name.taskpod"
+            },
+            "4": {
+              "name": "variable.other.constant.vars.taskpod"
+            }
+          }
+        },
+        {
+          "match": "^\\s*(include|env|vars|secrets|age-key|shell)\\b",
           "captures": {
             "1": {
               "name": "keyword.control.import.taskpod"
@@ -405,7 +422,7 @@
           }
         },
         {
-          "match": "\\b(sudo|from|url|sha256|new|keep|before|after|base|match)\\b",
+          "match": "\\b(sudo|from|url|sha256|new|keep|before|after|base|match|template)\\b",
           "name": "entity.other.attribute-name.taskpod"
         },
         {

@@ -187,6 +187,39 @@ through an askpass helper in a private temporary directory, removed when the
 command ends. Scripts that call `/usr/bin/sudo` by its full path bypass that.
 `--host` needs a Unix system to run on.
 
+## Versions in one file
+
+`vars` loads a YAML (or JSON) file as variables, so every version, checksum
+and image digest can live in one place, separate from the tasks that use
+them:
+
+```yaml
+# versions.yaml
+uv:
+  version: 0.13.9
+  sha256: 0797542018e541a9288855df555c8077eed06f7a47d206362030480e8ecc9f3d
+images:
+  gitea: gitea/gitea:1@sha256:87a67ee09d3ae0d1df5fda5dcda3e2a1f9236a45b0a59025d6e00e46adc43bef
+```
+
+```sh
+vars "versions.yaml" as versions
+
+task uv {
+    file "/var/cache/uv.tar.gz" sudo \
+        url "https://github.com/astral-sh/uv/releases/download/{{ versions.uv.version }}/uv-aarch64-unknown-linux-gnu.tar.gz" \
+        sha256 "{{ versions.uv.sha256 }}"
+}
+
+task gitea {
+    # `template` fills in {{ }} in a copied file: image: {{ versions.images.gitea }}
+    file "~/gitea/compose.yaml" template from "files/gitea/compose.yaml"
+}
+```
+
+Nested keys join with dots, after the name given with `as`. Values are used
+as written. In VS Code, Ctrl+click on a variable goes to its key in the file.
+
 ## Secrets
 
 Secrets live in a [sops](https://github.com/getsops/sops)-encrypted file,
