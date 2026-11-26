@@ -315,17 +315,24 @@ Or with [just](https://github.com/casey/just): `just install` builds and
 installs the Arch package and the VS Code extension, `just arch` or
 `just vscode` one of them (`just` lists every recipe).
 
+Debian and Ubuntu, with [cargo-deb](https://github.com/kornelski/cargo-deb):
+`cargo deb` (or `just deb`) builds `target/debian/taskpod_*.deb`, which
+`sudo apt install ./target/debian/taskpod_*.deb` installs.
+
 Anywhere else with Rust: `cargo install --path .`
 
-Prebuilt Linux and Windows (x86_64) binaries are attached to
-[GitHub releases](https://github.com/Moudoux/taskpod/releases), built by CI
-for every `v*` tag.
+[GitHub releases](https://github.com/Moudoux/taskpod/releases) have prebuilt
+binaries for macOS (arm64) and Linux (arm64), a `.deb` and an Arch package for
+Linux x86_64, and the VS Code extension. CI creates the release for the
+version in `Cargo.toml` when a push to `master` has a version without one.
 
 Latest CI builds of `master` (zip files, through [nightly.link](https://nightly.link),
 since GitHub only lets signed-in users download build artifacts):
 
-- [Linux x86_64 binary](https://nightly.link/Moudoux/taskpod/workflows/ci/master/taskpod-x86_64-unknown-linux-gnu.zip)
-- [Windows x86_64 binary](https://nightly.link/Moudoux/taskpod/workflows/ci/master/taskpod-x86_64-pc-windows-msvc.zip)
+- [macOS arm64 binary](https://nightly.link/Moudoux/taskpod/workflows/ci/master/taskpod-macos-arm64.zip)
+- [Linux arm64 binary](https://nightly.link/Moudoux/taskpod/workflows/ci/master/taskpod-linux-arm64.zip)
+- [Debian package (x86_64)](https://nightly.link/Moudoux/taskpod/workflows/ci/master/taskpod-deb.zip)
+- [Arch package (x86_64)](https://nightly.link/Moudoux/taskpod/workflows/ci/master/taskpod-arch.zip)
 - [VS Code extension (.vsix)](https://nightly.link/Moudoux/taskpod/workflows/ci/master/taskpod-vscode.zip)
 
 Or signed in, from the [latest CI runs](https://github.com/Moudoux/taskpod/actions/workflows/ci.yml?query=branch%3Amaster).

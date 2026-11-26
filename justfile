@@ -19,6 +19,10 @@ arch:
 arch-build:
     cd dist/arch && makepkg -f
 
+# Build the Debian package into target/debian/ (needs cargo-deb: `cargo install cargo-deb`)
+deb:
+    cargo deb --locked
+
 # Package the VS Code extension as a .vsix
 vsix:
     cd {{ vscode_dir }} && bun install && bun run package

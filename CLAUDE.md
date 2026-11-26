@@ -79,6 +79,7 @@ idempotent. Its main use is setting up an Arch system from
   checks for files enabled in workspace state and shows results; bump `JSON_VERSION` in both with the shape.
 - `dist/arch/PKGBUILD`: Arch package, builds from the repo (`cd dist/arch && makepkg -si`).
   Its `pkgver` must match `Cargo.toml`; CI checks this.
+- `[package.metadata.deb]` in `Cargo.toml`: the Debian package, built with cargo-deb (`cargo deb`, `just deb`).
 
 ## Commands
 
@@ -90,7 +91,8 @@ just install                       # build and install the Arch package and the 
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, the extension tests and builds
-Linux and Windows binaries; `v*` tags create a GitHub release.
+macOS and Linux arm64 binaries, the .deb and the Arch package (x86_64) and the .vsix. A push to
+master whose `Cargo.toml` version has no `v<version>` release yet creates it with those files.
 
 ## Rules
 
@@ -100,8 +102,8 @@ Linux and Windows binaries; `v*` tags create a GitHub release.
   "text file busy" races with parallel tests. Dry runs and diffs only run `if`/`unless` checks, so keep checks read-only.
 - Every change to the code bumps the version, or `makepkg -si` won't install it: `version` in
   `Cargo.toml` (and `Cargo.lock`, a build updates it), `pkgver` in `dist/arch/PKGBUILD` with
-  `pkgrel=1`, and `version` in `editors/vscode/package.json`. Patch for fixes, minor for new
-  syntax or features. Do it before asking me to reinstall.
+  `pkgrel=1`, and `version` in `editors/vscode/package.json` (CI checks they match). Patch for
+  fixes, minor for new syntax or features. Pushing a new version to master releases it. Do it before asking me to reinstall.
 - `.gitignore` patterns are anchored to the root (`/test*`), so source files aren't ignored by accident.
 - Pushing straight to master is fine. Commits use the GitHub noreply address set in this
   repo's git config. Commits are signed with a YubiKey, which needs a touch, so a commit

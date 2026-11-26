@@ -3,7 +3,6 @@ name: CI
 on:
   push:
     branches: [master]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -15,6 +14,8 @@ jobs:
     # Skip commits whose message starts with [nobuild]
     if: ${{ !startsWith(github.event.head_commit.message, '[nobuild]') }}
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -24,16 +25,24 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
-      - name: PKGBUILD version matches Cargo.toml
+      - name: Versions match Cargo.toml
+        id: version
         run: |
           cargo_version=$(awk -F'"' '/^version *=/ {print $2; exit}' Cargo.toml)
           pkgbuild_version=$(sed -n 's/^pkgver=//p' dist/arch/PKGBUILD)
+          vscode_version=$(jq -r .version editors/vscode/package.json)
           if [ "$cargo_version" != "$pkgbuild_version" ]; then
             echo "::error file=dist/arch/PKGBUILD::pkgver $pkgbuild_version doesn't match Cargo.toml $cargo_version"
             exit 1
           fi
+          if [ "$cargo_version" != "$vscode_version" ]; then
+            echo "::error file=editors/vscode/package.json::version $vscode_version doesn't match Cargo.toml $cargo_version"
+            exit 1
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
 
   # File steps shell out to stat, install and chmod, whose BSD versions differ from GNU's.
+  # macos-latest is arm64, so this also builds the macOS binary.
   macos:
     if: ${{ !startsWith(github.event.head_commit.message, '[nobuild]') }}
     runs-on: macos-latest
@@ -45,6 +54,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: taskpod-macos-arm64
+          path: target/release/taskpod
 
   vscode:
     if: ${{ !startsWith(github.event.head_commit.message, '[nobuild]') }}
@@ -63,43 +77,91 @@ jobs:
           name: taskpod-vscode
           path: editors/vscode/*.vsix
 
-  build:
+  # Built on Ubuntu 22.04 for an older glibc (2.35), so they run on more distributions.
+  linux-arm64:
     needs: check
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            binary: taskpod
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary: taskpod.exe
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: cargo build --release --locked
       - uses: actions/upload-artifact@v4
         with:
-          name: taskpod-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          name: taskpod-linux-arm64
+          path: target/release/taskpod
 
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, vscode]
+  deb:
+    needs: check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - run: cargo deb --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: taskpod-deb
+          path: target/debian/*.deb
+
+  # makepkg refuses to run as root, so it runs as a builder user in an Arch container.
+  arch:
+    needs: check
     runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      # pacman's download sandbox can't always set up seccomp in a container.
+      - run: |
+          sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
+          pacman -Syu --noconfirm --needed git rust
+      - uses: actions/checkout@v5
+      - name: makepkg
+        run: |
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          # Tests already ran in the check job.
+          su builder -c 'cd dist/arch && makepkg --nocheck'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: taskpod-arch
+          path: dist/arch/taskpod-[0-9]*.pkg.tar.zst  # not the taskpod-debug package
+
+  # Creates the release for Cargo.toml's version on master if there isn't one yet.
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: [check, macos, vscode, linux-arm64, deb, arch]
+    runs-on: ubuntu-latest
+    concurrency: release
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
-      - name: Create release
+      - name: Release exists
+        id: exists
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.check.outputs.version }}
         run: |
-          mv taskpod-x86_64-unknown-linux-gnu/taskpod taskpod-linux-x86_64
-          mv taskpod-x86_64-pc-windows-msvc/taskpod.exe taskpod-windows-x86_64.exe
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
-            taskpod-linux-x86_64 taskpod-windows-x86_64.exe taskpod-vscode/*.vsix
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.exists.outputs.exists == 'false'
+        uses: actions/download-artifact@v4
+      - name: Create release
+        if: steps.exists.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.check.outputs.version }}
+        run: |
+          mkdir assets
+          mv taskpod-macos-arm64/taskpod assets/taskpod-macos-arm64
+          mv taskpod-linux-arm64/taskpod assets/taskpod-linux-arm64
+          mv taskpod-vscode/*.vsix taskpod-deb/*.deb taskpod-arch/*.pkg.tar.zst assets/
+          ls -l assets
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$TAG" --generate-notes assets/*

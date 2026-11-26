@@ -1,6 +1,6 @@
 [package]
 name = "taskpod"
-version = "0.21.0"
+version = "0.21.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Declarative task runner: tasks declare dependencies and run in parallel"
@@ -30,3 +30,21 @@ tempfile = "3.27.0"
 lto = true
 strip = true
 codegen-units = 1
+
+# `cargo deb` (cargo-deb) builds the Debian package into target/debian/.
+[package.metadata.deb]
+maintainer = "Moudoux <14980525+Moudoux@users.noreply.github.com>"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+suggests = "sudo, openssh-client, sops, age"
+extended-description = """\
+Task files (.task) declare tasks with dependencies. Tasks run in parallel, \
+and if/unless checks make them idempotent. It can configure the local machine \
+or another one over SSH, and undo what it changed."""
+assets = [
+  ["target/release/taskpod", "usr/bin/", "755"],
+  ["README.md", "usr/share/doc/taskpod/", "644"],
+  ["spec.task", "usr/share/doc/taskpod/", "644"],
+  ["Task.xml", "usr/share/taskpod/", "644"],
+]

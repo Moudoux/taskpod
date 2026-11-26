@@ -2,7 +2,7 @@
   "name": "taskpod",
   "displayName": "Taskpod",
   "description": "Syntax highlighting, completion, hover docs, go to definition, diagnostics and live checks against the system for taskpod .task files",
-  "version": "0.21.0",
+  "version": "0.21.1",
   "publisher": "moudoux",
   "license": "MIT",
   "repository": {
